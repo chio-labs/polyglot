@@ -8,7 +8,7 @@ use crate::ast_transforms::get_aggregate_functions;
 use crate::dialects::{Dialect, DialectType};
 use crate::error::{ValidationError, ValidationResult};
 use crate::expressions::{
-    Column, DataType, Expression, Function, Insert, JoinKind, TableRef, Update,
+    Column, DataType, Expression, Function, Insert, JoinKind, OracleDataType, TableRef, Update,
 };
 use crate::function_catalog::FunctionCatalog;
 #[cfg(any(
@@ -769,6 +769,23 @@ fn data_type_family(data_type: &DataType) -> TypeFamily {
         DataType::Float { .. } | DataType::Double { .. } | DataType::Decimal { .. } => {
             TypeFamily::Numeric
         }
+        DataType::Oracle { oracle_type } => match oracle_type {
+            OracleDataType::Number { .. }
+            | OracleDataType::BinaryFloat
+            | OracleDataType::BinaryDouble
+            | OracleDataType::Float { .. } => TypeFamily::Numeric,
+            OracleDataType::Character { .. }
+            | OracleDataType::Clob { .. }
+            | OracleDataType::Long { raw: false }
+            | OracleDataType::RowId => TypeFamily::String,
+            OracleDataType::Blob
+            | OracleDataType::Raw { .. }
+            | OracleDataType::Long { raw: true } => TypeFamily::Binary,
+            OracleDataType::Date => TypeFamily::Date,
+            OracleDataType::Timestamp { .. } => TypeFamily::Timestamp,
+            OracleDataType::IntervalYearToMonth { .. }
+            | OracleDataType::IntervalDayToSecond { .. } => TypeFamily::Interval,
+        },
         DataType::Char { .. }
         | DataType::VarChar { .. }
         | DataType::String { .. }

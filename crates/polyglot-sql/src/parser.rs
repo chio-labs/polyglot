@@ -41177,6 +41177,216 @@ impl Parser {
         })))
     }
 
+    fn parse_oracle_precision(&mut self, context: &str, minimum: u32, maximum: u32) -> Result<u32> {
+        let value = self.expect_number()?;
+        let value = u32::try_from(value)
+            .map_err(|_| self.parse_error(format!("{context} must be non-negative")))?;
+        if !(minimum..=maximum).contains(&value) {
+            return Err(
+                self.parse_error(format!("{context} must be between {minimum} and {maximum}"))
+            );
+        }
+        Ok(value)
+    }
+
+    fn parse_oracle_character_type(&mut self, kind: OracleCharacterKind) -> Result<DataType> {
+        let supports_length_semantics = matches!(
+            kind,
+            OracleCharacterKind::Char | OracleCharacterKind::VarChar
+        );
+        let (length, semantics) = if self.match_token(TokenType::LParen) {
+            let length = self.parse_oracle_precision("Oracle character length", 1, u32::MAX)?;
+            let semantics = if supports_length_semantics && self.match_keyword("BYTE") {
+                Some(OracleCharacterLengthSemantics::Byte)
+            } else if supports_length_semantics && self.match_keyword("CHAR") {
+                Some(OracleCharacterLengthSemantics::Char)
+            } else {
+                None
+            };
+            self.expect(TokenType::RParen)?;
+            (Some(length), semantics)
+        } else {
+            (None, None)
+        };
+
+        Ok(DataType::Oracle {
+            oracle_type: OracleDataType::Character {
+                kind,
+                length,
+                semantics,
+            },
+        })
+    }
+
+    /// Parse an Oracle-specific data type after its first token has been consumed.
+    ///
+    /// Returns `None` for names that should continue through the generic data type parser.
+    fn parse_oracle_data_type(&mut self, name: &str) -> Result<Option<DataType>> {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Oracle)
+        ) {
+            return Ok(None);
+        }
+
+        let oracle_type = match name {
+            "NUMBER" => {
+                let (precision, scale) = if self.match_token(TokenType::LParen) {
+                    let precision = if self.match_token(TokenType::Star) {
+                        None
+                    } else {
+                        Some(self.parse_oracle_precision("Oracle NUMBER precision", 1, 38)?)
+                    };
+                    let scale = if self.match_token(TokenType::Comma) {
+                        let scale = self.expect_number()?;
+                        let scale = i32::try_from(scale)
+                            .map_err(|_| self.parse_error("Oracle NUMBER scale is out of range"))?;
+                        if !(-84..=127).contains(&scale) {
+                            return Err(
+                                self.parse_error("Oracle NUMBER scale must be between -84 and 127")
+                            );
+                        }
+                        Some(scale)
+                    } else {
+                        None
+                    };
+                    self.expect(TokenType::RParen)?;
+                    (precision, scale)
+                } else {
+                    (None, None)
+                };
+                OracleDataType::Number { precision, scale }
+            }
+            "BINARY_FLOAT" => OracleDataType::BinaryFloat,
+            "BINARY_DOUBLE" => OracleDataType::BinaryDouble,
+            "FLOAT" => {
+                let precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle FLOAT precision", 1, 126)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                OracleDataType::Float { precision }
+            }
+            "CHAR" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::Char)
+                    .map(Some);
+            }
+            "VARCHAR2" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::VarChar)
+                    .map(Some);
+            }
+            "NCHAR" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::NChar)
+                    .map(Some);
+            }
+            "NVARCHAR2" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::NVarChar)
+                    .map(Some);
+            }
+            "DATE" => OracleDataType::Date,
+            "TIMESTAMP" => {
+                let precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle TIMESTAMP precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                let timezone = if self.match_token(TokenType::With) {
+                    if self.match_token(TokenType::Local) {
+                        if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                            return Err(self.parse_error("Expected LOCAL TIME ZONE"));
+                        }
+                        OracleTimestampTimeZone::WithLocalTimeZone
+                    } else {
+                        if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                            return Err(self.parse_error("Expected TIME ZONE"));
+                        }
+                        OracleTimestampTimeZone::WithTimeZone
+                    }
+                } else if self.match_keyword("WITHOUT") {
+                    if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                        return Err(self.parse_error("Expected TIME ZONE"));
+                    }
+                    OracleTimestampTimeZone::None
+                } else {
+                    OracleTimestampTimeZone::None
+                };
+                OracleDataType::Timestamp {
+                    precision,
+                    timezone,
+                }
+            }
+            "INTERVAL" if self.match_keyword("YEAR") => {
+                let year_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL YEAR precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                if !self.match_token(TokenType::To) || !self.match_keyword("MONTH") {
+                    return Err(self.parse_error("Expected TO MONTH"));
+                }
+                OracleDataType::IntervalYearToMonth { year_precision }
+            }
+            "INTERVAL" if self.match_keyword("DAY") => {
+                let day_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL DAY precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                if !self.match_token(TokenType::To) || !self.match_keyword("SECOND") {
+                    return Err(self.parse_error("Expected TO SECOND"));
+                }
+                let fractional_seconds_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL SECOND precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                OracleDataType::IntervalDayToSecond {
+                    day_precision,
+                    fractional_seconds_precision,
+                }
+            }
+            "CLOB" => OracleDataType::Clob { national: false },
+            "NCLOB" => OracleDataType::Clob { national: true },
+            "BLOB" => OracleDataType::Blob,
+            "RAW" => {
+                let length = if self.match_token(TokenType::LParen) {
+                    let length = self.parse_oracle_precision("Oracle RAW length", 1, u32::MAX)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(length)
+                } else {
+                    None
+                };
+                OracleDataType::Raw { length }
+            }
+            "LONG" => OracleDataType::Long {
+                raw: self.match_keyword("RAW"),
+            },
+            "ROWID" => OracleDataType::RowId,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(DataType::Oracle { oracle_type }))
+    }
+
     /// Parse a data type
     fn parse_data_type(&mut self) -> Result<DataType> {
         // Handle special token types that represent data type keywords
@@ -41227,6 +41437,10 @@ impl Parser {
                     });
                 }
             }
+        }
+
+        if let Some(data_type) = self.parse_oracle_data_type(&name)? {
+            return Ok(data_type);
         }
 
         let base_type = match name.as_str() {
@@ -42357,6 +42571,10 @@ impl Parser {
         }
         let name = raw_name.to_ascii_uppercase();
 
+        if let Some(data_type) = self.parse_oracle_data_type(&name)? {
+            return self.maybe_parse_collated_data_type(data_type);
+        }
+
         // Handle parametric types like ARRAY<T>, MAP<K,V>
         let base_type = match name.as_str() {
             "ARRAY" => {
@@ -43181,6 +43399,105 @@ impl Parser {
         }
     }
 
+    fn oracle_data_type_to_string(&self, data_type: &OracleDataType) -> String {
+        match data_type {
+            OracleDataType::Number { precision, scale } => {
+                if precision.is_none() && scale.is_none() {
+                    "NUMBER".to_string()
+                } else {
+                    let precision = precision
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "*".to_string());
+                    if let Some(scale) = scale {
+                        format!("NUMBER({precision}, {scale})")
+                    } else {
+                        format!("NUMBER({precision})")
+                    }
+                }
+            }
+            OracleDataType::BinaryFloat => "BINARY_FLOAT".to_string(),
+            OracleDataType::BinaryDouble => "BINARY_DOUBLE".to_string(),
+            OracleDataType::Float { precision } => precision
+                .map(|value| format!("FLOAT({value})"))
+                .unwrap_or_else(|| "FLOAT".to_string()),
+            OracleDataType::Character {
+                kind,
+                length,
+                semantics,
+            } => {
+                let name = match kind {
+                    OracleCharacterKind::Char => "CHAR",
+                    OracleCharacterKind::VarChar => "VARCHAR2",
+                    OracleCharacterKind::NChar => "NCHAR",
+                    OracleCharacterKind::NVarChar => "NVARCHAR2",
+                };
+                if let Some(length) = length {
+                    let semantics = match semantics {
+                        Some(OracleCharacterLengthSemantics::Byte) => " BYTE",
+                        Some(OracleCharacterLengthSemantics::Char) => " CHAR",
+                        None => "",
+                    };
+                    format!("{name}({length}{semantics})")
+                } else {
+                    name.to_string()
+                }
+            }
+            OracleDataType::Date => "DATE".to_string(),
+            OracleDataType::Timestamp {
+                precision,
+                timezone,
+            } => {
+                let mut sql = "TIMESTAMP".to_string();
+                if let Some(precision) = precision {
+                    sql.push_str(&format!("({precision})"));
+                }
+                sql.push_str(match timezone {
+                    OracleTimestampTimeZone::None => "",
+                    OracleTimestampTimeZone::WithTimeZone => " WITH TIME ZONE",
+                    OracleTimestampTimeZone::WithLocalTimeZone => " WITH LOCAL TIME ZONE",
+                });
+                sql
+            }
+            OracleDataType::IntervalYearToMonth { year_precision } => {
+                let precision = year_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                format!("INTERVAL YEAR{precision} TO MONTH")
+            }
+            OracleDataType::IntervalDayToSecond {
+                day_precision,
+                fractional_seconds_precision,
+            } => {
+                let day_precision = day_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                let fractional_seconds_precision = fractional_seconds_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                format!("INTERVAL DAY{day_precision} TO SECOND{fractional_seconds_precision}")
+            }
+            OracleDataType::Clob { national } => {
+                if *national {
+                    "NCLOB".to_string()
+                } else {
+                    "CLOB".to_string()
+                }
+            }
+            OracleDataType::Blob => "BLOB".to_string(),
+            OracleDataType::Raw { length } => length
+                .map(|value| format!("RAW({value})"))
+                .unwrap_or_else(|| "RAW".to_string()),
+            OracleDataType::Long { raw } => {
+                if *raw {
+                    "LONG RAW".to_string()
+                } else {
+                    "LONG".to_string()
+                }
+            }
+            OracleDataType::RowId => "ROWID".to_string(),
+        }
+    }
+
     /// Convert a DataType to a string representation for JSONColumnDef.kind
     fn data_type_to_string(&self, dt: &DataType) -> String {
         match dt {
@@ -43237,6 +43554,7 @@ impl Parser {
             DataType::Decimal {
                 precision: None, ..
             } => "DECIMAL".to_string(),
+            DataType::Oracle { oracle_type } => self.oracle_data_type_to_string(oracle_type),
             DataType::VarChar {
                 length: Some(n), ..
             } => format!("VARCHAR({})", n),
@@ -49618,6 +49936,7 @@ impl Parser {
                 (Some(p), None) => format!("DECIMAL({})", p),
                 _ => "DECIMAL".to_string(),
             },
+            DataType::Oracle { oracle_type } => self.oracle_data_type_to_string(oracle_type),
             DataType::Char { length } => {
                 if let Some(n) = length {
                     format!("CHAR({})", n)

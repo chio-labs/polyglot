@@ -5750,6 +5750,88 @@ impl StructField {
     }
 }
 
+/// Oracle-specific data types whose semantics cannot be represented losslessly by the
+/// generic [`DataType`] variants.
+///
+/// Keeping these types structured allows the Oracle parser to retain details such as a
+/// negative `NUMBER` scale, `BYTE`/`CHAR` length semantics, interval precisions, and
+/// `TIMESTAMP WITH LOCAL TIME ZONE` until the target dialect is known.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(tag = "oracle_data_type", rename_all = "snake_case")]
+pub enum OracleDataType {
+    Number {
+        precision: Option<u32>,
+        scale: Option<i32>,
+    },
+    BinaryFloat,
+    BinaryDouble,
+    Float {
+        precision: Option<u32>,
+    },
+    Character {
+        kind: OracleCharacterKind,
+        length: Option<u32>,
+        semantics: Option<OracleCharacterLengthSemantics>,
+    },
+    Date,
+    Timestamp {
+        precision: Option<u32>,
+        timezone: OracleTimestampTimeZone,
+    },
+    IntervalYearToMonth {
+        year_precision: Option<u32>,
+    },
+    IntervalDayToSecond {
+        day_precision: Option<u32>,
+        fractional_seconds_precision: Option<u32>,
+    },
+    Clob {
+        national: bool,
+    },
+    Blob,
+    Raw {
+        length: Option<u32>,
+    },
+    Long {
+        raw: bool,
+    },
+    RowId,
+}
+
+#[derive(
+    polyglot_sql_ast_derive::AstNode, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OracleCharacterKind {
+    Char,
+    VarChar,
+    NChar,
+    NVarChar,
+}
+
+#[derive(
+    polyglot_sql_ast_derive::AstNode, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OracleCharacterLengthSemantics {
+    Byte,
+    Char,
+}
+
+#[derive(
+    polyglot_sql_ast_derive::AstNode, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OracleTimestampTimeZone {
+    None,
+    WithTimeZone,
+    WithLocalTimeZone,
+}
+
 /// Enumerate all SQL data types recognized by the parser.
 ///
 /// Covers standard SQL types (BOOLEAN, INT, VARCHAR, TIMESTAMP, etc.) as well
@@ -5800,6 +5882,10 @@ pub enum DataType {
     Decimal {
         precision: Option<u32>,
         scale: Option<u32>,
+    },
+    /// Structured Oracle data type retained until the target dialect is known.
+    Oracle {
+        oracle_type: OracleDataType,
     },
 
     // String

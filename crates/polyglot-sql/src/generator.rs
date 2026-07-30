@@ -17875,8 +17875,20 @@ impl Generator {
         if matches!(self.config.dialect, Some(DialectType::Oracle)) {
             if let Some(format) = &cast.format {
                 // Check if target type is DATE or TIMESTAMP
-                let is_date = matches!(cast.to, DataType::Date);
-                let is_timestamp = matches!(cast.to, DataType::Timestamp { .. });
+                let is_date = matches!(
+                    cast.to,
+                    DataType::Date
+                        | DataType::Oracle {
+                            oracle_type: OracleDataType::Date
+                        }
+                );
+                let is_timestamp = matches!(
+                    cast.to,
+                    DataType::Timestamp { .. }
+                        | DataType::Oracle {
+                            oracle_type: OracleDataType::Timestamp { .. }
+                        }
+                );
 
                 if is_date || is_timestamp {
                     let func_name = if is_date { "TO_DATE" } else { "TO_TIMESTAMP" };
@@ -18023,6 +18035,18 @@ impl Generator {
                     _ => {
                         self.generate_data_type(&cast.to)?;
                     }
+                }
+            } else if matches!(self.config.dialect, Some(DialectType::Oracle)) {
+                // Oracle canonicalizes binary floating-point CAST targets even though
+                // column definitions retain the BINARY_FLOAT/BINARY_DOUBLE spellings.
+                match &cast.to {
+                    DataType::Oracle {
+                        oracle_type: OracleDataType::BinaryFloat,
+                    } => self.write_keyword("FLOAT"),
+                    DataType::Oracle {
+                        oracle_type: OracleDataType::BinaryDouble,
+                    } => self.write_keyword("DOUBLE PRECISION"),
+                    _ => self.generate_data_type(&cast.to)?,
                 }
             } else {
                 self.generate_data_type(&cast.to)?;
@@ -24988,6 +25012,536 @@ impl Generator {
         }
     }
 
+    fn write_type_with_length(&mut self, name: &str, length: Option<u32>) {
+        self.write_keyword(name);
+        if let Some(length) = length {
+            self.write(&format!("({length})"));
+        }
+    }
+
+    fn write_oracle_number(&mut self, precision: Option<u32>, scale: Option<i32>) -> Result<()> {
+        use crate::dialects::DialectType;
+
+        if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+            self.write_keyword("NUMBER");
+            if precision.is_some() || scale.is_some() {
+                self.write("(");
+                if let Some(precision) = precision {
+                    self.write(&precision.to_string());
+                } else {
+                    self.write("*");
+                }
+                if let Some(scale) = scale {
+                    self.write(&format!(", {scale}"));
+                }
+                self.write(")");
+            }
+            return Ok(());
+        }
+
+        let target = self.config.dialect;
+        match (precision, scale) {
+            (None, None) => match target {
+                Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                    self.write_keyword("NUMERIC");
+                }
+                Some(DialectType::MySQL)
+                | Some(DialectType::SingleStore)
+                | Some(DialectType::TiDB) => {
+                    self.unsupported(
+                        "Oracle NUMBER without precision or scale has no exact MySQL mapping",
+                    )?;
+                    self.write_keyword("DECIMAL(65, 30)");
+                }
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                    self.unsupported(
+                        "Oracle NUMBER without precision or scale has no exact T-SQL mapping",
+                    )?;
+                    self.write_keyword("DECIMAL(38, 10)");
+                }
+                _ => self.write_keyword("DECIMAL"),
+            },
+            (Some(precision), None) | (Some(precision), Some(0)) => {
+                if precision <= 9 {
+                    self.write_keyword("INT");
+                } else if precision <= 18 {
+                    self.write_keyword("BIGINT");
+                } else {
+                    self.write(&format!("DECIMAL({precision}, 0)"));
+                }
+            }
+            (Some(precision), Some(scale)) if scale < 0 => match target {
+                Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                    self.write(&format!("NUMERIC({precision}, {scale})"));
+                }
+                Some(DialectType::MySQL)
+                | Some(DialectType::SingleStore)
+                | Some(DialectType::TiDB) => {
+                    self.unsupported(format!(
+                        "Oracle NUMBER({precision}, {scale}) negative-scale rounding cannot be enforced by MySQL"
+                    ))?;
+                    let width = precision.saturating_add(scale.unsigned_abs()).min(65);
+                    self.write(&format!("DECIMAL({width}, 0)"));
+                }
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                    self.unsupported(format!(
+                        "Oracle NUMBER({precision}, {scale}) negative-scale rounding cannot be enforced by T-SQL"
+                    ))?;
+                    let width = precision.saturating_add(scale.unsigned_abs()).min(38);
+                    self.write(&format!("DECIMAL({width}, 0)"));
+                }
+                _ => {
+                    self.unsupported(format!(
+                        "Oracle NUMBER({precision}, {scale}) negative-scale rounding may not be supported"
+                    ))?;
+                    let width = precision.saturating_add(scale.unsigned_abs());
+                    self.write(&format!("DECIMAL({width}, 0)"));
+                }
+            },
+            (Some(precision), Some(scale)) => {
+                let mut target_precision = precision;
+                let mut target_scale = u32::try_from(scale).unwrap_or_default();
+                let limits = match target {
+                    Some(DialectType::MySQL)
+                    | Some(DialectType::SingleStore)
+                    | Some(DialectType::TiDB) => Some((65, 30, "MySQL")),
+                    Some(DialectType::TSQL) | Some(DialectType::Fabric) => Some((38, 38, "T-SQL")),
+                    _ => None,
+                };
+                if let Some((max_precision, max_scale, dialect_name)) = limits {
+                    let requested_precision = target_precision;
+                    let requested_scale = target_scale;
+                    target_scale = target_scale.min(max_scale);
+                    target_precision = target_precision.max(target_scale).min(max_precision);
+                    if target_precision != requested_precision || target_scale != requested_scale {
+                        self.unsupported(format!(
+                            "Oracle NUMBER({precision}, {scale}) exceeds {dialect_name} DECIMAL limits"
+                        ))?;
+                    }
+                }
+                self.write(&format!("DECIMAL({target_precision}, {target_scale})"));
+            }
+            (None, Some(scale)) => {
+                self.unsupported(format!(
+                    "Oracle NUMBER(*, {scale}) has no exact target mapping"
+                ))?;
+                self.write_keyword("DECIMAL");
+            }
+        }
+        Ok(())
+    }
+
+    fn write_oracle_character(
+        &mut self,
+        kind: OracleCharacterKind,
+        length: Option<u32>,
+        semantics: Option<OracleCharacterLengthSemantics>,
+    ) -> Result<()> {
+        use crate::dialects::DialectType;
+
+        if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+            let name = match kind {
+                OracleCharacterKind::Char => "CHAR",
+                OracleCharacterKind::VarChar => "VARCHAR2",
+                OracleCharacterKind::NChar => "NCHAR",
+                OracleCharacterKind::NVarChar => "NVARCHAR2",
+            };
+            self.write_keyword(name);
+            if let Some(length) = length {
+                self.write(&format!("({length}"));
+                if let Some(semantics) = semantics {
+                    self.write(match semantics {
+                        OracleCharacterLengthSemantics::Byte => " BYTE",
+                        OracleCharacterLengthSemantics::Char => " CHAR",
+                    });
+                }
+                self.write(")");
+            }
+            return Ok(());
+        }
+
+        let mut target_kind = kind;
+        match self.config.dialect {
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+                if semantics == Some(OracleCharacterLengthSemantics::Char)
+                    && matches!(
+                        kind,
+                        OracleCharacterKind::Char | OracleCharacterKind::VarChar
+                    ) =>
+            {
+                self.unsupported(
+                    "Oracle CHAR length semantics require a national-character approximation in T-SQL",
+                )?;
+                target_kind = match kind {
+                    OracleCharacterKind::Char => OracleCharacterKind::NChar,
+                    OracleCharacterKind::VarChar => OracleCharacterKind::NVarChar,
+                    _ => kind,
+                };
+            }
+            Some(DialectType::PostgreSQL) | Some(DialectType::Materialize)
+                if matches!(
+                    kind,
+                    OracleCharacterKind::NChar | OracleCharacterKind::NVarChar
+                ) =>
+            {
+                target_kind = match kind {
+                    OracleCharacterKind::NChar => OracleCharacterKind::Char,
+                    OracleCharacterKind::NVarChar => OracleCharacterKind::VarChar,
+                    _ => kind,
+                };
+            }
+            _ => {}
+        }
+
+        if semantics == Some(OracleCharacterLengthSemantics::Byte)
+            && matches!(
+                self.config.dialect,
+                Some(DialectType::MySQL)
+                    | Some(DialectType::SingleStore)
+                    | Some(DialectType::TiDB)
+                    | Some(DialectType::PostgreSQL)
+                    | Some(DialectType::Materialize)
+            )
+        {
+            self.unsupported(
+                "Oracle BYTE character length semantics cannot be enforced by the target type",
+            )?;
+        }
+
+        let name = match target_kind {
+            OracleCharacterKind::Char => "CHAR",
+            OracleCharacterKind::VarChar => "VARCHAR",
+            OracleCharacterKind::NChar => "NCHAR",
+            OracleCharacterKind::NVarChar => "NVARCHAR",
+        };
+        let length = if matches!(
+            target_kind,
+            OracleCharacterKind::Char | OracleCharacterKind::NChar
+        ) {
+            Some(length.unwrap_or(1))
+        } else {
+            length
+        };
+        self.write_type_with_length(name, length);
+        Ok(())
+    }
+
+    fn oracle_timestamp_precision(&mut self, precision: Option<u32>, maximum: u32) -> Result<u32> {
+        let requested = precision.unwrap_or(6);
+        if requested > maximum {
+            self.unsupported(format!(
+                "Oracle timestamp precision {requested} exceeds the target maximum of {maximum}"
+            ))?;
+        }
+        Ok(requested.min(maximum))
+    }
+
+    fn write_oracle_data_type(&mut self, data_type: &OracleDataType) -> Result<()> {
+        use crate::dialects::DialectType;
+
+        match data_type {
+            OracleDataType::Number { precision, scale } => {
+                self.write_oracle_number(*precision, *scale)?;
+            }
+            OracleDataType::BinaryFloat => match self.config.dialect {
+                Some(DialectType::Oracle) | None => self.write_keyword("BINARY_FLOAT"),
+                Some(DialectType::TSQL)
+                | Some(DialectType::Fabric)
+                | Some(DialectType::PostgreSQL)
+                | Some(DialectType::Materialize) => self.write_keyword("REAL"),
+                _ => self.write_keyword("FLOAT"),
+            },
+            OracleDataType::BinaryDouble => match self.config.dialect {
+                Some(DialectType::Oracle) | None => self.write_keyword("BINARY_DOUBLE"),
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => self.write_keyword("FLOAT"),
+                Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                    self.write_keyword("DOUBLE PRECISION")
+                }
+                _ => self.write_keyword("DOUBLE"),
+            },
+            OracleDataType::Float { precision } => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword("FLOAT");
+                    if let Some(precision) = precision {
+                        self.write(&format!("({precision})"));
+                    }
+                } else {
+                    let precision = precision.unwrap_or(126);
+                    match self.config.dialect {
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                            if precision > 53 {
+                                self.unsupported(format!(
+                                    "Oracle FLOAT({precision}) exceeds T-SQL FLOAT precision"
+                                ))?;
+                            }
+                            self.write(&format!("FLOAT({})", precision.min(53)));
+                        }
+                        Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                            self.write_keyword(if precision <= 24 {
+                                "REAL"
+                            } else {
+                                "DOUBLE PRECISION"
+                            });
+                        }
+                        Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB) => {
+                            self.write_keyword(if precision <= 24 { "FLOAT" } else { "DOUBLE" });
+                        }
+                        _ => self.write_keyword("DOUBLE PRECISION"),
+                    }
+                }
+            }
+            OracleDataType::Character {
+                kind,
+                length,
+                semantics,
+            } => self.write_oracle_character(*kind, *length, *semantics)?,
+            OracleDataType::Date => match self.config.dialect {
+                Some(DialectType::Oracle) | None => self.write_keyword("DATE"),
+                Some(DialectType::MySQL)
+                | Some(DialectType::SingleStore)
+                | Some(DialectType::TiDB) => self.write_keyword("DATETIME"),
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                    self.write_keyword("DATETIME2(0)")
+                }
+                _ => self.write_keyword("TIMESTAMP(0)"),
+            },
+            OracleDataType::Timestamp {
+                precision,
+                timezone,
+            } => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword("TIMESTAMP");
+                    if let Some(precision) = precision {
+                        self.write(&format!("({precision})"));
+                    }
+                    match timezone {
+                        OracleTimestampTimeZone::None => {}
+                        OracleTimestampTimeZone::WithTimeZone => {
+                            self.write_keyword(" WITH TIME ZONE")
+                        }
+                        OracleTimestampTimeZone::WithLocalTimeZone => {
+                            self.write_keyword(" WITH LOCAL TIME ZONE")
+                        }
+                    }
+                } else {
+                    match self.config.dialect {
+                        Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB) => {
+                            let precision = self.oracle_timestamp_precision(*precision, 6)?;
+                            match timezone {
+                                OracleTimestampTimeZone::None => {
+                                    self.write(&format!("DATETIME({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithTimeZone => {
+                                    self.unsupported(
+                                        "Oracle TIMESTAMP WITH TIME ZONE loses its time zone in MySQL",
+                                    )?;
+                                    self.write(&format!("DATETIME({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithLocalTimeZone => {
+                                    self.unsupported(
+                                        "Oracle TIMESTAMP WITH LOCAL TIME ZONE has only an approximate MySQL mapping",
+                                    )?;
+                                    self.write(&format!("TIMESTAMP({precision})"));
+                                }
+                            }
+                        }
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                            let precision = self.oracle_timestamp_precision(*precision, 7)?;
+                            match timezone {
+                                OracleTimestampTimeZone::None => {
+                                    self.write(&format!("DATETIME2({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithTimeZone => {
+                                    self.write(&format!("DATETIMEOFFSET({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithLocalTimeZone => {
+                                    self.unsupported(
+                                        "Oracle TIMESTAMP WITH LOCAL TIME ZONE loses session time-zone semantics in T-SQL",
+                                    )?;
+                                    self.write(&format!("DATETIME2({precision})"));
+                                }
+                            }
+                        }
+                        Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                            let precision = self.oracle_timestamp_precision(*precision, 6)?;
+                            match timezone {
+                                OracleTimestampTimeZone::None => {
+                                    self.write(&format!("TIMESTAMP({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithTimeZone => {
+                                    self.write(&format!("TIMESTAMPTZ({precision})"));
+                                }
+                                OracleTimestampTimeZone::WithLocalTimeZone => {
+                                    self.unsupported(
+                                        "Oracle TIMESTAMP WITH LOCAL TIME ZONE has only an approximate PostgreSQL mapping",
+                                    )?;
+                                    self.write(&format!("TIMESTAMPTZ({precision})"));
+                                }
+                            }
+                        }
+                        _ => {
+                            let precision = precision.unwrap_or(6);
+                            let name = if matches!(timezone, OracleTimestampTimeZone::None) {
+                                "TIMESTAMP"
+                            } else {
+                                "TIMESTAMPTZ"
+                            };
+                            self.write(&format!("{name}({precision})"));
+                        }
+                    }
+                }
+            }
+            OracleDataType::IntervalYearToMonth { year_precision } => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword("INTERVAL YEAR");
+                    if let Some(precision) = year_precision {
+                        self.write(&format!("({precision})"));
+                    }
+                    self.write_keyword(" TO MONTH");
+                } else if matches!(
+                    self.config.dialect,
+                    Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB)
+                        | Some(DialectType::TSQL)
+                        | Some(DialectType::Fabric)
+                ) {
+                    self.unsupported(
+                        "Oracle INTERVAL YEAR TO MONTH has no native target column type",
+                    )?;
+                    self.write_keyword("VARCHAR(30)");
+                } else {
+                    if year_precision.is_some() {
+                        self.unsupported(
+                            "Oracle INTERVAL YEAR leading precision cannot be preserved",
+                        )?;
+                    }
+                    self.write_keyword("INTERVAL YEAR TO MONTH");
+                }
+            }
+            OracleDataType::IntervalDayToSecond {
+                day_precision,
+                fractional_seconds_precision,
+            } => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword("INTERVAL DAY");
+                    if let Some(precision) = day_precision {
+                        self.write(&format!("({precision})"));
+                    }
+                    self.write_keyword(" TO SECOND");
+                    if let Some(precision) = fractional_seconds_precision {
+                        self.write(&format!("({precision})"));
+                    }
+                } else if matches!(
+                    self.config.dialect,
+                    Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB)
+                        | Some(DialectType::TSQL)
+                        | Some(DialectType::Fabric)
+                ) {
+                    self.unsupported(
+                        "Oracle INTERVAL DAY TO SECOND has no native target column type",
+                    )?;
+                    self.write_keyword("VARCHAR(30)");
+                } else {
+                    if day_precision.is_some() {
+                        self.unsupported(
+                            "Oracle INTERVAL DAY leading precision cannot be preserved",
+                        )?;
+                    }
+                    self.write_keyword("INTERVAL");
+                    if let Some(precision) = fractional_seconds_precision {
+                        self.write(&format!("({precision})"));
+                    }
+                    self.write_keyword(" DAY TO SECOND");
+                }
+            }
+            OracleDataType::Clob { national } => match self.config.dialect {
+                Some(DialectType::Oracle) | None => {
+                    self.write_keyword(if *national { "NCLOB" } else { "CLOB" })
+                }
+                Some(DialectType::MySQL)
+                | Some(DialectType::SingleStore)
+                | Some(DialectType::TiDB) => self.write_keyword("LONGTEXT"),
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                    self.write_keyword(if *national {
+                        "NVARCHAR(MAX)"
+                    } else {
+                        "VARCHAR(MAX)"
+                    });
+                }
+                _ => self.write_keyword("TEXT"),
+            },
+            OracleDataType::Blob => match self.config.dialect {
+                Some(DialectType::Oracle) | None => self.write_keyword("BLOB"),
+                Some(DialectType::MySQL)
+                | Some(DialectType::SingleStore)
+                | Some(DialectType::TiDB) => self.write_keyword("LONGBLOB"),
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                    self.write_keyword("VARBINARY(MAX)")
+                }
+                Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                    self.write_keyword("BYTEA")
+                }
+                _ => self.write_keyword("BLOB"),
+            },
+            OracleDataType::Raw { length } => match self.config.dialect {
+                Some(DialectType::Oracle) | None => self.write_type_with_length("RAW", *length),
+                Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                    if length.is_some() {
+                        self.unsupported("Oracle RAW length constraint is lost in PostgreSQL")?;
+                    }
+                    self.write_keyword("BYTEA");
+                }
+                _ => self.write_type_with_length("VARBINARY", *length),
+            },
+            OracleDataType::Long { raw } => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword(if *raw { "LONG RAW" } else { "LONG" });
+                } else if *raw {
+                    match self.config.dialect {
+                        Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB) => self.write_keyword("LONGBLOB"),
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                            self.write_keyword("VARBINARY(MAX)")
+                        }
+                        Some(DialectType::PostgreSQL) | Some(DialectType::Materialize) => {
+                            self.write_keyword("BYTEA")
+                        }
+                        _ => self.write_keyword("BLOB"),
+                    }
+                } else {
+                    match self.config.dialect {
+                        Some(DialectType::MySQL)
+                        | Some(DialectType::SingleStore)
+                        | Some(DialectType::TiDB) => self.write_keyword("LONGTEXT"),
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                            self.write_keyword("VARCHAR(MAX)")
+                        }
+                        _ => self.write_keyword("TEXT"),
+                    }
+                }
+            }
+            OracleDataType::RowId => {
+                if matches!(self.config.dialect, Some(DialectType::Oracle) | None) {
+                    self.write_keyword("ROWID");
+                } else {
+                    self.unsupported(
+                        "Oracle ROWID physical row identity is reduced to its text representation",
+                    )?;
+                    self.write_keyword("CHAR(18)");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn generate_data_type(&mut self, dt: &DataType) -> Result<()> {
         use crate::dialects::DialectType;
 
@@ -25232,6 +25786,9 @@ impl Generator {
                         }
                     }
                 }
+            }
+            DataType::Oracle { oracle_type } => {
+                self.write_oracle_data_type(oracle_type)?;
             }
             DataType::Char { length } => {
                 // Dialect-specific char type mappings
