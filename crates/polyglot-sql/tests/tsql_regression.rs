@@ -1799,6 +1799,62 @@ fn postgres_row_value_equality_preserves_zero_and_multiple_row_cardinality_for_t
 }
 
 #[test]
+fn postgres_row_value_equality_handles_nulls_aliases_and_query_modifiers_for_tsql() {
+    let null_component = pg_to_tsql_strict("SELECT ROW(1, NULL) = (SELECT 1, 2) AS eq");
+    assert!(
+        null_component.contains(
+            "_polyglot_row._polyglot_row_value_1 = 1 AND \
+             _polyglot_row._polyglot_row_value_2 = NULL THEN 1"
+        ),
+        "{null_component}"
+    );
+    assert!(
+        null_component.contains(
+            "_polyglot_row._polyglot_row_value_1 <> 1 OR \
+             _polyglot_row._polyglot_row_value_2 <> NULL THEN 0 ELSE NULL END"
+        ),
+        "{null_component}"
+    );
+    assert!(!null_component.contains("EXISTS"), "{null_component}");
+
+    let alias_collision = pg_to_tsql_strict(
+        "SELECT ROW(_polyglot_row._polyglot_row_value_1, _polyglot_row.f2) = \
+         (SELECT 1, 2) AS eq FROM subselect_tbl AS _polyglot_row",
+    );
+    assert!(
+        alias_collision.contains(
+            "FROM (SELECT 1, 2) AS \
+             _polyglot_row_2(_polyglot_row_value_1_2, _polyglot_row_value_2)"
+        ),
+        "{alias_collision}"
+    );
+    assert!(
+        alias_collision.contains(
+            "_polyglot_row_2._polyglot_row_value_1_2 = \
+             _polyglot_row._polyglot_row_value_1"
+        ),
+        "{alias_collision}"
+    );
+    assert!(
+        alias_collision.contains("FROM subselect_tbl AS _polyglot_row"),
+        "{alias_collision}"
+    );
+
+    let query_modifiers = pg_to_tsql_strict(
+        "SELECT ROW(1, 2) = \
+         (SELECT f1, f2 FROM subselect_tbl ORDER BY f1 LIMIT 1) AS eq",
+    );
+    assert!(
+        query_modifiers.contains(
+            "FROM (SELECT TOP 1 f1, f2 FROM subselect_tbl ORDER BY \
+             CASE WHEN f1 IS NULL THEN 1 ELSE 0 END, f1) AS \
+             _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)"
+        ),
+        "{query_modifiers}"
+    );
+}
+
+#[test]
 fn postgres_row_value_subquery_arity_mismatch_fails_tsql_strict_mode() {
     let err = Dialect::get(DialectType::PostgreSQL)
         .transpile_with(

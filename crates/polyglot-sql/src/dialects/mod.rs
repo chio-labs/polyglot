@@ -181,6 +181,8 @@ use crate::generator::{Generator, GeneratorConfig};
 #[cfg(feature = "transpile")]
 use crate::guard::enforce_generate_ast;
 use crate::guard::{enforce_input, ComplexityGuardOptions};
+#[cfg(feature = "transpile")]
+use crate::helper::find_new_name;
 use crate::parser::Parser;
 #[cfg(feature = "transpile")]
 use crate::tokens::TokenType;
@@ -6643,41 +6645,38 @@ impl Dialect {
             };
 
         let row_values = Self::row_value_expressions(row)?;
-        let query = Self::select_from_subquery_expression(query)?;
-        if row_values.is_empty() || row_values.len() != query.expressions.len() {
+        let projection_count = Self::subquery_projection_count(query)?;
+        if row_values.is_empty() || row_values.len() != projection_count {
             return None;
         }
 
-        // Keep the original query intact behind a derived table. The outer scalar
+        // Keep the complete original query behind a derived table. The outer scalar
         // SELECT therefore returns the same number of rows as the PostgreSQL
         // single-row subquery: zero rows stay NULL and multiple rows still raise a
         // scalar-subquery cardinality error in T-SQL/Fabric.
-        let source_alias = "_polyglot_row";
+        let mut taken_names = HashSet::new();
+        Self::collect_generated_alias_conflicts(row, &mut taken_names);
+        Self::collect_generated_alias_conflicts(query, &mut taken_names);
+
+        let source_alias = find_new_name(&taken_names, "_polyglot_row");
+        taken_names.insert(source_alias.to_ascii_lowercase());
         let column_aliases = (1..=row_values.len())
-            .map(|index| Identifier::new(format!("_polyglot_row_value_{index}")))
+            .map(|index| {
+                let name = find_new_name(&taken_names, &format!("_polyglot_row_value_{index}"));
+                taken_names.insert(name.to_ascii_lowercase());
+                Identifier::new(name)
+            })
             .collect::<Vec<_>>();
-        let source = Expression::Subquery(Box::new(Subquery {
-            this: Expression::Select(Box::new(query)),
-            alias: Some(Identifier::new(source_alias)),
-            column_aliases: column_aliases.clone(),
-            alias_explicit_as: true,
-            alias_keyword: None,
-            order_by: None,
-            limit: None,
-            offset: None,
-            distribute_by: None,
-            sort_by: None,
-            cluster_by: None,
-            lateral: false,
-            modifiers_inside: false,
-            trailing_comments: Vec::new(),
-            inferred_type: None,
-        }));
+        let source = Self::subquery_as_derived_table(
+            query,
+            Identifier::new(&source_alias),
+            column_aliases.clone(),
+        )?;
 
         let mut equal_components = Vec::with_capacity(row_values.len());
         let mut unequal_components = Vec::with_capacity(row_values.len());
         for (column, row_value) in column_aliases.into_iter().zip(row_values) {
-            let projected = Expression::qualified_column(source_alias, column.name);
+            let projected = Expression::qualified_column(source_alias.clone(), column.name);
             equal_components.push(Expression::Eq(Box::new(BinaryOp::new(
                 projected.clone(),
                 row_value.clone(),
@@ -6745,12 +6744,123 @@ impl Dialect {
         }
     }
 
-    fn select_from_subquery_expression(expr: &Expression) -> Option<Select> {
+    fn subquery_projection_count(expr: &Expression) -> Option<usize> {
         match expr {
-            Expression::Select(select) => Some((**select).clone()),
-            Expression::Subquery(subquery) => Self::select_from_subquery_expression(&subquery.this),
-            Expression::Paren(paren) => Self::select_from_subquery_expression(&paren.this),
+            Expression::Select(select) => Some(select.expressions.len()),
+            Expression::Subquery(subquery) => Self::subquery_projection_count(&subquery.this),
+            Expression::Paren(paren) => Self::subquery_projection_count(&paren.this),
             _ => None,
+        }
+    }
+
+    fn subquery_as_derived_table(
+        expr: &Expression,
+        alias: Identifier,
+        column_aliases: Vec<Identifier>,
+    ) -> Option<Expression> {
+        match expr.clone() {
+            Expression::Subquery(mut subquery) => {
+                subquery.alias = Some(alias);
+                subquery.column_aliases = column_aliases;
+                subquery.alias_explicit_as = true;
+                subquery.alias_keyword = None;
+                Some(Expression::Subquery(subquery))
+            }
+            Expression::Select(_) | Expression::Paren(_) => {
+                Some(Expression::Subquery(Box::new(Subquery {
+                    this: expr.clone(),
+                    alias: Some(alias),
+                    column_aliases,
+                    alias_explicit_as: true,
+                    alias_keyword: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    distribute_by: None,
+                    sort_by: None,
+                    cluster_by: None,
+                    lateral: false,
+                    modifiers_inside: false,
+                    trailing_comments: Vec::new(),
+                    inferred_type: None,
+                })))
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_generated_alias_conflicts(expr: &Expression, names: &mut HashSet<String>) {
+        fn insert(names: &mut HashSet<String>, identifier: &Identifier) {
+            if !identifier.name.is_empty() {
+                names.insert(identifier.name.to_ascii_lowercase());
+            }
+        }
+
+        for node in expr.dfs() {
+            match node {
+                Expression::Identifier(identifier) => insert(names, identifier),
+                Expression::Column(column) => {
+                    insert(names, &column.name);
+                    if let Some(table) = &column.table {
+                        insert(names, table);
+                    }
+                }
+                Expression::Table(table) => {
+                    insert(names, &table.name);
+                    if let Some(schema) = &table.schema {
+                        insert(names, schema);
+                    }
+                    if let Some(catalog) = &table.catalog {
+                        insert(names, catalog);
+                    }
+                    if let Some(alias) = &table.alias {
+                        insert(names, alias);
+                    }
+                    for alias in &table.column_aliases {
+                        insert(names, alias);
+                    }
+                }
+                Expression::Alias(alias) => {
+                    insert(names, &alias.alias);
+                    for column_alias in &alias.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Subquery(subquery) => {
+                    if let Some(alias) = &subquery.alias {
+                        insert(names, alias);
+                    }
+                    for column_alias in &subquery.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Cte(cte) => {
+                    insert(names, &cte.alias);
+                    for column in &cte.columns {
+                        insert(names, column);
+                    }
+                    for key in &cte.key_expressions {
+                        insert(names, key);
+                    }
+                }
+                Expression::Values(values) => {
+                    if let Some(alias) = &values.alias {
+                        insert(names, alias);
+                    }
+                    for column_alias in &values.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Unnest(unnest) => {
+                    if let Some(alias) = &unnest.alias {
+                        insert(names, alias);
+                    }
+                    if let Some(offset_alias) = &unnest.offset_alias {
+                        insert(names, offset_alias);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
