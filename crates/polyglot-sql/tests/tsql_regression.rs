@@ -1753,17 +1753,49 @@ fn postgres_row_value_equality_subquery_rewrites_in_predicate_contexts_for_tsql(
     let out = pg_to_tsql_strict("SELECT f1 FROM t WHERE ROW(f1, f2) = (SELECT a, b FROM t2)");
     assert_eq!(
         out,
-        "SELECT f1 FROM t WHERE EXISTS(SELECT 1 FROM t2 WHERE t2.a = t.f1 AND t2.b = t.f2)"
+        "SELECT f1 FROM t WHERE CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = f1 AND _polyglot_row._polyglot_row_value_2 = f2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> f1 OR _polyglot_row._polyglot_row_value_2 <> f2 THEN 0 ELSE NULL END FROM (SELECT a, b FROM t2) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) <> 0"
     );
 }
 
 #[test]
-fn postgres_row_value_equality_subquery_rewrites_inside_scalar_boolean_for_tsql() {
-    let out = pg_to_tsql_strict("SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM t");
-    assert_eq!(
-        out,
-        "SELECT CAST(CASE WHEN EXISTS(SELECT 1 WHERE f1 = 1 AND f2 = 2) THEN 1 ELSE 0 END AS BIT) AS eq FROM t"
+fn postgres_row_value_equality_issue_271_examples_preserve_three_valued_semantics_for_tsql() {
+    let cases = [
+        (
+            "SELECT ROW(1, 2) = (SELECT 3, 4) AS eq FROM subselect_tbl;",
+            "SELECT CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = 1 AND _polyglot_row._polyglot_row_value_2 = 2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> 1 OR _polyglot_row._polyglot_row_value_2 <> 2 THEN 0 ELSE NULL END FROM (SELECT 3, 4) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) AS eq FROM subselect_tbl",
+        ),
+        (
+            "SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM subselect_tbl;",
+            "SELECT CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = 1 AND _polyglot_row._polyglot_row_value_2 = 2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> 1 OR _polyglot_row._polyglot_row_value_2 <> 2 THEN 0 ELSE NULL END FROM (SELECT f1, f2) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) AS eq FROM subselect_tbl",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(pg_to_tsql_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_row_value_equality_preserves_zero_and_multiple_row_cardinality_for_tsql() {
+    let zero_rows = pg_to_tsql_strict(
+        "SELECT ROW(1, 2) = (SELECT f1, f2 FROM subselect_tbl WHERE FALSE) AS eq",
     );
+    assert!(zero_rows.contains("ELSE NULL END"), "{zero_rows}");
+    assert!(
+        zero_rows
+            .contains("FROM (SELECT f1, f2 FROM subselect_tbl WHERE (1 = 0)) AS _polyglot_row"),
+        "{zero_rows}"
+    );
+    assert!(!zero_rows.contains("EXISTS"), "{zero_rows}");
+
+    let potentially_multiple_rows =
+        pg_to_tsql_strict("SELECT ROW(1, 2) = (SELECT f1, f2 FROM subselect_tbl) AS eq");
+    assert!(
+        potentially_multiple_rows
+            .contains("FROM (SELECT f1, f2 FROM subselect_tbl) AS _polyglot_row"),
+        "{potentially_multiple_rows}"
+    );
+    assert!(!potentially_multiple_rows.contains("EXISTS"));
 }
 
 #[test]

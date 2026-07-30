@@ -163,8 +163,8 @@ use crate::error::Result;
 #[cfg(feature = "transpile")]
 use crate::expressions::{
     BinaryOp, Case, Cast, ColumnConstraint, DateBin, Fetch, Function, Identifier, Interval,
-    IntervalUnit, IntervalUnitSpec, Literal, Offset, Over, Top, Var, WindowFrame, WindowFrameBound,
-    WindowFrameKind,
+    IntervalUnit, IntervalUnitSpec, Literal, Offset, Over, Select, Subquery, Top, Var, WindowFrame,
+    WindowFrameBound, WindowFrameKind,
 };
 use crate::expressions::{DataType, Expression};
 #[cfg(any(
@@ -3917,6 +3917,11 @@ impl Dialect {
                 let normalized = if matches!(target, DialectType::TSQL | DialectType::Fabric)
                     && !matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
                 {
+                    let normalized = if self.dialect_type == DialectType::PostgreSQL {
+                        Self::rewrite_postgres_row_value_equality_for_tsql(normalized)?
+                    } else {
+                        normalized
+                    };
                     Self::rewrite_boolean_values_for_tsql(normalized)?
                 } else {
                     normalized
@@ -6613,6 +6618,139 @@ impl Dialect {
                 Ok(Expression::Except(except))
             }
             other => Self::rewrite_tsql_boolean_nested_contexts(other),
+        }
+    }
+
+    fn rewrite_postgres_row_value_equality_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Eq(op) => {
+                let op = *op;
+                Ok(Self::postgres_row_value_equality_to_tsql_scalar(&op)
+                    .unwrap_or_else(|| Expression::Eq(Box::new(op))))
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn postgres_row_value_equality_to_tsql_scalar(op: &BinaryOp) -> Option<Expression> {
+        let (row, query) =
+            if Self::expr_is_row_value(&op.left) && Self::expr_is_subquery_like(&op.right) {
+                (&op.left, &op.right)
+            } else if Self::expr_is_row_value(&op.right) && Self::expr_is_subquery_like(&op.left) {
+                (&op.right, &op.left)
+            } else {
+                return None;
+            };
+
+        let row_values = Self::row_value_expressions(row)?;
+        let query = Self::select_from_subquery_expression(query)?;
+        if row_values.is_empty() || row_values.len() != query.expressions.len() {
+            return None;
+        }
+
+        // Keep the original query intact behind a derived table. The outer scalar
+        // SELECT therefore returns the same number of rows as the PostgreSQL
+        // single-row subquery: zero rows stay NULL and multiple rows still raise a
+        // scalar-subquery cardinality error in T-SQL/Fabric.
+        let source_alias = "_polyglot_row";
+        let column_aliases = (1..=row_values.len())
+            .map(|index| Identifier::new(format!("_polyglot_row_value_{index}")))
+            .collect::<Vec<_>>();
+        let source = Expression::Subquery(Box::new(Subquery {
+            this: Expression::Select(Box::new(query)),
+            alias: Some(Identifier::new(source_alias)),
+            column_aliases: column_aliases.clone(),
+            alias_explicit_as: true,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        let mut equal_components = Vec::with_capacity(row_values.len());
+        let mut unequal_components = Vec::with_capacity(row_values.len());
+        for (column, row_value) in column_aliases.into_iter().zip(row_values) {
+            let projected = Expression::qualified_column(source_alias, column.name);
+            equal_components.push(Expression::Eq(Box::new(BinaryOp::new(
+                projected.clone(),
+                row_value.clone(),
+            ))));
+            unequal_components.push(Expression::Neq(Box::new(BinaryOp::new(
+                projected, row_value,
+            ))));
+        }
+
+        let all_equal = equal_components
+            .into_iter()
+            .reduce(|left, right| Expression::And(Box::new(BinaryOp::new(left, right))))?;
+        let any_unequal = unequal_components
+            .into_iter()
+            .reduce(|left, right| Expression::Or(Box::new(BinaryOp::new(left, right))))?;
+        let comparison = Expression::Case(Box::new(Case {
+            operand: None,
+            whens: vec![
+                (all_equal, Expression::number(1)),
+                (any_unequal, Expression::number(0)),
+            ],
+            else_: Some(Expression::null()),
+            comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        let scalar_select = Select::new().column(comparison).from(source);
+        let scalar_subquery = Expression::Subquery(Box::new(Subquery {
+            this: Expression::Select(Box::new(scalar_select)),
+            alias: None,
+            column_aliases: Vec::new(),
+            alias_explicit_as: false,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            inferred_type: Some(DataType::Boolean),
+        }));
+
+        Some(Expression::Cast(Box::new(Cast {
+            this: scalar_subquery,
+            to: DataType::Boolean,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: Some(DataType::Boolean),
+        })))
+    }
+
+    fn row_value_expressions(expr: &Expression) -> Option<Vec<Expression>> {
+        match expr {
+            Expression::Tuple(tuple) => Some(tuple.expressions.clone()),
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("ROW") => {
+                Some(function.args.clone())
+            }
+            Expression::Paren(paren) => Self::row_value_expressions(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn select_from_subquery_expression(expr: &Expression) -> Option<Select> {
+        match expr {
+            Expression::Select(select) => Some((**select).clone()),
+            Expression::Subquery(subquery) => Self::select_from_subquery_expression(&subquery.this),
+            Expression::Paren(paren) => Self::select_from_subquery_expression(&paren.this),
+            _ => None,
         }
     }
 
