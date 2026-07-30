@@ -974,7 +974,9 @@ impl TSQLDialect {
                     }
                 }
                 '.' if !saw_decimal => saw_decimal = true,
-                ',' | ' ' => {}
+                // Group separators and positional whitespace have format-model
+                // semantics that a raw TRY_CONVERT cannot reproduce.
+                ',' | ' ' => return None,
                 _ => return None,
             }
         }

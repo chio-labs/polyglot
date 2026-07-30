@@ -349,6 +349,14 @@ fn postgres_math_and_string_functions_map_to_tsql_semantics() {
             "SELECT to_number('123.45', '999.99')",
             "SELECT TRY_CONVERT(DECIMAL(18, 2), '123.45')",
         ),
+        (
+            "SELECT to_number('7.25', 'FM9.99')",
+            "SELECT TRY_CONVERT(DECIMAL(18, 2), '7.25')",
+        ),
+        (
+            "SELECT to_number('123', '999')",
+            "SELECT TRY_CONVERT(DECIMAL(18, 0), '123')",
+        ),
     ];
 
     for (sql, expected) in cases {
@@ -494,6 +502,31 @@ fn postgres_math_functions_without_tsql_equivalent_fail_in_strict_mode() {
         assert!(
             err.to_string().contains(expected),
             "unexpected error for {sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn postgres_to_number_grouping_and_space_masks_do_not_lower_to_try_convert_for_tsql() {
+    let cases = [
+        "SELECT to_number('34,50', '999,99')",
+        "SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')",
+    ];
+
+    for sql in cases {
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::TSQL, TranspileOptions::strict())
+            .expect_err("strict mode should reject unsupported TO_NUMBER format masks");
+
+        assert!(
+            err.to_string().contains("TO_NUMBER"),
+            "unexpected error for {sql}: {err}"
+        );
+
+        let best_effort = pg_to_tsql(sql);
+        assert!(
+            best_effort.contains("TO_NUMBER") && !best_effort.contains("TRY_CONVERT"),
+            "unsupported format mask was lowered unsafely for {sql}: {best_effort}"
         );
     }
 }
