@@ -3860,6 +3860,14 @@ impl Dialect {
                     normalized
                 };
 
+                let normalized = if self.dialect_type == DialectType::PostgreSQL
+                    && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::normalize_postgres_bytea_literals_for_tsql(normalized)?
+                } else {
+                    normalized
+                };
+
                 let normalized = if matches!(
                     self.dialect_type,
                     DialectType::PostgreSQL | DialectType::CockroachDB
@@ -4428,6 +4436,16 @@ impl Dialect {
                             &mut diagnostics,
                             &format!("PostgreSQL {string_semantics}"),
                         );
+                    }
+                    if source == DialectType::PostgreSQL {
+                        if let Some(binary_semantics) =
+                            Self::postgres_tsql_unsupported_binary_semantics(node)
+                        {
+                            Self::push_unsupported_diagnostic(
+                                &mut diagnostics,
+                                &format!("PostgreSQL {binary_semantics}"),
+                            );
+                        }
                     }
                     if let Some(function_name) =
                         Self::postgres_tsql_unsupported_function_name(node, target)
@@ -6098,6 +6116,110 @@ impl Dialect {
             }
             other => Ok(other),
         })
+    }
+
+    fn normalize_postgres_bytea_literals_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Cast(cast) if Self::is_postgres_bytea_data_type(&cast.to) => {
+                let Some(value) = Self::postgres_plain_string_literal_value(&cast.this) else {
+                    return Ok(Expression::Cast(cast));
+                };
+                let Some(hex) = Self::postgres_bytea_hex_payload(value) else {
+                    return Ok(Expression::Cast(cast));
+                };
+
+                // Replace the complete BYTEA cast. Keeping a bare T-SQL
+                // CAST(... AS VARBINARY) would apply SQL Server's default length
+                // and could truncate payloads longer than 30 bytes.
+                Ok(Expression::Literal(Box::new(Literal::HexString(hex))))
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn postgres_plain_string_literal_value(expr: &Expression) -> Option<&str> {
+        match expr {
+            Expression::Literal(literal) => match literal.as_ref() {
+                Literal::String(value) => Some(value),
+                _ => None,
+            },
+            Expression::Paren(paren) => Self::postgres_plain_string_literal_value(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn postgres_bytea_hex_payload(value: &str) -> Option<String> {
+        let payload = value.strip_prefix("\\x")?;
+        if payload.is_empty() {
+            return Some(String::new());
+        }
+
+        let mut chars = payload.chars().peekable();
+        let mut hex = String::with_capacity(payload.len());
+        loop {
+            let high = chars.next()?;
+            let low = chars.next()?;
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return None;
+            }
+            hex.push(high);
+            hex.push(low);
+
+            let Some(next) = chars.peek().copied() else {
+                return Some(hex);
+            };
+            if next.is_ascii_whitespace() {
+                while chars
+                    .peek()
+                    .is_some_and(|character| character.is_ascii_whitespace())
+                {
+                    chars.next();
+                }
+                // PostgreSQL permits whitespace between byte pairs, not after
+                // the prefix or after the final pair.
+                chars.peek()?;
+            }
+        }
+    }
+
+    fn is_postgres_bytea_data_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::VarBinary { length: None } => true,
+            DataType::Custom { name } => name.trim().eq_ignore_ascii_case("BYTEA"),
+            _ => false,
+        }
+    }
+
+    fn postgres_tsql_unsupported_binary_semantics(expr: &Expression) -> Option<&'static str> {
+        let cast = match expr {
+            Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast)
+                if Self::is_postgres_bytea_data_type(&cast.to) =>
+            {
+                cast
+            }
+            _ => return None,
+        };
+
+        let literal = match &cast.this {
+            Expression::Literal(literal) => literal.as_ref(),
+            Expression::Paren(paren) => match &paren.this {
+                Expression::Literal(literal) => literal.as_ref(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let value = match literal {
+            Literal::String(value) | Literal::EscapeString(value) => value,
+            _ => return None,
+        };
+
+        if value.starts_with("\\x") {
+            Some("bytea hex literals with invalid or unsupported formatting")
+        } else if value.contains('\\') {
+            Some("bytea escape-format literals")
+        } else {
+            None
+        }
     }
 
     fn recover_postgres_like_escape(op: &mut crate::expressions::LikeOp) {

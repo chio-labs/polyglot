@@ -348,6 +348,10 @@ fn postgres_math_and_string_functions_map_to_fabric_semantics() {
             "SELECT LOWER(CONVERT(VARCHAR(MAX), CAST('abc' AS VARBINARY(MAX)), 2))",
         ),
         (
+            "SELECT encode('\\x1234567890abcdef00'::bytea, 'hex')",
+            "SELECT LOWER(CONVERT(VARCHAR(MAX), CAST(0x1234567890abcdef00 AS VARBINARY(MAX)), 2))",
+        ),
+        (
             "SELECT to_number('123.45', '999.99')",
             "SELECT TRY_CONVERT(DECIMAL(18, 2), '123.45')",
         ),
@@ -355,6 +359,40 @@ fn postgres_math_and_string_functions_map_to_fabric_semantics() {
 
     for (sql, expected) in cases {
         assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_bytea_hex_literals_map_to_fabric_binary_literals() {
+    let cases = [
+        ("SELECT '\\x1234'::bytea", "SELECT 0x1234"),
+        ("SELECT '\\xDE AD BE EF'::bytea", "SELECT 0xDEADBEEF"),
+        (
+            "SELECT '\\x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'::bytea",
+            "SELECT 0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_unsafe_bytea_literal_forms_fail_for_fabric_in_strict_mode() {
+    for sql in [
+        "SELECT '\\x1'::bytea",
+        "SELECT '\\x1 2'::bytea",
+        "SELECT '\\001\\134'::bytea",
+    ] {
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .expect_err("strict mode should reject unsafe PostgreSQL bytea literals");
+
+        assert!(
+            err.to_string().contains("bytea"),
+            "unexpected error for {sql}: {err}"
+        );
     }
 }
 
