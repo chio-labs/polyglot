@@ -6,7 +6,7 @@
 //!
 
 use crate::dialects::DialectType;
-use crate::expressions::{Expression, Identifier, JoinKind, NamedWindow, Select};
+use crate::expressions::{Expression, Identifier, JoinKind, NamedWindow, Select, With};
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
 use crate::optimizer::annotate_types::annotate_types;
@@ -400,77 +400,144 @@ pub fn expand_cte_stars(expr: &mut Expression, schema: Option<&dyn Schema>) {
         return;
     }
 
-    let select = match expr {
-        Expression::Select(s) => s,
-        _ => return,
-    };
+    let resolved_cte_columns = {
+        let with = match query_with_mut(expr) {
+            Some(with) => with,
+            None => return,
+        };
+        let is_recursive_with = with.recursive;
+        let mut resolved_cte_columns: HashMap<String, Vec<String>> = HashMap::new();
 
-    let with = match &mut select.with {
-        Some(w) => w,
-        None => return,
-    };
+        for cte in &mut with.ctes {
+            let cte_name = normalize_cte_name(&cte.alias);
+            let explicit_columns = (!cte.columns.is_empty())
+                .then(|| cte.columns.iter().map(|c| c.name.clone()).collect());
 
-    let mut resolved_cte_columns: HashMap<String, Vec<String>> = HashMap::new();
-
-    for cte in &mut with.ctes {
-        let cte_name = normalize_cte_name(&cte.alias);
-
-        // If CTE has explicit column list (e.g., cte(a, b) AS (...)), use that
-        if !cte.columns.is_empty() {
-            let cols: Vec<String> = cte.columns.iter().map(|c| c.name.clone()).collect();
-            resolved_cte_columns.insert(cte_name, cols);
-            continue;
-        }
-
-        // Skip recursive CTEs (self-referencing) — their column resolution is complex.
-        // A CTE is recursive if the WITH block is marked recursive AND the CTE body
-        // references itself. We detect this conservatively: if the CTE name appears as
-        // a source in its own body, skip it. Non-recursive CTEs in a recursive WITH
-        // block are still expanded.
-        if with.recursive {
-            let is_self_referencing =
-                if let Some(body_select) = get_leftmost_select_mut(&mut cte.this) {
-                    let body_sources = get_select_sources(body_select);
-                    body_sources.iter().any(|s| s.normalized == cte_name)
-                } else {
-                    false
-                };
-            if is_self_referencing {
+            // Skip recursive CTE bodies — resolving their self-references safely is
+            // more complex than ordered, non-recursive CTE propagation. Inspect every
+            // set-operation arm because the recursive reference normally appears in
+            // the right branch after a non-recursive base case.
+            if is_recursive_with && query_references_source(&cte.this, &cte_name) {
+                if let Some(columns) = explicit_columns {
+                    resolved_cte_columns.insert(cte_name, columns);
+                }
                 continue;
+            }
+
+            // Rewrite every SELECT arm, but derive the CTE's implicit output names
+            // from the leftmost arm only. Explicit CTE column aliases override those
+            // implicit names without preventing safe body expansion.
+            let implicit_columns =
+                rewrite_stars_in_query(&mut cte.this, &resolved_cte_columns, schema);
+            if let Some(columns) = explicit_columns.or(implicit_columns) {
+                resolved_cte_columns.insert(cte_name, columns);
             }
         }
 
-        // Get the SELECT from the CTE body (handle UNION by taking left branch)
-        let body_select = match get_leftmost_select_mut(&mut cte.this) {
-            Some(s) => s,
-            None => continue,
-        };
+        resolved_cte_columns
+    };
 
-        let columns = rewrite_stars_in_select(body_select, &resolved_cte_columns, schema);
-        resolved_cte_columns.insert(cte_name, columns);
-    }
-
-    // Also expand stars in the outer SELECT itself
-    rewrite_stars_in_select(select, &resolved_cte_columns, schema);
+    // Also expand stars in every arm of the outer query. WITH can be attached
+    // directly to a root set operation, so limiting this to Expression::Select
+    // would skip the entire query.
+    rewrite_stars_in_query(expr, &resolved_cte_columns, schema);
 }
 
-/// Get the leftmost SELECT from an expression, drilling through UNION/INTERSECT/EXCEPT.
-///
-/// Per the SQL standard, the column names of a set operation (UNION, INTERSECT, EXCEPT)
-/// are determined by the left branch. This matches sqlglot's behavior.
-fn get_leftmost_select_mut(expr: &mut Expression) -> Option<&mut Select> {
+/// Get the WITH clause attached to a query root, drilling through parentheses.
+fn query_with_mut(expr: &mut Expression) -> Option<&mut With> {
     let mut current = expr;
-    for _ in 0..MAX_LINEAGE_DEPTH {
+    loop {
         match current {
-            Expression::Select(s) => return Some(s),
-            Expression::Union(u) => current = &mut u.left,
-            Expression::Intersect(i) => current = &mut i.left,
-            Expression::Except(e) => current = &mut e.left,
+            Expression::Select(select) => return select.with.as_mut(),
+            Expression::Union(union) => return union.with.as_mut(),
+            Expression::Intersect(intersect) => return intersect.with.as_mut(),
+            Expression::Except(except) => return except.with.as_mut(),
             Expression::Paren(p) => current = &mut p.this,
+            Expression::Subquery(subquery) => current = &mut subquery.this,
             _ => return None,
         }
     }
-    None
+}
+
+/// Whether any SELECT arm in a query directly references `source_name`.
+///
+/// This is used to identify recursive CTEs whose self-reference commonly lives
+/// in a non-leftmost set-operation branch.
+fn query_references_source(expr: &Expression, source_name: &str) -> bool {
+    let mut stack = vec![expr];
+
+    while let Some(current) = stack.pop() {
+        match current {
+            Expression::Select(select) => {
+                if get_select_sources(select)
+                    .iter()
+                    .any(|source| source.normalized == source_name)
+                {
+                    return true;
+                }
+            }
+            Expression::Union(union) => {
+                stack.push(&union.right);
+                stack.push(&union.left);
+            }
+            Expression::Intersect(intersect) => {
+                stack.push(&intersect.right);
+                stack.push(&intersect.left);
+            }
+            Expression::Except(except) => {
+                stack.push(&except.right);
+                stack.push(&except.left);
+            }
+            Expression::Paren(paren) => stack.push(&paren.this),
+            Expression::Subquery(subquery) => stack.push(&subquery.this),
+            _ => {}
+        }
+    }
+
+    false
+}
+
+/// Rewrite stars in every SELECT arm of a query.
+///
+/// The traversal visits left branches first, so the first returned column list
+/// remains the set operation's output column list while all later arms are still
+/// rewritten independently. An explicit stack avoids adding recursion pressure
+/// for deeply nested set-operation chains.
+fn rewrite_stars_in_query(
+    expr: &mut Expression,
+    resolved_ctes: &HashMap<String, Vec<String>>,
+    schema: Option<&dyn Schema>,
+) -> Option<Vec<String>> {
+    let mut leftmost_columns = None;
+    let mut stack = vec![expr];
+
+    while let Some(current) = stack.pop() {
+        match current {
+            Expression::Select(select) => {
+                let columns = rewrite_stars_in_select(select, resolved_ctes, schema);
+                if leftmost_columns.is_none() {
+                    leftmost_columns = Some(columns);
+                }
+            }
+            Expression::Union(union) => {
+                stack.push(&mut union.right);
+                stack.push(&mut union.left);
+            }
+            Expression::Intersect(intersect) => {
+                stack.push(&mut intersect.right);
+                stack.push(&mut intersect.left);
+            }
+            Expression::Except(except) => {
+                stack.push(&mut except.right);
+                stack.push(&mut except.left);
+            }
+            Expression::Paren(paren) => stack.push(&mut paren.this),
+            Expression::Subquery(subquery) => stack.push(&mut subquery.this),
+            _ => {}
+        }
+    }
+
+    leftmost_columns
 }
 
 /// Rewrite star expressions in a SELECT using resolved CTE column lists.
@@ -3749,6 +3816,20 @@ mod tests {
         );
     }
 
+    const ISSUE_368_SQL: &str = "with
+base as (
+  select 1 as col_a
+),
+literal_branch as (
+  select 2 as col_a
+),
+unioned as (
+  select * from base
+  union all
+  select * from literal_branch
+)
+select col_a from unioned";
+
     #[test]
     fn test_simple_lineage() {
         let expr = parse("SELECT a FROM t");
@@ -5304,6 +5385,192 @@ SELECT json_data FROM transform_cte
             all_names.len() >= 2,
             "Expected at least 2 nodes for CTE union star, got: {:?}",
             all_names
+        );
+    }
+
+    #[test]
+    fn test_issue_368_expand_cte_stars_rewrites_every_union_arm() {
+        let mut expr = parse_one(ISSUE_368_SQL, DialectType::BigQuery).unwrap();
+
+        expand_cte_stars(&mut expr, None);
+
+        assert_eq!(
+            crate::generate(&expr, DialectType::BigQuery).unwrap(),
+            "WITH base AS (SELECT 1 AS col_a), literal_branch AS (SELECT 2 AS col_a), \
+             unioned AS (SELECT base.col_a FROM base UNION ALL \
+             SELECT literal_branch.col_a FROM literal_branch) \
+             SELECT col_a FROM unioned"
+        );
+    }
+
+    #[test]
+    fn test_issue_368_lineage_resolves_non_leftmost_union_star() {
+        let expr = parse_one(ISSUE_368_SQL, DialectType::BigQuery).unwrap();
+
+        let node = lineage("col_a", &expr, Some(DialectType::BigQuery), false).unwrap();
+        let names = lineage_names(&node);
+
+        assert!(
+            node.walk().any(|child| {
+                child.name == "col_a"
+                    && child.source_name == "literal_branch"
+                    && child.source_kind == SourceKind::Cte
+            }),
+            "expected the right UNION branch to resolve to literal_branch.col_a, got {node:#?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "*" || name == "literal_branch.*"),
+            "did not expect an unresolved right-branch star, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_expand_cte_stars_rewrites_all_set_operation_kinds() {
+        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            let mut expr = parse(&format!(
+                "WITH left_cte AS (SELECT 1 AS col_a), \
+                 right_cte AS (SELECT 2 AS col_a), \
+                 combined AS (SELECT * FROM left_cte {operator} SELECT * FROM right_cte) \
+                 SELECT col_a FROM combined"
+            ));
+
+            expand_cte_stars(&mut expr, None);
+
+            let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+            assert!(
+                sql.contains("SELECT left_cte.col_a FROM left_cte"),
+                "expected left arm expansion for {operator}, got {sql}"
+            );
+            assert!(
+                sql.contains("SELECT right_cte.col_a FROM right_cte"),
+                "expected right arm expansion for {operator}, got {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_cte_stars_rewrites_nested_parenthesized_set_operations() {
+        let mut expr = parse(
+            "WITH a AS (SELECT 1 AS x), \
+             b AS (SELECT 2 AS x), \
+             c AS (SELECT 3 AS x), \
+             combined AS ((SELECT * FROM a UNION ALL SELECT * FROM b) \
+             UNION ALL SELECT * FROM c) \
+             SELECT x FROM combined",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        for source in ["a", "b", "c"] {
+            assert!(
+                sql.contains(&format!("SELECT {source}.x FROM {source}")),
+                "expected nested arm {source} to be expanded, got {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_cte_stars_rewrites_root_set_operation() {
+        let mut expr = parse(
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS x) \
+             SELECT * FROM a UNION ALL SELECT * FROM b",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        assert!(
+            sql.contains("SELECT a.x FROM a UNION ALL SELECT b.x FROM b"),
+            "expected both root UNION arms to be expanded, got {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expand_cte_stars_preserves_leftmost_output_names() {
+        let mut expr = parse(
+            "WITH a AS (SELECT 1 AS left_name), \
+             b AS (SELECT 2 AS right_name), \
+             combined AS (SELECT * FROM a UNION ALL SELECT * FROM b) \
+             SELECT * FROM combined",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        assert!(
+            sql.ends_with("SELECT combined.left_name FROM combined"),
+            "expected the set operation output name to come from the left arm, got {sql}"
+        );
+        assert!(
+            sql.contains("SELECT b.right_name FROM b"),
+            "expected the differently named right arm to still be expanded, got {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expand_cte_stars_rewrites_body_with_explicit_cte_columns() {
+        let mut expr = parse(
+            "WITH a AS (SELECT 1 AS x), \
+             b AS (SELECT 2 AS x), \
+             combined(output_name) AS (SELECT * FROM a UNION ALL SELECT * FROM b) \
+             SELECT * FROM combined",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        assert!(
+            sql.contains("SELECT a.x FROM a UNION ALL SELECT b.x FROM b"),
+            "expected explicit aliases not to suppress body expansion, got {sql}"
+        );
+        assert!(
+            sql.ends_with("SELECT combined.output_name FROM combined"),
+            "expected the explicit CTE output name to override the body name, got {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expand_cte_stars_keeps_recursive_self_reference_conservative() {
+        let mut expr = parse(
+            "WITH RECURSIVE r(x) AS (\
+             SELECT 1 AS x UNION ALL SELECT * FROM r\
+             ) SELECT * FROM r",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        assert!(
+            sql.contains("UNION ALL SELECT * FROM r"),
+            "expected the recursive body star to remain untouched, got {sql}"
+        );
+        assert!(
+            sql.ends_with("SELECT r.x FROM r"),
+            "expected the explicit recursive CTE column to expand the outer star, got {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expand_cte_stars_preserves_genuinely_unresolved_branch_star() {
+        let mut expr = parse(
+            "WITH known AS (SELECT 1 AS x), \
+             combined AS (SELECT * FROM known UNION ALL SELECT * FROM missing) \
+             SELECT * FROM combined",
+        );
+
+        expand_cte_stars(&mut expr, None);
+
+        let sql = crate::generate(&expr, DialectType::Generic).unwrap();
+        assert!(
+            sql.contains("SELECT known.x FROM known UNION ALL SELECT * FROM missing"),
+            "expected only the resolvable branch to expand, got {sql}"
+        );
+        assert!(
+            sql.ends_with("SELECT combined.x FROM combined"),
+            "expected the leftmost output name to remain usable, got {sql}"
         );
     }
 
