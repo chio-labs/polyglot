@@ -2520,7 +2520,13 @@ impl Generator {
             Expression::Substring(f) => self.generate_substring(f),
             Expression::Upper(f) => self.generate_unary_func("UPPER", f),
             Expression::Lower(f) => self.generate_unary_func("LOWER", f),
-            Expression::Length(f) => self.generate_unary_func("LENGTH", f),
+            Expression::Length(f) => {
+                let name = match self.config.dialect {
+                    Some(DialectType::TSQL) | Some(DialectType::Fabric) => "LEN",
+                    _ => "LENGTH",
+                };
+                self.generate_unary_func(name, f)
+            }
             Expression::Trim(f) => self.generate_trim(f),
             Expression::LTrim(f) => self.generate_simple_func("LTRIM", &f.this),
             Expression::RTrim(f) => self.generate_simple_func("RTRIM", &f.this),

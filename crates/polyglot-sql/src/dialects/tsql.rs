@@ -3522,6 +3522,30 @@ mod tests {
     }
 
     #[test]
+    fn test_issue_374_tsql_parse_then_generate_uses_len() {
+        let sql = "SELECT LEN(table.col1) - LEN(table.col2) FROM table";
+        let ast = Dialect::get(DialectType::TSQL)
+            .parse(sql)
+            .expect("T-SQL should parse");
+        let expression = &ast[0];
+
+        for target in [DialectType::TSQL, DialectType::Fabric] {
+            let generated = Dialect::get(target)
+                .generate(expression)
+                .expect("AST should generate");
+            assert_eq!(generated, sql, "failed for target {target:?}");
+        }
+
+        let standard_sql = "SELECT LENGTH(table.col1) - LENGTH(table.col2) FROM table";
+        for target in [DialectType::Generic, DialectType::PostgreSQL] {
+            let generated = Dialect::get(target)
+                .generate(expression)
+                .expect("AST should generate");
+            assert_eq!(generated, standard_sql, "failed for target {target:?}");
+        }
+    }
+
+    #[test]
     fn test_now_to_getdate() {
         let result = transpile_to_tsql("SELECT NOW()");
         assert!(

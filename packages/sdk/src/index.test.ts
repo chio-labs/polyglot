@@ -226,6 +226,16 @@ describe('Polyglot SDK', () => {
       expect(generateResult.sql![0].toLowerCase()).toContain('from');
     });
 
+    it('should preserve TSQL LEN when generating a parsed AST', () => {
+      const sql = 'SELECT LEN(table.col1) - LEN(table.col2) FROM table';
+      const parseResult = parse(sql, Dialect.TSQL);
+      expect(parseResult.success).toBe(true);
+
+      const generateResult = generate(parseResult.ast, Dialect.TSQL);
+      expect(generateResult.success).toBe(true);
+      expect(generateResult.sql).toEqual([sql]);
+    });
+
     it('should roundtrip PostgreSQL PREPARE statements', () => {
       const parseResult = parse(
         'PREPARE leak (int) AS SELECT id FROM sensitive_table WHERE id = $1',
