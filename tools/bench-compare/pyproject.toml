@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Benchmark environment for parser performance comparisons."
 requires-python = ">=3.9"
 dependencies = [
-    "polyglot-sql",
+    "polyglot-sql-chio",
     "moz-sql-parser>=4.40.0",
     "pyperf>=2.7.0",
     "sqloxide>=0.1.56; python_version < '3.14'",
@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-polyglot-sql = { path = "../../crates/polyglot-sql-python", editable = true }
+polyglot-sql-chio = { path = "../../crates/polyglot-sql-python", editable = true }

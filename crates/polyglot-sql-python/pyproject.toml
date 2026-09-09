@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "polyglot-sql"
+name = "polyglot-sql-chio"
 dynamic = ["version"]
 description = "Rust-powered SQL transpiler for more than 30 SQL dialects. Parse, generate, transpile, format, and validate SQL."
 readme = "README.md"
@@ -27,10 +27,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tobilg/polyglot"
+Homepage = "https://github.com/chio-labs/polyglot"
 Documentation = "https://polyglot.gh.tobilg.com"
-Repository = "https://github.com/tobilg/polyglot"
-Issues = "https://github.com/tobilg/polyglot/issues"
+Repository = "https://github.com/chio-labs/polyglot"
+Issues = "https://github.com/chio-labs/polyglot/issues"
 
 [tool.maturin]
 python-source = "python"

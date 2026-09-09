@@ -1,0 +1,171 @@
+name: Python fork release
+
+on:
+  push:
+    tags: ['python-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test Rust library
+        run: cargo test --lib -p polyglot-sql
+
+  wheels-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: '2014'
+          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          sccache: true
+
+      - name: Smoke test wheel
+        if: matrix.target == 'x86_64'
+        run: |
+          version="${GITHUB_REF_NAME#python-v}"
+          python -m pip install --no-index --find-links dist "polyglot-sql-chio==${version}"
+          python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-python-wheels-linux-${{ matrix.target }}
+          path: dist
+
+  wheels-macos:
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          sccache: true
+
+      - name: Smoke test wheel
+        run: |
+          version="${GITHUB_REF_NAME#python-v}"
+          python -m pip install --no-index --find-links dist "polyglot-sql-chio==${version}"
+          python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-python-wheels-macos-${{ matrix.target }}
+          path: dist
+
+  wheels-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        env:
+          SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          sccache: true
+
+      - name: Smoke test wheel
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring('python-v'.Length)
+          python -m pip install --no-index --find-links dist "polyglot-sql-chio==$version"
+          python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-python-wheels-windows-x86_64
+          path: dist
+
+  sdist:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build source distribution
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path crates/polyglot-sql-python/Cargo.toml
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-python-sdist
+          path: dist
+
+  publish:
+    needs: [wheels-linux, wheels-macos, wheels-windows, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/polyglot-sql-chio
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: fork-python-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify artifact versions
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("python-v")
+          artifacts = list(Path("dist").iterdir())
+          if not artifacts:
+              raise SystemExit("No distribution artifacts found")
+          invalid = [
+              path.name
+              for path in artifacts
+              if not path.name.startswith(f"polyglot_sql_chio-{expected}-")
+              and path.name != f"polyglot_sql_chio-{expected}.tar.gz"
+          ]
+          if invalid:
+              raise SystemExit(f"Artifact version mismatch: {invalid}")
+          print(f"Verified {len(artifacts)} artifacts for version {expected}")
+          PY
+
+      - name: Publish Python distribution
+        uses: pypa/gh-action-pypi-publish@release/v1
