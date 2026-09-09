@@ -2067,19 +2067,59 @@ fn check_query_reference_quality(
     strict: bool,
     relationships: &[DeclaredRelationship],
 ) -> Vec<ValidationError> {
+    let scope = build_scope(stmt);
+    let has_scoped_query = select_for_scope_expression(&scope.expression).is_some()
+        || !scope.cte_scopes.is_empty()
+        || !scope.union_scopes.is_empty()
+        || !scope.derived_table_scopes.is_empty()
+        || !scope.udtf_scopes.is_empty()
+        || !scope.subquery_scopes.is_empty();
+    if has_scoped_query {
+        return check_scope_reference_quality(
+            &scope,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        );
+    }
+
     let mut errors = Vec::new();
-
     for node in stmt.dfs() {
-        let Expression::Select(select) = node else {
+        if !matches!(node, Expression::Select(_)) {
             continue;
-        };
+        }
+        let query_scope = build_scope(node);
+        errors.extend(check_scope_reference_quality(
+            &query_scope,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
+    errors
+}
 
-        let select_expr = Expression::Select(select.clone());
+fn check_scope_reference_quality(
+    scope: &crate::scope::Scope,
+    schema_map: &HashMap<String, TableSchemaEntry>,
+    resolver_schema: &MappingSchema,
+    strict: bool,
+    relationships: &[DeclaredRelationship],
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if let Some(select) = select_for_scope_expression(&scope.expression) {
+        let select_expr = Expression::Select(Box::new(select.clone()));
         let context = collect_type_check_context(&select_expr, schema_map);
-        let scope = build_scope(&select_expr);
-        let mut resolver = Resolver::new(&scope, resolver_schema, true);
+        let mut resolver = Resolver::new(scope, resolver_schema, true);
 
-        if context.referenced_tables.len() > 1 {
+        let direct_source_count = select
+            .from
+            .as_ref()
+            .map_or(0, |from| from.expressions.len())
+            + select.joins.len();
+        if direct_source_count > 1 {
             let using_columns: HashSet<String> = select
                 .joins
                 .iter()
@@ -2192,6 +2232,51 @@ fn check_query_reference_quality(
         }
     }
 
+    for child in &scope.cte_scopes {
+        errors.extend(check_scope_reference_quality(
+            child,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
+    for child in &scope.union_scopes {
+        errors.extend(check_scope_reference_quality(
+            child,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
+    for child in &scope.derived_table_scopes {
+        errors.extend(check_scope_reference_quality(
+            child,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
+    for child in &scope.udtf_scopes {
+        errors.extend(check_scope_reference_quality(
+            child,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
+    for child in &scope.subquery_scopes {
+        errors.extend(check_scope_reference_quality(
+            child,
+            schema_map,
+            resolver_schema,
+            strict,
+            relationships,
+        ));
+    }
     errors
 }
 
@@ -3325,6 +3410,7 @@ fn source_display_name(scope: &crate::scope::Scope, source_name: &str) -> String
 fn validate_select_columns_with_schema(
     select: &crate::expressions::Select,
     scope: &crate::scope::Scope,
+    outer_sources: &HashMap<String, crate::scope::SourceInfo>,
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     strict: bool,
@@ -3403,6 +3489,21 @@ fn validate_select_columns_with_schema(
             .collect();
 
         if !matching_sources.is_empty() {
+            continue;
+        }
+
+        let mut outer_scope = normalized_scope.clone();
+        outer_scope.sources = outer_sources.clone();
+        let mut outer_resolver = Resolver::new(&outer_scope, resolver_schema, true);
+        let matches_outer_source = outer_scope.sources.keys().any(|source_name| {
+            outer_resolver
+                .get_source_columns(source_name)
+                .ok()
+                .is_some_and(|columns| {
+                    !columns.is_empty() && source_has_column(&columns, &col_name)
+                })
+        });
+        if matches_outer_source {
             continue;
         }
 
@@ -3495,6 +3596,7 @@ fn validate_scope_columns_with_schema(
     strict: bool,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
+    let empty_sources = HashMap::new();
     let mut effective_scope = scope.clone();
     if scope.can_be_correlated {
         for node in walk_in_scope(&scope.expression, false) {
@@ -3520,6 +3622,7 @@ fn validate_scope_columns_with_schema(
         errors.extend(validate_select_columns_with_schema(
             select,
             &effective_scope,
+            outer_sources,
             schema_map,
             resolver_schema,
             strict,
@@ -3529,7 +3632,7 @@ fn validate_scope_columns_with_schema(
     for child in &scope.cte_scopes {
         errors.extend(validate_scope_columns_with_schema(
             child,
-            &HashMap::new(),
+            &empty_sources,
             schema_map,
             resolver_schema,
             strict,
@@ -3547,7 +3650,11 @@ fn validate_scope_columns_with_schema(
     for child in &scope.derived_table_scopes {
         errors.extend(validate_scope_columns_with_schema(
             child,
-            &HashMap::new(),
+            if child.can_be_correlated {
+                outer_sources
+            } else {
+                &empty_sources
+            },
             schema_map,
             resolver_schema,
             strict,
@@ -3556,7 +3663,11 @@ fn validate_scope_columns_with_schema(
     for child in &scope.udtf_scopes {
         errors.extend(validate_scope_columns_with_schema(
             child,
-            &HashMap::new(),
+            if child.can_be_correlated {
+                outer_sources
+            } else {
+                &empty_sources
+            },
             schema_map,
             resolver_schema,
             strict,

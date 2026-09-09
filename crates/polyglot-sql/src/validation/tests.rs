@@ -300,6 +300,239 @@ fn test_validate_with_schema_window_resolves_prior_cte_projection() {
 }
 
 #[test]
+fn test_validate_with_schema_joined_cte_projection_preserves_scope() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    for dialect in schema_validation_dialects() {
+        let result = validate_with_schema(
+            "WITH selected_users AS (SELECT id, name FROM users), \
+             selected_orders AS (SELECT id, user_id, total FROM orders), \
+             combined AS (SELECT selected_users.*, selected_orders.total \
+             FROM selected_users JOIN selected_orders \
+             ON selected_users.id = selected_orders.user_id) \
+             SELECT id, name, total FROM combined",
+            dialect,
+            &schema,
+            &opts,
+        );
+
+        assert!(result.valid, "{dialect}: {:#?}", result.errors);
+    }
+}
+
+#[test]
+fn test_validate_with_schema_chained_star_projection_preserves_aliases() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    for dialect in schema_validation_dialects() {
+        let result = validate_with_schema(
+            "WITH totals AS (SELECT user_id, total AS order_total FROM orders), \
+             copied AS (SELECT * FROM totals), \
+             scored AS (SELECT *, order_total + 1 AS adjusted_total FROM copied) \
+             SELECT user_id, order_total, adjusted_total FROM scored",
+            dialect,
+            &schema,
+            &opts,
+        );
+
+        assert!(result.valid, "{dialect}: {:#?}", result.errors);
+    }
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_qualify_resolves_projection_columns() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH ranked AS (SELECT user_id, total, \
+         ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY total DESC) AS row_number \
+         FROM orders QUALIFY row_number = 1) \
+         SELECT user_id, total FROM ranked",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_union_by_name_preserves_projection() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH records AS (SELECT id, name FROM users \
+         UNION ALL BY NAME SELECT id, CAST(total AS VARCHAR) AS name FROM orders) \
+         SELECT id, name FROM records",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_join_using_resolves_cte_column() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH selected_users AS (SELECT id, name FROM users) \
+         SELECT orders.id, selected_users.name FROM orders \
+         INNER JOIN selected_users USING (id)",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_join_using_cte_from_same_table() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH selected_users AS (SELECT id FROM users WHERE age >= 18), \
+         combined AS (SELECT users.* FROM users \
+         INNER JOIN selected_users USING (id)) \
+         SELECT id, name FROM combined",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_nested_qualify_resolves_cte_projection() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH customer_orders AS (SELECT user_id, id AS order_id, total FROM orders), \
+         deduplicated AS (SELECT * FROM (SELECT user_id, order_id, total \
+         FROM customer_orders QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id \
+         ORDER BY order_id) = 1)) SELECT user_id, order_id, total FROM deduplicated",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_snowflake_deep_nested_qualify_resolves_cte_projection() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH base AS (SELECT id AS user_id, name, age FROM users), \
+         flags AS (SELECT user_id FROM (SELECT user_id FROM ( \
+         SELECT user_id, name, age FROM base \
+         QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id, name ORDER BY age) = 1))) \
+         SELECT user_id FROM flags",
+        DialectType::Snowflake,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_deep_star_chain_preserves_computed_alias() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    for dialect in schema_validation_dialects() {
+        let result = validate_with_schema(
+            "WITH base AS (SELECT user_id, total FROM orders), \
+             first_copy AS (SELECT *, total + 1 AS adjusted_total FROM base), \
+             second_copy AS (SELECT * FROM first_copy), \
+             third_copy AS (SELECT * FROM second_copy), \
+             fourth_copy AS (SELECT *, adjusted_total * 2 AS score FROM third_copy) \
+             SELECT user_id, adjusted_total, score FROM fourth_copy",
+            dialect,
+            &schema,
+            &opts,
+        );
+
+        assert!(result.valid, "{dialect}: {:#?}", result.errors);
+    }
+}
+
+#[test]
+fn test_validate_with_schema_nested_scalar_subquery_resolves_outer_column() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    for dialect in schema_validation_dialects() {
+        let result = validate_with_schema(
+            "WITH metrics AS (SELECT user_id, total AS score FROM orders), \
+             adjusted AS (SELECT score, CASE WHEN score IS NULL THEN NULL ELSE ( \
+             SELECT adjusted_score FROM (SELECT score + 1 AS adjusted_score)) END AS result \
+             FROM metrics) SELECT score, result FROM adjusted",
+            dialect,
+            &schema,
+            &opts,
+        );
+
+        assert!(result.valid, "{dialect}: {:#?}", result.errors);
+    }
+}
+
+#[test]
+fn test_validate_with_schema_unknown_column_after_cte_projection_stays_invalid() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH selected_users AS (SELECT id, name FROM users) \
+         SELECT missing_column FROM selected_users",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(!result.valid);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == validation_codes::E_UNKNOWN_COLUMN));
+}
+
+#[test]
 fn test_validate_with_schema_unknown_column_in_derived_table() {
     let schema = base_schema();
     let opts = SchemaValidationOptions::default();
