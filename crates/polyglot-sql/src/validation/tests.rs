@@ -378,7 +378,6 @@ fn test_validate_with_schema_snowflake_union_by_name_preserves_projection() {
         &schema,
         &opts,
     );
-
     assert!(result.valid, "{:#?}", result.errors);
 }
 
