@@ -181,6 +181,139 @@ fn test_validate_with_schema_known_table_column() {
 }
 
 #[test]
+fn test_validate_with_schema_qualified_cte_column_is_not_ambiguous() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH selected_users AS (SELECT id FROM users), \
+         selected_orders AS (SELECT id FROM orders) \
+         SELECT selected_users.id FROM selected_users \
+         JOIN selected_orders ON selected_users.id = selected_orders.id",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_correlated_subquery_resolves_outer_alias() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "SELECT outer_users.id FROM users outer_users \
+         WHERE EXISTS (SELECT 1 FROM orders inner_orders \
+         WHERE inner_orders.user_id = outer_users.id)",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_correlated_subquery_prefers_inner_unqualified_column() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "SELECT outer_users.id FROM users outer_users \
+         WHERE EXISTS (SELECT 1 FROM orders inner_orders \
+         WHERE id = outer_users.id)",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_subsequent_cte_resolves_prior_projection() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH derived AS (SELECT total AS derived_total FROM orders), \
+         next AS (SELECT derived_total FROM derived) \
+         SELECT derived_total FROM next",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_window_resolves_prior_cte_projection() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "WITH scored AS (SELECT user_id, total AS order_total FROM orders), \
+         ranked AS (SELECT user_id, ROW_NUMBER() OVER ( \
+         PARTITION BY user_id ORDER BY order_total DESC) AS row_number FROM scored) \
+         SELECT user_id FROM ranked",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
+fn test_validate_with_schema_unknown_column_in_derived_table() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions::default();
+    let result = validate_with_schema(
+        "SELECT selected.id FROM (SELECT missing FROM users) selected",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(!result.valid);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == validation_codes::E_UNKNOWN_COLUMN));
+}
+
+#[test]
+fn test_validate_with_schema_unknown_column_in_insert_query() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions::default();
+    let result = validate_with_schema(
+        "INSERT INTO users (id) SELECT missing FROM orders",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(!result.valid);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.code == validation_codes::E_UNKNOWN_COLUMN));
+}
+
+#[test]
 fn test_validate_with_schema_unknown_table() {
     let schema = base_schema();
     let opts = SchemaValidationOptions::default();

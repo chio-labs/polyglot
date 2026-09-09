@@ -395,42 +395,42 @@ bench-python:
 
 # Parse benchmark (core): polyglot-sql (Rust/PyO3) vs sqlglot[c] native extensions via pyperf
 bench-parse:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_parse.py --quiet --core-only
 
 # Parse benchmark (core/quick): faster but less stable timings
 bench-parse-quick:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_parse.py --quiet --core-only --quick
 
 # Parse benchmark (full): include optional third-party parsers when available
 bench-parse-full:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_parse.py --quiet
 
 # Simple parse benchmark (core/quick): polyglot-sql vs sqlglot, median-of-5
 bench-simple-quick:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_simple.py --core-only
 
 # Simple parse benchmark (core): polyglot-sql vs sqlglot, median-of-5
 bench-simple:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_simple.py --core-only
 
 # Simple parse benchmark (full): include optional third-party parsers
 bench-simple-full:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_simple.py
 
 # Transpile benchmark: polyglot-sql (Rust/PyO3) vs sqlglot[c] native extensions via pyperf
 bench-transpile:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_transpile.py --quiet
 
 # Transpile benchmark (quick): faster but less stable timings
 bench-transpile-quick:
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql && \
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio && \
 		uv run --project tools/bench-compare python3 tools/bench-compare/bench_transpile.py --quiet --quick
 
 bench-performance:
@@ -442,7 +442,7 @@ bench-allocations:
 
 bench-python-concurrency:
 	@mkdir -p target/performance
-	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql
+	@$(PYTHON_BENCH_BUILD_ENV) uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio
 	@uv run --project tools/bench-compare python3 tools/bench-compare/bench_python_concurrency.py \
 		--output target/performance/python-concurrency.json
 
@@ -502,7 +502,7 @@ develop-python:
 
 # Run Python tests
 test-python:
-	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql && uv run --no-sync pytest
+	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql-chio && uv run --no-sync pytest
 
 # Build Python wheels (release)
 build-python:
@@ -510,7 +510,7 @@ build-python:
 
 # Type-check Python package/stubs
 typecheck-python:
-	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql && uv run --no-sync pyright python/polyglot_sql/
+	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql-chio && uv run --no-sync pyright python/polyglot_sql/
 
 # Generate C header via build.rs/cbindgen
 generate-ffi-header:

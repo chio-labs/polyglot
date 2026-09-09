@@ -1,13 +1,15 @@
-# polyglot-sql (Python)
+# polyglot-sql-chio (Python)
 
 Rust-powered SQL transpiler for more than 30 SQL dialects.
 
-The `polyglot-sql` Python package exposes an API backed by the Rust `polyglot-sql` engine for fast parse/transpile/generate/format/validate workflows.
+The `polyglot-sql-chio` Python distribution exposes the existing `polyglot_sql` import API backed by the Rust `polyglot-sql` engine for fast parse/transpile/generate/format/validate workflows.
+
+This distribution is maintained as a temporary compatibility fork. Do not install it alongside `polyglot-sql`, because both distributions provide the same `polyglot_sql` package.
 
 ## Installation
 
 ```bash
-pip install polyglot-sql
+pip install polyglot-sql-chio
 ```
 
 ## Quick Start

@@ -10,7 +10,7 @@ Run via make from the project root:
 
 Or directly:
 
-    uv sync --project tools/bench-compare --reinstall-package polyglot-sql
+    uv sync --project tools/bench-compare --reinstall-package polyglot-sql-chio
     uv run --project tools/bench-compare python3 tools/bench-compare/bench_transpile.py --quiet
     uv run --project tools/bench-compare python3 tools/bench-compare/bench_transpile.py --quiet --quick
 """

@@ -103,7 +103,7 @@ wheels = [
 ]
 
 [[package]]
-name = "polyglot-sql"
+name = "polyglot-sql-chio"
 source = { editable = "." }
 
 [package.dev-dependencies]
