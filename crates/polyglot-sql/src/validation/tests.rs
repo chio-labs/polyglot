@@ -294,7 +294,6 @@ fn test_validate_with_schema_window_resolves_prior_cte_projection() {
             &schema,
             &opts,
         );
-
         assert!(result.valid, "{dialect}: {:#?}", result.errors);
     }
 }
@@ -361,7 +360,6 @@ fn test_validate_with_schema_snowflake_qualify_resolves_projection_columns() {
         &schema,
         &opts,
     );
-
     assert!(result.valid, "{:#?}", result.errors);
 }
 
