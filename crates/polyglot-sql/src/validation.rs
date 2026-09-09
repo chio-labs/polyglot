@@ -3495,15 +3495,39 @@ fn validate_select_columns_with_schema(
         let mut outer_scope = normalized_scope.clone();
         outer_scope.sources = outer_sources.clone();
         let mut outer_resolver = Resolver::new(&outer_scope, resolver_schema, true);
-        let matches_outer_source = outer_scope.sources.keys().any(|source_name| {
-            outer_resolver
-                .get_source_columns(source_name)
-                .ok()
-                .is_some_and(|columns| {
-                    !columns.is_empty() && source_has_column(&columns, &col_name)
-                })
-        });
-        if matches_outer_source {
+        let matching_outer_source_count = outer_scope
+            .sources
+            .keys()
+            .filter(|source_name| {
+                outer_resolver
+                    .get_source_columns(source_name)
+                    .ok()
+                    .is_some_and(|columns| {
+                        !columns.is_empty() && source_has_column(&columns, &col_name)
+                    })
+            })
+            .count();
+        if matching_outer_source_count == 1 {
+            continue;
+        }
+        if matching_outer_source_count > 1 {
+            errors.push(if strict {
+                ValidationError::error(
+                    format!(
+                        "Ambiguous unqualified column '{}' found in {} outer sources",
+                        col_name, matching_outer_source_count
+                    ),
+                    validation_codes::E_AMBIGUOUS_COLUMN_REFERENCE,
+                )
+            } else {
+                ValidationError::warning(
+                    format!(
+                        "Ambiguous unqualified column '{}' found in {} outer sources",
+                        col_name, matching_outer_source_count
+                    ),
+                    validation_codes::W_WEAK_REFERENCE_INTEGRITY,
+                )
+            });
             continue;
         }
 

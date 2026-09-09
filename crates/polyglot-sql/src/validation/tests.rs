@@ -508,6 +508,28 @@ fn test_validate_with_schema_nested_scalar_subquery_resolves_outer_column() {
 }
 
 #[test]
+fn test_validate_with_schema_ambiguous_outer_column_stays_invalid() {
+    let schema = base_schema();
+    let opts = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    let result = validate_with_schema(
+        "SELECT users.id FROM users JOIN orders ON users.id = orders.user_id \
+         WHERE EXISTS (SELECT 1 WHERE id > 0)",
+        DialectType::Generic,
+        &schema,
+        &opts,
+    );
+
+    assert!(!result.valid);
+    assert!(result.errors.iter().any(|error| {
+        error.code == validation_codes::E_AMBIGUOUS_COLUMN_REFERENCE
+            && error.message.contains("outer sources")
+    }));
+}
+
+#[test]
 fn test_validate_with_schema_unknown_column_after_cte_projection_stays_invalid() {
     let schema = base_schema();
     let opts = SchemaValidationOptions {
