@@ -1003,11 +1003,119 @@ struct IndexedScope {
 
 struct LineageScopeContext {
     scopes: Vec<IndexedScope>,
+    /// Usage analysis must not claim undeclared qualifiers as physical tables.
+    conservative: bool,
+}
+
+/// Reuse the lineage resolver for analysis of non-output column occurrences.
+/// The caller selects the lexical owner and checks ambiguous/open sources first.
+/// This keeps CTE, derived-table, virtual-source and set-operation tracing shared
+/// with projection lineage, without manufacturing SELECT projections.
+pub(crate) struct ScopedLineage {
+    context: LineageScopeContext,
+    root: ScopeId,
+    ctes: Vec<ScopeId>,
+    dialect: Option<DialectType>,
+}
+
+impl ScopedLineage {
+    pub(crate) fn new(scope: Scope, inherited_ctes: &[Scope], dialect: DialectType) -> Self {
+        let visible_ctes = scope.cte_sources.clone();
+        let (mut context, root) = LineageScopeContext::from_scope(scope);
+        context.conservative = true;
+        let mut ctes = context.indexed(root).cte_scopes.clone();
+        for cte_scope in inherited_ctes {
+            if let Expression::Cte(cte) = &cte_scope.expression {
+                if visible_ctes
+                    .get(&cte.alias.name)
+                    .is_some_and(|source| source.expression == cte_scope.expression)
+                    && !ctes
+                        .iter()
+                        .any(|id| context.scope(*id).expression == cte_scope.expression)
+                {
+                    ctes.push(context.insert_scope(cte_scope.clone()));
+                }
+            }
+        }
+        Self {
+            context,
+            root,
+            ctes,
+            dialect: Some(dialect),
+        }
+    }
+
+    pub(crate) fn column(&self, source: &str, column: &str) -> LineageNode {
+        let mut node = LineageNode::new(
+            column,
+            Expression::qualified_column(source, column),
+            self.context.scope(self.root).expression.clone(),
+        );
+        resolve_qualified_column(
+            &mut node,
+            &self.context,
+            self.root,
+            self.dialect,
+            source,
+            column,
+            column,
+            false,
+            &self.ctes,
+            0,
+        );
+        node
+    }
+
+    pub(crate) fn output(&self, ordinal: usize) -> Result<LineageNode> {
+        to_node_inner(
+            ColumnRef::Index(ordinal),
+            &self.context,
+            self.root,
+            self.dialect,
+            "",
+            "",
+            "",
+            false,
+            &self.ctes,
+            0,
+        )
+    }
+
+    pub(crate) fn output_names(&self) -> Vec<String> {
+        crate::ast_transforms::get_output_column_names_for_dialect(
+            effective_scope_expression(&self.context.scope(self.root).expression),
+            self.dialect,
+        )
+    }
+
+    pub(crate) fn subquery_output(&self, index: usize) -> Result<LineageNode> {
+        let scope_id = *self
+            .context
+            .indexed(self.root)
+            .subquery_scopes
+            .get(index)
+            .ok_or_else(|| Error::internal("missing scalar subquery scope"))?;
+        to_node_inner(
+            ColumnRef::Index(0),
+            &self.context,
+            scope_id,
+            self.dialect,
+            "",
+            "",
+            "",
+            false,
+            &self.ctes,
+            0,
+        )
+    }
 }
 
 impl LineageScopeContext {
     fn from_scope(scope: Scope) -> (Self, ScopeId) {
-        let mut context = Self { scopes: Vec::new() };
+        let mut context = Self {
+            scopes: Vec::new(),
+            conservative: false,
+        };
         let root = context.insert_scope(scope);
         (context, root)
     }
@@ -1649,8 +1757,11 @@ fn resolve_qualified_column(
     }
 
     // Base table or unresolved — terminal node
-    node.downstream
-        .push(make_table_column_node(table, col_name));
+    let mut child = make_table_column_node(table, col_name);
+    if context.conservative {
+        child.source_kind = SourceKind::Unknown;
+    }
+    node.downstream.push(child);
 }
 
 fn attach_pivot_dependencies(

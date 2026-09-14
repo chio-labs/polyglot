@@ -10,10 +10,11 @@
 import { describe, expect, it } from 'vitest';
 import { col, lit, sqlNull } from '../../builders';
 import type { Expression } from '../../generated/Expression';
-import { Dialect, generate, parse } from '../../index';
+import { annotateTypes, Dialect, generate, parse } from '../../index';
 import {
   getExprData,
   getExprType,
+  getInferredType,
   isExpressionValue,
   makeExpr,
 } from '../helpers';
@@ -62,6 +63,23 @@ import {
   // Walker functions
   walk,
 } from './index';
+
+const singleFieldDataTypes = [
+  'boolean',
+  'text',
+  'blob',
+  'date',
+  'json',
+  'json_b',
+  'uuid',
+  'int128',
+  'uint8',
+  'uint16',
+  'uint32',
+  'uint64',
+  'uint128',
+  'unknown',
+] as const;
 
 // Helper to parse SQL and get the first statement
 function parseFirst(sql: string): Expression {
@@ -236,6 +254,23 @@ describe('Walker Functions', () => {
       });
       expect(visited).not.toContain('this');
       expect(visited).not.toContain('expressions');
+    });
+
+    it.each(
+      singleFieldDataTypes,
+    )('should distinguish %s descriptors from data type expression envelopes', (dataType) => {
+      const descriptor = { data_type: dataType };
+      const expression: Expression = { data_type: descriptor };
+      const parent = makeExpr('tuple', { expressions: [expression] });
+
+      expect(isExpressionValue(descriptor)).toBe(false);
+      expect(isExpressionValue(expression)).toBe(true);
+      expect(findByType(parent, 'data_type')).toEqual([expression]);
+      expect(getChildren(expression)).toEqual([]);
+
+      const visited: Expression[] = [];
+      walk(parent, { data_type: (node) => visited.push(node) });
+      expect(visited).toEqual([expression]);
     });
   });
 
@@ -1215,6 +1250,155 @@ describe('Remove', () => {
         'WITH cte AS (SELECT a FROM source_table) SELECT * FROM cte',
       );
     });
+  });
+});
+
+// ============================================================================
+// Serialized Payload Preservation Tests
+// ============================================================================
+
+describe('Serialized payload preservation', () => {
+  const operations: Array<[string, (node: Expression) => Expression]> = [
+    ['clone', clone],
+    ['identity transform', (node) => transform(node, {})],
+    ['no-op remove', (node) => remove(node, () => false)],
+  ];
+
+  function expectIndependentContainers(original: unknown, copied: unknown) {
+    if (original === null || typeof original !== 'object') return;
+    expect(copied).not.toBe(original);
+    for (const [key, value] of Object.entries(original)) {
+      expectIndependentContainers(
+        value,
+        (copied as Record<string, unknown>)[key],
+      );
+    }
+  }
+
+  describe.each(operations)('%s', (_, copy) => {
+    it.each([
+      { sql: 'SELECT CAST(x AS DATE) FROM t', dialect: Dialect.TSQL },
+      { sql: 'SELECT CAST(x AS DATE) FROM t', dialect: Dialect.PostgreSQL },
+      { sql: 'SELECT CAST(x AS DATE) FROM t', dialect: Dialect.DuckDB },
+      {
+        sql: 'SELECT CAST(x AS BOOLEAN), CAST(x AS TEXT), CAST(x AS BLOB), CAST(x AS JSON), CAST(x AS UUID) FROM t',
+        dialect: Dialect.DuckDB,
+      },
+      {
+        sql: 'SELECT CAST(x AS JSONB) FROM t',
+        dialect: Dialect.PostgreSQL,
+      },
+      {
+        sql: 'SELECT CAST(x AS DATE[]), CAST(x AS STRUCT(d DATE)) FROM t',
+        dialect: Dialect.DuckDB,
+      },
+      {
+        sql: 'CREATE TABLE t(d DATE, b BOOLEAN, s TEXT)',
+        dialect: Dialect.DuckDB,
+      },
+      {
+        sql: 'SELECT CAST(x AS INT), CAST(x AS DECIMAL(10, 2)) FROM t',
+        dialect: Dialect.TSQL,
+      },
+    ])('should preserve $dialect types in $sql', ({ sql, dialect }) => {
+      const ast = parseFirstWithDialect(sql, dialect);
+      const original = structuredClone(ast);
+      const expected = generate([ast], dialect);
+      expect(expected.success).toBe(true);
+
+      const copied = copy(ast);
+      expect(copied).toStrictEqual(original);
+      expect(ast).toStrictEqual(original);
+      expectIndependentContainers(ast, copied);
+      expect(generate([copied], dialect)).toEqual(expected);
+      expect(findByType(ast, 'data_type')).toEqual([]);
+      expect(findByType(copied, 'data_type')).toEqual([]);
+    });
+
+    it.each(
+      singleFieldDataTypes,
+    )('should preserve genuine %s type expressions', (dataType) => {
+      const ast: Expression = { data_type: { data_type: dataType } };
+      const parent = makeExpr('tuple', { expressions: [ast] });
+      for (const node of [ast, parent]) {
+        const copied = copy(node);
+        expect(copied).toStrictEqual(node);
+        expectIndependentContainers(node, copied);
+        expect(findByType(copied, 'data_type')).toEqual([ast]);
+        const expected = generate([node], Dialect.DuckDB);
+        expect(expected.success).toBe(true);
+        expect(generate([copied], Dialect.DuckDB)).toEqual(expected);
+      }
+    });
+
+    it.each<Expression>([
+      { column_position: 'First' },
+      { column_constraint: 'NotNull' },
+      { column_constraint: 'Null' },
+      { column_constraint: 'Unique' },
+      { column_constraint: 'PrimaryKey' },
+      { null: null },
+      { current_date: null },
+    ])('should preserve scalar expression payloads: %j', (ast) => {
+      expect(isExpressionValue(ast)).toBe(true);
+      const parent = makeExpr('tuple', { expressions: [ast] });
+      for (const node of [ast, parent]) {
+        const copied = copy(node);
+        expect(copied).toStrictEqual(node);
+        expectIndependentContainers(node, copied);
+        expect(findByType(copied, getExprType(ast))).toEqual([ast]);
+        const expected = generate([node], Dialect.DuckDB);
+        expect(expected.success).toBe(true);
+        expect(generate([copied], Dialect.DuckDB)).toEqual(expected);
+      }
+    });
+
+    it('should preserve inferred type metadata', () => {
+      const annotated = annotateTypes(
+        'SELECT flag FROM flags',
+        Dialect.DuckDB,
+        {
+          tables: [
+            { name: 'flags', columns: [{ name: 'flag', type: 'BOOLEAN' }] },
+          ],
+        },
+      );
+      expect(annotated.success).toBe(true);
+      const ast = annotated.ast![0];
+      const original = structuredClone(ast);
+      expect(getInferredType(findByType(ast, 'column')[0])).toEqual({
+        data_type: 'boolean',
+      });
+
+      const copied = copy(ast);
+      expect(copied).toStrictEqual(original);
+      expect(ast).toStrictEqual(original);
+      expectIndependentContainers(ast, copied);
+      expect(getInferredType(findByType(copied, 'column')[0])).toEqual({
+        data_type: 'boolean',
+      });
+      expect(findByType(copied, 'data_type')).toEqual([]);
+      expect(toSql(copied)).toBe('SELECT flag FROM flags');
+    });
+  });
+
+  it('should transform CAST operands without visiting their type descriptors', () => {
+    const ast = parseFirstWithDialect(
+      'SELECT CAST(x AS DATE) FROM t',
+      Dialect.TSQL,
+    );
+    const visitedTypes: Expression[] = [];
+    const transformed = transform(ast, {
+      column: () => col('renamed').toJSON() as Expression,
+      data_type: (node) => {
+        visitedTypes.push(node);
+        return node;
+      },
+    });
+
+    expect(visitedTypes).toEqual([]);
+    expect(toSql(transformed)).toBe('SELECT CAST(renamed AS DATE) FROM t');
+    expect(toSql(ast)).toBe('SELECT CAST(x AS DATE) FROM t');
   });
 });
 

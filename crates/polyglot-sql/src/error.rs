@@ -255,10 +255,10 @@ pub struct ValidationError {
     pub severity: ValidationSeverity,
     /// Error code (e.g., "E001", "W001")
     pub code: String,
-    /// Start byte offset of the error range
+    /// Start Unicode character offset of the error range (not a UTF-8 byte offset)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<usize>,
-    /// End byte offset of the error range (exclusive)
+    /// End Unicode character offset of the error range (exclusive)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<usize>,
 }

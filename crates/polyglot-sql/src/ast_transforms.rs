@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::builder::engine;
+use crate::ast_mutation as engine;
 use crate::expressions::*;
 use crate::traversal::{is_aggregate, ExpressionWalk};
 

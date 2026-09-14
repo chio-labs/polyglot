@@ -29,9 +29,9 @@ export interface ValidationError {
   severity: ValidationSeverity;
   /** Error code (e.g., "E001", "W001") */
   code: string;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range (not UTF-16 code units) */
   start?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   end?: number;
 }
 

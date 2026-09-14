@@ -230,11 +230,18 @@ test-rust-pretty:
 test-rust-lib:
 	cargo test --lib -p polyglot-sql
 
+# Check capabilities separately so Cargo feature unification cannot mask dependencies.
 test-rust-feature-gates:
 	cargo check -p polyglot-sql --no-default-features
+	@for feature in generate transpile builder ast-tools semantic openlineage diff planner time \
+		function-catalog-clickhouse function-catalog-duckdb function-catalog-all-dialects; do \
+		cargo check -p polyglot-sql --no-default-features --features "$$feature" || exit $$?; \
+	done
 	cargo check -p polyglot-sql --no-default-features --features dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features generate,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-clickhouse,dialect-postgresql
+	cargo check -p polyglot-sql --no-default-features --features ast-tools,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features openlineage,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features builder,diff,planner,time,dialect-clickhouse

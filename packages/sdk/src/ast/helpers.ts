@@ -102,6 +102,9 @@ export function getExprData(expr: Expression): Record<string, unknown> {
  * key is one of the variants generated from Rust's `Expression` enum.
  * Checking the exact variant registry prevents one-field payload structs such
  * as `{ this: expression }` from being exposed as phantom expression nodes.
+ * DataType's own `data_type` discriminator also matches an Expression variant:
+ * `{ data_type: 'date' }` is a descriptor, whereas the expression envelope is
+ * `{ data_type: { data_type: 'date' } }`.
  */
 export function isExpressionValue(value: unknown): value is Expression {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -109,7 +112,16 @@ export function isExpressionValue(value: unknown): value is Expression {
   }
   const keys = Object.keys(value);
   if (keys.length !== 1) return false;
-  return expressionVariantNameSet.has(keys[0]);
+  const key = keys[0];
+  if (!expressionVariantNameSet.has(key)) return false;
+  if (key === 'data_type') {
+    const payload = (value as Record<string, unknown>)[key];
+    return (
+      typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+    );
+  }
+  // Other variants can legitimately carry scalars, e.g. column_position: 'First'.
+  return true;
 }
 
 /**
@@ -151,5 +163,14 @@ export function getInferredType(expr: Expression): DataType | undefined {
       return it as DataType;
     }
   }
+
+  const expressionType = getExprType(expr);
+  if (
+    (expressionType === 'paren' || expressionType === 'annotated') &&
+    isExpressionValue(data.this)
+  ) {
+    return getInferredType(data.this);
+  }
+
   return undefined;
 }

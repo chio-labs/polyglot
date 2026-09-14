@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dialects::DialectType;
 use crate::expressions::{
-    BinaryOp, DataType, DotAccess, Expression, Function, IfFunc, ListAggOverflow, Literal, Map,
-    Nvl2Func, Struct, StructField, Subscript,
+    BinaryOp, DataType, DateTimeField, DotAccess, Expression, Function, IfFunc, ListAggOverflow,
+    Literal, Map, Nvl2Func, Struct, StructField, Subscript,
 };
 use crate::schema::{normalize_name, Schema, SchemaError, SchemaResult, TABLE_PARTS};
 
@@ -48,6 +48,12 @@ impl TypeCoercionClass {
             | DataType::SmallInt { .. }
             | DataType::Int { .. }
             | DataType::BigInt { .. }
+            | DataType::Int128
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128
             | DataType::Float { .. }
             | DataType::Double { .. }
             | DataType::Decimal { .. } => Some(TypeCoercionClass::Numeric),
@@ -110,6 +116,26 @@ impl<'a> TypeAnnotator<'a> {
         );
 
         // String functions
+        if self._dialect == Some(DialectType::DuckDB) {
+            // DuckDB's list-to-string and date-name functions always return
+            // VARCHAR, even when the argument's type is unresolved. Keep these
+            // rules dialect-specific: BigQuery's ARRAY_TO_STRING also has a
+            // BYTES overload.
+            for name in [
+                "ARRAY_TO_STRING",
+                "ARRAY_TO_STRING_COMMA_DEFAULT",
+                "MONTHNAME",
+                "DAYNAME",
+            ] {
+                self.function_return_types.insert(
+                    name.to_string(),
+                    DataType::VarChar {
+                        length: None,
+                        parenthesized_length: false,
+                    },
+                );
+            }
+        }
         self.function_return_types.insert(
             "CONCAT".to_string(),
             DataType::VarChar {
@@ -380,8 +406,8 @@ impl<'a> TypeAnnotator<'a> {
             Expression::Add(op)
             | Expression::Sub(op)
             | Expression::Mul(op)
-            | Expression::Div(op)
-            | Expression::Mod(op) => self.annotate_arithmetic(op),
+            | Expression::Mod(op) => self.annotate_arithmetic(op, false),
+            Expression::Div(op) => self.annotate_arithmetic(op, true),
 
             // Comparison operations - always boolean
             Expression::Eq(_)
@@ -420,6 +446,10 @@ impl<'a> TypeAnnotator<'a> {
             // Negation preserves type
             Expression::Neg(op) => self.annotate(&op.this),
 
+            // Transparent wrappers preserve the type of their inner expression.
+            Expression::Paren(paren) => self.annotate(&paren.this),
+            Expression::Annotated(annotated) => self.annotate(&annotated.this),
+
             // Functions
             Expression::Function(func) => self.annotate_function(func),
             Expression::IfFunc(if_func) => self.annotate_if_func(if_func),
@@ -436,6 +466,13 @@ impl<'a> TypeAnnotator<'a> {
             }),
             Expression::Min(agg) => self.annotate(&agg.this),
             Expression::Max(agg) => self.annotate(&agg.this),
+            Expression::Median(agg) => {
+                if self._dialect == Some(DialectType::DuckDB) {
+                    self.annotate_duckdb_median(&agg.this)
+                } else {
+                    None
+                }
+            }
             Expression::GroupConcat(_) | Expression::StringAgg(_) | Expression::ListAgg(_) => {
                 Some(DataType::VarChar {
                     length: None,
@@ -480,38 +517,18 @@ impl<'a> TypeAnnotator<'a> {
                 }
             }
 
-            // CASE expression - type of the first THEN/ELSE
-            Expression::Case(case) => {
-                if let Some(else_expr) = &case.else_ {
-                    self.annotate(else_expr)
-                } else if let Some((_, then_expr)) = case.whens.first() {
-                    self.annotate(then_expr)
-                } else {
-                    None
-                }
-            }
+            // CASE expression - common type of all result branches
+            Expression::Case(case) => self.coerce_expression_types(
+                case.whens
+                    .iter()
+                    .map(|(_, result)| result)
+                    .chain(case.else_.iter()),
+            ),
 
-            // Array expressions
-            Expression::Array(arr) => {
-                if let Some(first) = arr.expressions.first() {
-                    if let Some(elem_type) = self.annotate(first) {
-                        Some(DataType::Array {
-                            element_type: Box::new(elem_type),
-                            dimension: None,
-                        })
-                    } else {
-                        Some(DataType::Array {
-                            element_type: Box::new(DataType::Unknown),
-                            dimension: None,
-                        })
-                    }
-                } else {
-                    Some(DataType::Array {
-                        element_type: Box::new(DataType::Unknown),
-                        dimension: None,
-                    })
-                }
-            }
+            // Array expressions. Bracket constructors such as ARRAY[...] and LIST[...]
+            // parse as ArrayFunc, while some normalized expressions use Array.
+            Expression::Array(arr) => self.annotate_array(&arr.expressions),
+            Expression::ArrayFunc(arr) => self.annotate_array(&arr.expressions),
 
             // Interval expressions
             Expression::Interval(_) => Some(DataType::Interval {
@@ -540,7 +557,29 @@ impl<'a> TypeAnnotator<'a> {
             | Expression::DateSub(_)
             | Expression::ToDate(_)
             | Expression::Date(_) => Some(DataType::Date),
-            Expression::DateDiff(_) | Expression::Extract(_) => Some(DataType::Int {
+            Expression::DateDiff(_) => Some(DataType::Int {
+                length: None,
+                integer_spelling: false,
+            }),
+            Expression::Extract(extract) if matches!(self._dialect, Some(DialectType::DuckDB)) => {
+                // DuckDB returns fractional epoch seconds and Julian days as DOUBLE.
+                let fractional = match &extract.field {
+                    DateTimeField::Epoch => true,
+                    DateTimeField::Custom(name) => {
+                        name.eq_ignore_ascii_case("epoch") || name.eq_ignore_ascii_case("julian")
+                    }
+                    _ => false,
+                };
+                Some(if fractional {
+                    DataType::Double {
+                        precision: None,
+                        scale: None,
+                    }
+                } else {
+                    DataType::BigInt { length: None }
+                })
+            }
+            Expression::Extract(_) => Some(DataType::Int {
                 length: None,
                 integer_spelling: false,
             }),
@@ -798,6 +837,14 @@ impl<'a> TypeAnnotator<'a> {
                 self.annotate_in_place(&mut c.this);
             }
 
+            // Transparent wrappers
+            Expression::Paren(paren) => {
+                self.annotate_in_place(&mut paren.this);
+            }
+            Expression::Annotated(annotated) => {
+                self.annotate_in_place(&mut annotated.this);
+            }
+
             // Case
             Expression::Case(c) => {
                 if let Some(ref mut operand) = c.operand {
@@ -809,6 +856,18 @@ impl<'a> TypeAnnotator<'a> {
                 }
                 if let Some(ref mut else_expr) = c.else_ {
                     self.annotate_in_place(else_expr);
+                }
+            }
+
+            // Array constructors
+            Expression::Array(a) => {
+                for expression in &mut a.expressions {
+                    self.annotate_in_place(expression);
+                }
+            }
+            Expression::ArrayFunc(a) => {
+                for expression in &mut a.expressions {
+                    self.annotate_in_place(expression);
                 }
             }
 
@@ -936,6 +995,13 @@ impl<'a> TypeAnnotator<'a> {
             // Subquery
             Expression::Subquery(s) => {
                 self.annotate_in_place(&mut s.this);
+            }
+
+            Expression::Trim(f) => {
+                self.annotate_in_place(&mut f.this);
+                if let Some(characters) = &mut f.characters {
+                    self.annotate_in_place(characters);
+                }
             }
 
             // UnaryFunc variants
@@ -1247,12 +1313,22 @@ impl<'a> TypeAnnotator<'a> {
     }
 
     /// Annotate an arithmetic binary operation
-    fn annotate_arithmetic(&mut self, op: &BinaryOp) -> Option<DataType> {
+    fn annotate_arithmetic(&mut self, op: &BinaryOp, division: bool) -> Option<DataType> {
         let left_type = self.annotate(&op.left);
         let right_type = self.annotate(&op.right);
 
         match (left_type, right_type) {
-            (Some(l), Some(r)) => self.coerce_types(&l, &r),
+            (Some(l), Some(r)) => {
+                if self._dialect == Some(DialectType::DuckDB) {
+                    if division && (is_unsigned_integer(&l) || is_unsigned_integer(&r)) {
+                        return Some(double_type());
+                    }
+                    if let Some(result) = duckdb_unsigned_integer_coercion(&l, &r, true) {
+                        return Some(result);
+                    }
+                }
+                self.coerce_types(&l, &r)
+            }
             (Some(t), None) | (None, Some(t)) => Some(t),
             (None, None) => None,
         }
@@ -1262,8 +1338,16 @@ impl<'a> TypeAnnotator<'a> {
     fn annotate_function(&mut self, func: &Function) -> Option<DataType> {
         let func_name = func.name.to_uppercase();
 
-        if self._dialect == Some(DialectType::DuckDB) && !func.quoted && func_name == "DATE_TRUNC" {
-            return self.annotate_duckdb_date_trunc(func);
+        if self._dialect == Some(DialectType::DuckDB) && !func.quoted {
+            match func_name.as_str() {
+                // Builder-created Function nodes use the same inference as the
+                // dedicated nodes produced when parsing these built-ins.
+                "SUM" => return func.args.first().and_then(|arg| self.annotate_sum(arg)),
+                "COALESCE" | "IFNULL" => return self.coerce_arg_types(&func.args),
+                "DATE_TRUNC" => return self.annotate_duckdb_date_trunc(func),
+                "REGEXP_EXTRACT_ALL" => return self.annotate_duckdb_regexp_extract_all(func),
+                _ => {}
+            }
         }
 
         // Check known function return types
@@ -1309,6 +1393,81 @@ impl<'a> TypeAnnotator<'a> {
                 func.args.first().and_then(|arg| self.annotate(arg))
             }
         }
+    }
+
+    /// Infer DuckDB's string-list or named-capture struct-list regex result.
+    /// The result depends on the group argument, not the input string's type.
+    fn annotate_duckdb_regexp_extract_all(&mut self, func: &Function) -> Option<DataType> {
+        if !(2..=4).contains(&func.args.len()) {
+            return None;
+        }
+
+        fn unwrap(mut expr: &Expression) -> &Expression {
+            loop {
+                expr = match expr {
+                    Expression::Paren(p) => &p.this,
+                    Expression::Annotated(a) => &a.this,
+                    _ => return expr,
+                };
+            }
+        }
+
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let element_type = if let Some(group) = func.args.get(2).map(unwrap) {
+            let names = match group {
+                Expression::Array(a) => Some(&a.expressions),
+                Expression::ArrayFunc(a) => Some(&a.expressions),
+                _ => None,
+            };
+            if let Some(names) = names {
+                if names.is_empty() {
+                    return None;
+                }
+                let mut seen = HashSet::new();
+                let mut fields = Vec::with_capacity(names.len());
+                for name in names {
+                    let Expression::Literal(literal) = unwrap(name) else {
+                        return None;
+                    };
+                    if !literal.is_string() {
+                        return None;
+                    }
+                    let name = literal.value_str();
+                    // DuckDB rejects duplicate names using ASCII-insensitive
+                    // comparison, but preserves the original spelling.
+                    if !seen.insert(name.to_ascii_lowercase()) {
+                        return None;
+                    }
+                    fields.push(StructField::new(name.to_string(), varchar.clone()));
+                }
+                DataType::Struct {
+                    fields,
+                    nested: false,
+                }
+            } else if matches!(group, Expression::Null(_))
+                || matches!(
+                    self.annotate(group),
+                    Some(
+                        DataType::TinyInt { .. } | DataType::SmallInt { .. } | DataType::Int { .. }
+                    )
+                )
+            {
+                varchar
+            } else {
+                // Unknown group expressions or nonliteral name lists cannot
+                // determine the element type. Do not fall back to the input.
+                return None;
+            }
+        } else {
+            varchar
+        };
+        Some(DataType::Array {
+            element_type: Box::new(element_type),
+            dimension: None,
+        })
     }
 
     /// Infer DuckDB's overloaded DATE_TRUNC return type from its temporal value argument.
@@ -1419,20 +1578,83 @@ impl<'a> TypeAnnotator<'a> {
                     scale: None,
                 })
             }
-            "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MEDIAN" => {
+            "PERCENTILE_CONT" | "PERCENTILE_DISC" => {
                 args.first().and_then(|arg| self.annotate(arg))
             }
+            "MEDIAN" => args.first().and_then(|arg| {
+                if self._dialect == Some(DialectType::DuckDB) {
+                    self.annotate_duckdb_median(arg)
+                } else {
+                    self.annotate(arg)
+                }
+            }),
             _ => None,
+        }
+    }
+
+    /// DuckDB defines MEDIAN as QUANTILE_CONT(value, 0.5). Integral inputs are
+    /// promoted to DOUBLE so an interpolated midpoint can be represented, and
+    /// DATE inputs become TIMESTAMP. Other supported quantitative and ordinal
+    /// types preserve their input type.
+    fn annotate_duckdb_median(&mut self, arg: &Expression) -> Option<DataType> {
+        match self.annotate(arg)? {
+            DataType::TinyInt { .. }
+            | DataType::SmallInt { .. }
+            | DataType::Int { .. }
+            | DataType::BigInt { .. }
+            | DataType::Int128 => Some(DataType::Double {
+                precision: None,
+                scale: None,
+            }),
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128 => Some(double_type()),
+            DataType::Date => Some(DataType::Timestamp {
+                precision: None,
+                timezone: false,
+            }),
+            DataType::Unknown => None,
+            other => Some(other),
         }
     }
 
     /// Annotate SUM function - promotes to at least BigInt
     fn annotate_sum(&mut self, arg: &Expression) -> Option<DataType> {
-        match self.annotate(arg) {
+        let arg_type = self.annotate(arg);
+        if self._dialect == Some(DialectType::DuckDB) {
+            // These are DuckDB's bound aggregate result types, not the generic
+            // integer-to-BIGINT promotion. UHUGEINT binds to the DOUBLE overload.
+            return match arg_type? {
+                DataType::Boolean
+                | DataType::TinyInt { .. }
+                | DataType::SmallInt { .. }
+                | DataType::Int { .. }
+                | DataType::BigInt { .. }
+                | DataType::Int128
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => Some(DataType::Int128),
+                DataType::UInt128 | DataType::Float { .. } | DataType::Double { .. } => {
+                    Some(double_type())
+                }
+                DataType::Decimal { precision, scale } => Some(DataType::Decimal {
+                    precision: Some(38),
+                    // DuckDB DECIMAL defaults to (18,3); DECIMAL(p) defaults to (p,0).
+                    scale: Some(scale.unwrap_or(if precision.is_some() { 0 } else { 3 })),
+                }),
+                // Do not invent a concrete return type for an unresolved input.
+                _ => None,
+            };
+        }
+        match arg_type {
             Some(DataType::TinyInt { .. })
             | Some(DataType::SmallInt { .. })
             | Some(DataType::Int { .. }) => Some(DataType::BigInt { length: None }),
             Some(DataType::BigInt { .. }) => Some(DataType::BigInt { length: None }),
+            Some(DataType::Int128) => Some(DataType::Int128),
             Some(DataType::Float { .. }) | Some(DataType::Double { .. }) => {
                 Some(DataType::Double {
                     precision: None,
@@ -1449,8 +1671,27 @@ impl<'a> TypeAnnotator<'a> {
         }
     }
 
+    /// Infer the type of an array constructor from all of its elements.
+    fn annotate_array(&mut self, expressions: &[Expression]) -> Option<DataType> {
+        let element_type = self
+            .coerce_expression_types(expressions.iter())
+            .unwrap_or(DataType::Unknown);
+        Some(DataType::Array {
+            element_type: Box::new(element_type),
+            dimension: None,
+        })
+    }
+
     /// Coerce multiple argument types to a common type
     fn coerce_arg_types(&mut self, args: &[Expression]) -> Option<DataType> {
+        self.coerce_expression_types(args.iter())
+    }
+
+    /// Coerce expression types from an iterator to a common type.
+    fn coerce_expression_types<'b>(
+        &mut self,
+        args: impl IntoIterator<Item = &'b Expression>,
+    ) -> Option<DataType> {
         let mut result_type: Option<DataType> = None;
         for arg in args {
             if let Some(arg_type) = self.annotate(arg) {
@@ -1468,6 +1709,30 @@ impl<'a> TypeAnnotator<'a> {
         // If types are the same, return that type
         if left == right {
             return Some(left.clone());
+        }
+
+        // Arrays coerce recursively based on their element types.
+        if let (
+            DataType::Array {
+                element_type: left_element,
+                dimension: left_dimension,
+            },
+            DataType::Array {
+                element_type: right_element,
+                dimension: right_dimension,
+            },
+        ) = (left, right)
+        {
+            return self
+                .coerce_types(left_element, right_element)
+                .map(|element_type| DataType::Array {
+                    element_type: Box::new(element_type),
+                    dimension: if left_dimension == right_dimension {
+                        *left_dimension
+                    } else {
+                        None
+                    },
+                });
         }
 
         // Special case: Interval + Date/Timestamp
@@ -1529,16 +1794,22 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Get the wider numeric type
     fn wider_numeric_type(&self, left: &DataType, right: &DataType) -> DataType {
+        if self._dialect == Some(DialectType::DuckDB) {
+            if let Some(result) = duckdb_unsigned_integer_coercion(left, right, false) {
+                return result;
+            }
+        }
         let order = |dt: &DataType| -> u8 {
             match dt {
                 DataType::Boolean => 0,
-                DataType::TinyInt { .. } => 1,
-                DataType::SmallInt { .. } => 2,
-                DataType::Int { .. } => 3,
-                DataType::BigInt { .. } => 4,
-                DataType::Float { .. } => 5,
-                DataType::Double { .. } => 6,
-                DataType::Decimal { .. } => 7,
+                DataType::TinyInt { .. } | DataType::UInt8 => 1,
+                DataType::SmallInt { .. } | DataType::UInt16 => 2,
+                DataType::Int { .. } | DataType::UInt32 => 3,
+                DataType::BigInt { .. } | DataType::UInt64 => 4,
+                DataType::Int128 | DataType::UInt128 => 5,
+                DataType::Float { .. } => 6,
+                DataType::Double { .. } => 7,
+                DataType::Decimal { .. } => 8,
                 _ => 0,
             }
         };
@@ -1549,6 +1820,100 @@ impl<'a> TypeAnnotator<'a> {
             right.clone()
         }
     }
+}
+
+fn double_type() -> DataType {
+    DataType::Double {
+        precision: None,
+        scale: None,
+    }
+}
+
+fn is_unsigned_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128
+    )
+}
+
+/// Integer width and signedness, used only for DuckDB's unsigned coercion rules.
+fn integer_shape(data_type: &DataType) -> Option<(u16, bool)> {
+    Some(match data_type {
+        DataType::Boolean => (0, false),
+        DataType::TinyInt { .. } => (8, false),
+        DataType::SmallInt { .. } => (16, false),
+        DataType::Int { .. } => (32, false),
+        DataType::BigInt { .. } => (64, false),
+        DataType::Int128 => (128, false),
+        DataType::UInt8 => (8, true),
+        DataType::UInt16 => (16, true),
+        DataType::UInt32 => (32, true),
+        DataType::UInt64 => (64, true),
+        DataType::UInt128 => (128, true),
+        _ => return None,
+    })
+}
+
+fn signed_integer_type(bits: u16) -> DataType {
+    match bits {
+        0..=8 => DataType::TinyInt { length: None },
+        9..=16 => DataType::SmallInt { length: None },
+        17..=32 => DataType::Int {
+            length: None,
+            integer_spelling: false,
+        },
+        33..=64 => DataType::BigInt { length: None },
+        65..=128 => DataType::Int128,
+        _ => double_type(),
+    }
+}
+
+/// DuckDB uses function-overload binding for arithmetic, but combination casting
+/// for CASE/COALESCE/arrays. In particular, small mixed arithmetic binds BIGINT.
+fn duckdb_unsigned_integer_coercion(
+    left: &DataType,
+    right: &DataType,
+    arithmetic: bool,
+) -> Option<DataType> {
+    let (left_bits, left_unsigned) = integer_shape(left)?;
+    let (right_bits, right_unsigned) = integer_shape(right)?;
+    if !left_unsigned && !right_unsigned {
+        return None;
+    }
+    if left_unsigned && right_unsigned {
+        return Some(if left_bits >= right_bits { left } else { right }.clone());
+    }
+    let (signed, unsigned, signed_type, unsigned_type) = if left_unsigned {
+        (right_bits, left_bits, right, left)
+    } else {
+        (left_bits, right_bits, left, right)
+    };
+    if signed == 0 && !arithmetic {
+        return Some(unsigned_type.clone());
+    }
+    if signed > unsigned {
+        return Some(signed_type.clone());
+    }
+    if unsigned == 128 {
+        // DuckDB 1.5's combination caster advances the signed input one width;
+        // arithmetic instead binds DOUBLE. Match the engine's reported type,
+        // rather than claiming this is a lossless conversion for every value.
+        return Some(if arithmetic {
+            double_type()
+        } else {
+            signed_integer_type(signed + 1)
+        });
+    }
+    let required_bits = unsigned + 1;
+    Some(signed_integer_type(if arithmetic {
+        required_bits.max(64)
+    } else {
+        required_bits
+    }))
 }
 
 /// A schema layer whose entries are visible only while annotating one query
@@ -1998,7 +2363,7 @@ pub fn annotate_types(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{BooleanLiteral, Cast, Null};
+    use crate::expressions::{BooleanLiteral, Cast, ExtractFunc, Null};
     use crate::{parse_one, DialectType, MappingSchema, Schema};
 
     fn make_int_literal(val: i64) -> Expression {
@@ -2188,6 +2553,706 @@ mod tests {
                 timezone: false
             })
         );
+    }
+
+    #[test]
+    fn test_duckdb_trim_stores_inferred_types() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "records",
+                &[
+                    ("name".to_string(), varchar.clone()),
+                    ("chars".to_string(), varchar.clone()),
+                    ("values_json".to_string(), DataType::Json),
+                ],
+                None,
+            )
+            .unwrap();
+
+        for function in [
+            "TRIM(name)",
+            "trim(records.name)",
+            "TRIM(name, chars)",
+            "TRIM(BOTH chars FROM name)",
+            "TRIM(LEADING chars FROM name)",
+            "TRIM(TRAILING chars FROM name)",
+            "TRIM(FROM name)",
+            "TRIM('  hello  ')",
+            "TRIM(NULL)",
+            r#"TRIM(BOTH '"' FROM values_json->>0)"#,
+        ] {
+            let sql = format!("SELECT {function} AS normalized FROM records");
+            for schema in [None, Some(&schema as &dyn Schema)] {
+                let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+                let original_sql = expression.sql_for(DialectType::DuckDB);
+                annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+                let Expression::Select(select) = &expression else {
+                    panic!("Expected SELECT for {sql}");
+                };
+                let Expression::Alias(alias) = &select.expressions[0] else {
+                    panic!("Expected alias for {sql}");
+                };
+                assert!(matches!(alias.this, Expression::Trim(_)), "{sql}");
+                assert_eq!(alias.this.inferred_type(), Some(&varchar), "{sql}");
+                assert_eq!(alias.inferred_type.as_ref(), Some(&varchar), "{sql}");
+                assert_eq!(expression.sql_for(DialectType::DuckDB), original_sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_int128_inferred_types_and_widening() {
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "measurements",
+                &[("value".to_string(), DataType::Int128)],
+                None,
+            )
+            .unwrap();
+        for (projection, expected) in [
+            ("CAST(value AS HUGEINT)", DataType::Int128),
+            ("value", DataType::Int128),
+            ("value + CAST(1 AS BIGINT)", DataType::Int128),
+            ("CAST(1 AS BIGINT) + value", DataType::Int128),
+            ("COALESCE(value, CAST(1 AS BIGINT))", DataType::Int128),
+            ("COALESCE(CAST(1 AS BIGINT), value)", DataType::Int128),
+            (
+                "CASE WHEN TRUE THEN value ELSE CAST(1 AS BIGINT) END",
+                DataType::Int128,
+            ),
+            ("SUM(value)", DataType::Int128),
+            ("SUM(CAST(value AS BIGINT))", DataType::Int128),
+            (
+                "MEDIAN(value)",
+                DataType::Double {
+                    precision: None,
+                    scale: None,
+                },
+            ),
+            (
+                "CAST(value AS HUGEINT[])",
+                DataType::Array {
+                    element_type: Box::new(DataType::Int128),
+                    dimension: None,
+                },
+            ),
+        ] {
+            let sql = format!("SELECT {projection} AS widened FROM measurements");
+            let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+            annotate_types(&mut expression, Some(&schema), Some(DialectType::DuckDB));
+            let Expression::Select(select) = &expression else {
+                panic!("expected SELECT")
+            };
+            let Expression::Alias(alias) = &select.expressions[0] else {
+                panic!("expected alias")
+            };
+            assert_eq!(alias.this.inferred_type(), Some(&expected), "{sql}");
+            assert_eq!(alias.inferred_type.as_ref(), Some(&expected), "{sql}");
+        }
+        assert_eq!(
+            TypeCoercionClass::from_data_type(&DataType::Int128),
+            Some(TypeCoercionClass::Numeric)
+        );
+    }
+
+    #[test]
+    fn test_duckdb_unsigned_integer_coercion_matrix() {
+        // Verified against DuckDB 1.5.5: arithmetic overload binding and
+        // combination casting do not select the same small integer widths.
+        let signed = ["TINYINT", "SMALLINT", "INT", "BIGINT", "HUGEINT"];
+        let unsigned = ["UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"];
+        let arithmetic = [
+            ["BIGINT", "BIGINT", "BIGINT", "HUGEINT", "DOUBLE"],
+            ["SMALLINT", "BIGINT", "BIGINT", "HUGEINT", "DOUBLE"],
+            ["INT", "INT", "BIGINT", "HUGEINT", "DOUBLE"],
+            ["BIGINT", "BIGINT", "BIGINT", "HUGEINT", "DOUBLE"],
+            ["HUGEINT", "HUGEINT", "HUGEINT", "HUGEINT", "DOUBLE"],
+        ];
+        let combination = [
+            ["SMALLINT", "INT", "BIGINT", "HUGEINT", "SMALLINT"],
+            ["SMALLINT", "INT", "BIGINT", "HUGEINT", "INT"],
+            ["INT", "INT", "BIGINT", "HUGEINT", "BIGINT"],
+            ["BIGINT", "BIGINT", "BIGINT", "HUGEINT", "HUGEINT"],
+            ["HUGEINT", "HUGEINT", "HUGEINT", "HUGEINT", "DOUBLE"],
+        ];
+        for (i, s) in signed.iter().enumerate() {
+            for (j, u) in unsigned.iter().enumerate() {
+                for (a, b) in [(s, u), (u, s)] {
+                    let a = format!("CAST(1 AS {a})");
+                    let b = format!("CAST(1 AS {b})");
+                    for (sql, expected) in [
+                        (format!("{a} + {b}"), arithmetic[i][j]),
+                        (format!("{a} - {b}"), arithmetic[i][j]),
+                        (format!("{a} * {b}"), arithmetic[i][j]),
+                        (format!("{a} % {b}"), arithmetic[i][j]),
+                        (format!("{a} / {b}"), "DOUBLE"),
+                        (format!("COALESCE({a}, {b})"), combination[i][j]),
+                        (
+                            format!("CASE WHEN TRUE THEN {a} ELSE {b} END"),
+                            combination[i][j],
+                        ),
+                    ] {
+                        let expr = parse_one(&sql, DialectType::DuckDB).unwrap();
+                        let expected =
+                            crate::parse_data_type(expected, DialectType::DuckDB).unwrap();
+                        let mut annotator = TypeAnnotator::new(None, Some(DialectType::DuckDB));
+                        assert_eq!(annotator.annotate(&expr), Some(expected), "{sql}");
+                    }
+                }
+            }
+        }
+        for (i, a) in unsigned.iter().enumerate() {
+            for (j, b) in unsigned.iter().enumerate() {
+                let sql = format!("CAST(1 AS {a}) + CAST(1 AS {b})");
+                let expr = parse_one(&sql, DialectType::DuckDB).unwrap();
+                let mut annotator = TypeAnnotator::new(None, Some(DialectType::DuckDB));
+                assert_eq!(
+                    annotator.annotate(&expr),
+                    Some(crate::parse_data_type(unsigned[i.max(j)], DialectType::DuckDB).unwrap()),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_duckdb_sum_return_types() {
+        for (input, output) in [
+            ("BOOLEAN", "INT128"),
+            ("TINYINT", "INT128"),
+            ("SMALLINT", "INT128"),
+            ("INT", "INT128"),
+            ("BIGINT", "INT128"),
+            ("HUGEINT", "INT128"),
+            ("UTINYINT", "INT128"),
+            ("USMALLINT", "INT128"),
+            ("UINTEGER", "INT128"),
+            ("UBIGINT", "INT128"),
+            ("UHUGEINT", "DOUBLE"),
+            ("FLOAT", "DOUBLE"),
+            ("DOUBLE", "DOUBLE"),
+            ("DECIMAL(10,2)", "DECIMAL(38,2)"),
+            ("DECIMAL", "DECIMAL(38,3)"),
+            ("DECIMAL(10)", "DECIMAL(38,0)"),
+        ] {
+            let input_type = crate::parse_data_type(input, DialectType::DuckDB).unwrap();
+            let expected = crate::parse_data_type(output, DialectType::DuckDB).unwrap();
+            let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+            schema
+                .add_table("t", &[("x".to_string(), input_type)], None)
+                .unwrap();
+            let cast = parse_one(&format!("CAST(1 AS {input})"), DialectType::DuckDB).unwrap();
+            let function = Expression::Function(Box::new(Function::new("SUM", vec![cast])));
+            assert_eq!(
+                TypeAnnotator::new(None, Some(DialectType::DuckDB)).annotate(&function),
+                Some(expected.clone()),
+                "SUM({input}) builder"
+            );
+            for arg in ["x".to_string(), format!("CAST(1 AS {input})")] {
+                for projection in [
+                    format!("SUM({arg})"),
+                    format!("SUM(DISTINCT {arg})"),
+                    format!("SUM({arg}) OVER ()"),
+                    format!("SUM({arg}) FILTER (WHERE TRUE)"),
+                ] {
+                    let sql = format!("SELECT {projection} AS total FROM t");
+                    let mut expr = parse_one(&sql, DialectType::DuckDB).unwrap();
+                    annotate_types(&mut expr, Some(&schema), Some(DialectType::DuckDB));
+                    let Expression::Select(select) = expr else {
+                        unreachable!()
+                    };
+                    let Expression::Alias(alias) = &select.expressions[0] else {
+                        unreachable!()
+                    };
+                    assert_eq!(alias.inferred_type.as_ref(), Some(&expected), "{sql}");
+                }
+            }
+        }
+        let expr = parse_one("SUM(x)", DialectType::DuckDB).unwrap();
+        assert_eq!(
+            TypeAnnotator::new(None, Some(DialectType::DuckDB)).annotate(&expr),
+            None
+        );
+        // The dialect-specific override must not change the generic/default rule.
+        for dialect in [
+            DialectType::Generic,
+            DialectType::PostgreSQL,
+            DialectType::MySQL,
+            DialectType::BigQuery,
+        ] {
+            let expr = parse_one("SUM(CAST(1 AS BIGINT))", dialect).unwrap();
+            assert_eq!(
+                TypeAnnotator::new(None, Some(dialect)).annotate(&expr),
+                Some(DataType::BigInt { length: None })
+            );
+        }
+    }
+
+    #[test]
+    fn test_trim_annotates_both_arguments_and_nested_children() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "users",
+                &[
+                    ("name".to_string(), varchar.clone()),
+                    ("chars".to_string(), varchar.clone()),
+                ],
+                None,
+            )
+            .unwrap();
+
+        fn check_children(expr: &Expression, varchar: &DataType, has_schema: bool) -> usize {
+            let mut count = 0;
+            if matches!(
+                expr,
+                Expression::Trim(_)
+                    | Expression::Lower(_)
+                    | Expression::Upper(_)
+                    | Expression::Column(_)
+            ) {
+                let expected = if matches!(expr, Expression::Column(_)) && !has_schema {
+                    None
+                } else {
+                    Some(varchar)
+                };
+                assert_eq!(expr.inferred_type(), expected, "{}", expr.sql());
+                count += 1;
+            }
+            crate::ast_children::for_each_child(expr, |_, child| {
+                count += check_children(child, varchar, has_schema);
+            });
+            count
+        }
+
+        for schema in [None, Some(&schema as &dyn Schema)] {
+            let mut expression = parse_one(
+                "SELECT TRIM(LOWER(TRIM(name)), UPPER(chars)) AS normalized FROM users",
+                DialectType::DuckDB,
+            )
+            .unwrap();
+            annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+            assert_eq!(check_children(&expression, &varchar, schema.is_some()), 6);
+        }
+    }
+
+    #[test]
+    fn test_trim_type_metadata_roundtrip_across_dialects() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        for dialect in [
+            DialectType::Generic,
+            DialectType::DuckDB,
+            DialectType::PostgreSQL,
+            DialectType::Snowflake,
+            DialectType::BigQuery,
+            DialectType::MySQL,
+        ] {
+            let expression = parse_one("TRIM('  hello  ')", dialect).unwrap();
+            assert!(matches!(expression, Expression::Trim(_)));
+            assert_eq!(expression.inferred_type(), None);
+            let unannotated = serde_json::to_value(&expression).unwrap();
+            assert!(unannotated["trim"].get("inferred_type").is_none());
+
+            // Old AST JSON without type metadata remains deserializable.
+            let mut restored: Expression = serde_json::from_value(unannotated).unwrap();
+            assert_eq!(restored, expression);
+            annotate_types(&mut restored, None, Some(dialect));
+            assert_eq!(restored.inferred_type(), Some(&varchar), "{dialect:?}");
+            assert_eq!(restored.sql_for(dialect), expression.sql_for(dialect));
+
+            let annotated = serde_json::to_value(&restored).unwrap();
+            assert_eq!(annotated["trim"]["inferred_type"]["data_type"], "var_char");
+            let roundtripped: Expression = serde_json::from_value(annotated).unwrap();
+            assert_eq!(roundtripped, restored);
+            assert_eq!(roundtripped.inferred_type(), Some(&varchar));
+        }
+    }
+
+    #[test]
+    fn test_duckdb_regexp_extract_all_overload_types() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let captures = DataType::Struct {
+            fields: vec![
+                StructField::new("Letter".to_string(), varchar.clone()),
+                StructField::new("number".to_string(), varchar.clone()),
+            ],
+            nested: false,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table("documents", &[("body".to_string(), varchar.clone())], None)
+            .unwrap();
+
+        for (arguments, element_type) in [
+            ("body, '[0-9]+'", &varchar),
+            ("documents.body, '[0-9]+'", &varchar),
+            ("'a1b22', '[0-9]+'", &varchar),
+            ("'abc', '[0-9]+'", &varchar),
+            ("NULL, '[0-9]+'", &varchar),
+            ("body, '([a-z])([0-9]+)', 0", &varchar),
+            ("body, '([a-z])([0-9]+)', 2", &varchar),
+            ("body, '([a-z])([0-9]+)', (1), 'i'", &varchar),
+            ("body, '([a-z])([0-9]+)', CAST(1 AS INTEGER)", &varchar),
+            ("body, '([a-z])([0-9]+)', NULL", &varchar),
+            ("body, '([a-z])([0-9]+)', ['Letter', 'number']", &captures),
+            (
+                "body, '([a-z])([0-9]+)', (['Letter', 'number']), 'i'",
+                &captures,
+            ),
+            (
+                "body, '([a-z])([0-9]+)', ARRAY['Letter', 'number']",
+                &captures,
+            ),
+            (
+                "NULL, '([a-z])([0-9]+)', LIST['Letter', 'number']",
+                &captures,
+            ),
+        ] {
+            let expected = DataType::Array {
+                element_type: Box::new(element_type.clone()),
+                dimension: None,
+            };
+            for name in ["REGEXP_EXTRACT_ALL", "ReGeXp_ExTrAcT_AlL"] {
+                for schema in [None, Some(&schema as &dyn Schema)] {
+                    let sql = format!("SELECT {name}({arguments}) AS matches FROM documents");
+                    let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+                    let original_sql = expression.sql_for(DialectType::DuckDB);
+                    annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+                    let Expression::Select(select) = &expression else {
+                        panic!("Expected SELECT for {sql}");
+                    };
+                    let Expression::Alias(alias) = &select.expressions[0] else {
+                        panic!("Expected alias for {sql}");
+                    };
+                    assert_eq!(alias.this.inferred_type(), Some(&expected), "{sql}");
+                    assert_eq!(alias.inferred_type.as_ref(), Some(&expected), "{sql}");
+                    assert_eq!(expression.sql_for(DialectType::DuckDB), original_sql);
+                    let json = serde_json::to_value(&expression).unwrap();
+                    let restored: Expression = serde_json::from_value(json).unwrap();
+                    assert_eq!(restored, expression);
+
+                    let sql = format!(
+                        "SELECT UNNEST({name}({arguments})) AS single_match FROM documents"
+                    );
+                    let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+                    annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+                    let Expression::Select(select) = &expression else {
+                        panic!("Expected SELECT for {sql}");
+                    };
+                    let Expression::Alias(alias) = &select.expressions[0] else {
+                        panic!("Expected alias for {sql}");
+                    };
+                    assert_eq!(alias.this.inferred_type(), Some(element_type), "{sql}");
+                    assert_eq!(alias.inferred_type.as_ref(), Some(element_type), "{sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_duckdb_regexp_extract_all_unresolved_overloads() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "documents",
+                &[(
+                    "names".to_string(),
+                    DataType::Array {
+                        element_type: Box::new(varchar),
+                        dimension: None,
+                    },
+                )],
+                None,
+            )
+            .unwrap();
+
+        // Do not fabricate a scalar or a precise struct for unknown capture
+        // names, ambiguous overloads, or invalid literal name lists/arity.
+        for arguments in [
+            "",
+            "'a1'",
+            "'a1', '(a)(1)', 0, 'i', 1",
+            "'a1', '(a)(1)', missing_group",
+            "'a1', '(a)(1)', documents.names",
+            "'a1', '(a)(1)', ['letter', missing_name]",
+            "'a1', '(a)(1)', CAST(['letter', 'number'] AS VARCHAR[])",
+            "'a1', '(a)(1)', []",
+            "'a1', '(a)(1)', [NULL]",
+            "'a1', '(a)(1)', ['letter', 'LETTER']",
+            "'a1', '(a)(1)', 1.0",
+            "'a1', '(a)(1)', CAST(1 AS BIGINT)",
+        ] {
+            let sql = format!("REGEXP_EXTRACT_ALL({arguments})");
+            let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+            let mut annotator = TypeAnnotator::new(Some(&schema), Some(DialectType::DuckDB));
+            assert_eq!(annotator.annotate(&expression), None, "{sql}");
+            annotator.annotate_in_place(&mut expression);
+            assert_eq!(expression.inferred_type(), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_regexp_extract_all_rule_is_duckdb_specific() {
+        // Other dialects have different overloads, notably BigQuery BYTES.
+        // Preserve their existing behavior rather than installing a global rule.
+        for dialect in [
+            None,
+            Some(DialectType::Generic),
+            Some(DialectType::BigQuery),
+            Some(DialectType::Snowflake),
+            Some(DialectType::Databricks),
+        ] {
+            for input in [
+                make_string_literal("a1"),
+                Expression::Literal(Box::new(Literal::ByteString("a1".to_string()))),
+            ] {
+                let mut annotator = TypeAnnotator::new(None, dialect);
+                let expected = annotator.annotate(&input);
+                let function = Expression::Function(Box::new(Function::new(
+                    "REGEXP_EXTRACT_ALL",
+                    vec![input, make_string_literal("[0-9]+")],
+                )));
+                assert_eq!(annotator.annotate(&function), expected, "{dialect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_duckdb_date_name_types() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        for input_type in [
+            DataType::Date,
+            DataType::Timestamp {
+                precision: None,
+                timezone: false,
+            },
+            DataType::Timestamp {
+                precision: None,
+                timezone: true,
+            },
+        ] {
+            let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+            schema
+                .add_table(
+                    "events",
+                    &[("created_at".to_string(), input_type.clone())],
+                    None,
+                )
+                .unwrap();
+            for function in ["MONTHNAME", "MoNtHnAmE", "DAYNAME", "DaYnAmE"] {
+                for input in [
+                    "created_at",
+                    "events.created_at",
+                    "DATE '2026-01-01'",
+                    "TIMESTAMP '2026-01-01 12:00:00'",
+                    "TIMESTAMPTZ '2026-01-01 12:00:00+00'",
+                    "NULL",
+                ] {
+                    let sql = format!("SELECT {function}({input}) AS label FROM events");
+                    for schema in [None, Some(&schema as &dyn Schema)] {
+                        let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+                        let original_sql = expression.sql_for(DialectType::DuckDB);
+                        annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+                        let Expression::Select(select) = &expression else {
+                            panic!("Expected SELECT for {sql}");
+                        };
+                        let Expression::Alias(alias) = &select.expressions[0] else {
+                            panic!("Expected alias for {sql}");
+                        };
+                        assert_eq!(alias.this.inferred_type(), Some(&varchar), "{sql}");
+                        assert_eq!(alias.inferred_type.as_ref(), Some(&varchar), "{sql}");
+                        if let Expression::Function(function) = &alias.this {
+                            if let Expression::Column(column) = &function.args[0] {
+                                assert_eq!(
+                                    column.inferred_type.as_ref(),
+                                    schema.map(|_| &input_type),
+                                    "Argument type must remain unchanged for {sql}"
+                                );
+                            }
+                        }
+                        assert_eq!(expression.sql_for(DialectType::DuckDB), original_sql);
+                        let json = serde_json::to_value(&expression).unwrap();
+                        let restored: Expression = serde_json::from_value(json).unwrap();
+                        assert_eq!(restored, expression);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_date_name_fixed_return_types_are_duckdb_specific() {
+        for dialect in [
+            None,
+            Some(DialectType::Generic),
+            Some(DialectType::PostgreSQL),
+            Some(DialectType::MySQL),
+            Some(DialectType::Snowflake),
+        ] {
+            let annotator = TypeAnnotator::new(None, dialect);
+            for function in ["MONTHNAME", "DAYNAME"] {
+                assert!(
+                    !annotator.function_return_types.contains_key(function),
+                    "Unexpected fixed return type for {function} in {dialect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_duckdb_array_to_string_types() {
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "events",
+                &[
+                    ("label".to_string(), varchar.clone()),
+                    (
+                        "labels".to_string(),
+                        DataType::Array {
+                            element_type: Box::new(varchar.clone()),
+                            dimension: None,
+                        },
+                    ),
+                ],
+                None,
+            )
+            .unwrap();
+
+        for function in [
+            "ARRAY_TO_STRING",
+            "array_to_string",
+            "ArRaY_To_StRiNg_CoMmA_DeFaUlT",
+        ] {
+            for input in [
+                "labels",
+                "events.labels",
+                "ARRAY_AGG(label)",
+                "ARRAY_AGG(events.label)",
+                "['a', NULL, 'b']",
+                "[1, 2]",
+                "[]",
+                "CAST(NULL AS VARCHAR[])",
+                "NULL",
+            ] {
+                let arguments = if function.eq_ignore_ascii_case("ARRAY_TO_STRING") {
+                    format!("{input}, ', '")
+                } else {
+                    input.to_string()
+                };
+                let sql = format!("SELECT {function}({arguments}) AS label_text FROM events");
+                for schema in [None, Some(&schema as &dyn Schema)] {
+                    let mut expression = parse_one(&sql, DialectType::DuckDB).unwrap();
+                    annotate_types(&mut expression, schema, Some(DialectType::DuckDB));
+                    let Expression::Select(select) = &expression else {
+                        panic!("Expected SELECT for {sql}");
+                    };
+                    let Expression::Alias(alias) = &select.expressions[0] else {
+                        panic!("Expected alias for {sql}");
+                    };
+                    assert_eq!(alias.this.inferred_type(), Some(&varchar), "{sql}");
+                    assert_eq!(alias.inferred_type.as_ref(), Some(&varchar), "{sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_to_string_fixed_return_types_are_duckdb_specific() {
+        // In particular, BigQuery also has a BYTES-returning overload, so it
+        // must not inherit DuckDB's unconditional VARCHAR return-type rules.
+        for dialect in [
+            None,
+            Some(DialectType::Generic),
+            Some(DialectType::BigQuery),
+            Some(DialectType::PostgreSQL),
+            Some(DialectType::Snowflake),
+        ] {
+            let annotator = TypeAnnotator::new(None, dialect);
+            for function in ["ARRAY_TO_STRING", "ARRAY_TO_STRING_COMMA_DEFAULT"] {
+                assert!(
+                    !annotator.function_return_types.contains_key(function),
+                    "Unexpected fixed return type for {function} in {dialect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_types_are_dialect_and_field_specific() {
+        let double = DataType::Double {
+            precision: None,
+            scale: None,
+        };
+        let bigint = DataType::BigInt { length: None };
+        let int = DataType::Int {
+            length: None,
+            integer_spelling: false,
+        };
+
+        for (field, duckdb_type) in [
+            (DateTimeField::Year, &bigint),
+            (DateTimeField::Second, &bigint),
+            (DateTimeField::Millisecond, &bigint),
+            (DateTimeField::Microsecond, &bigint),
+            (DateTimeField::Custom("yearweek".to_string()), &bigint),
+            (DateTimeField::Epoch, &double),
+            (DateTimeField::Custom("EpOcH".to_string()), &double),
+            (DateTimeField::Custom("julian".to_string()), &double),
+            (DateTimeField::Custom("JuLiAn".to_string()), &double),
+        ] {
+            let extract = Expression::Extract(Box::new(ExtractFunc {
+                this: make_string_literal("2024-02-03 04:05:06.123456"),
+                field,
+            }));
+            for dialect in [
+                None,
+                Some(DialectType::Generic),
+                Some(DialectType::PostgreSQL),
+                Some(DialectType::Snowflake),
+                Some(DialectType::DuckDB),
+            ] {
+                let expected = if dialect == Some(DialectType::DuckDB) {
+                    duckdb_type
+                } else {
+                    &int
+                };
+                assert_eq!(
+                    TypeAnnotator::new(None, dialect)
+                        .annotate(&extract)
+                        .as_ref(),
+                    Some(expected),
+                    "unexpected type for {extract:?} in {dialect:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2498,6 +3563,7 @@ mod tests {
         // Array[index] returns element type
         let arr = Expression::Array(Box::new(crate::expressions::Array {
             expressions: vec![make_int_literal(1), make_int_literal(2)],
+            inferred_type: None,
         }));
         let subscript = Expression::Subscript(Box::new(crate::expressions::Subscript {
             this: arr,
@@ -2574,6 +3640,7 @@ mod tests {
         // EXPLODE(array) returns element type
         let arr = Expression::Array(Box::new(crate::expressions::Array {
             expressions: vec![make_int_literal(1), make_int_literal(2)],
+            inferred_type: None,
         }));
         let explode = Expression::Explode(Box::new(crate::expressions::UnaryFunc {
             this: arr,
@@ -2596,6 +3663,7 @@ mod tests {
         // UNNEST(array) returns element type
         let arr = Expression::Array(Box::new(crate::expressions::Array {
             expressions: vec![make_string_literal("a"), make_string_literal("b")],
+            inferred_type: None,
         }));
         let unnest = Expression::Unnest(Box::new(crate::expressions::UnnestFunc {
             this: arr,
@@ -2612,6 +3680,162 @@ mod tests {
                 parenthesized_length: false
             })
         );
+    }
+
+    #[test]
+    fn test_annotate_duckdb_array_case_unnest_types() {
+        let timestamp = DataType::Timestamp {
+            precision: None,
+            timezone: false,
+        };
+        let array_timestamp = DataType::Array {
+            element_type: Box::new(timestamp.clone()),
+            dimension: None,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "events",
+                &[
+                    ("created_at".to_string(), timestamp.clone()),
+                    ("closed_at".to_string(), timestamp.clone()),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let mut expr = parse_one(
+            "SELECT UNNEST(CASE WHEN closed_at IS NULL THEN ARRAY[created_at] \
+             ELSE ARRAY[created_at, closed_at] END) AS event_at FROM events",
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        annotate_types(&mut expr, Some(&schema), Some(DialectType::DuckDB));
+
+        let Expression::Select(select) = &expr else {
+            panic!("expected select");
+        };
+        let Expression::Alias(alias) = &select.expressions[0] else {
+            panic!("expected alias");
+        };
+        let Expression::Function(unnest) = &alias.this else {
+            panic!("expected UNNEST function");
+        };
+        assert_eq!(unnest.name, "UNNEST");
+        let Expression::Case(case) = &unnest.args[0] else {
+            panic!("expected case");
+        };
+        let Expression::ArrayFunc(then_array) = &case.whens[0].1 else {
+            panic!("expected ARRAY constructor in THEN branch");
+        };
+        let Expression::ArrayFunc(else_array) = case.else_.as_ref().expect("expected ELSE") else {
+            panic!("expected ARRAY constructor in ELSE branch");
+        };
+
+        assert_eq!(then_array.inferred_type.as_ref(), Some(&array_timestamp));
+        assert_eq!(else_array.inferred_type.as_ref(), Some(&array_timestamp));
+        assert_eq!(case.inferred_type.as_ref(), Some(&array_timestamp));
+        assert_eq!(unnest.inferred_type.as_ref(), Some(&timestamp));
+        assert_eq!(alias.inferred_type.as_ref(), Some(&timestamp));
+        assert!(then_array
+            .expressions
+            .iter()
+            .all(|expression| { expression.inferred_type() == Some(&timestamp) }));
+        assert!(else_array
+            .expressions
+            .iter()
+            .all(|expression| { expression.inferred_type() == Some(&timestamp) }));
+    }
+
+    #[test]
+    fn test_array_and_case_coerce_all_result_types() {
+        let mut expr = parse_one(
+            "SELECT CASE WHEN TRUE THEN ARRAY[1] ELSE ARRAY[2.5] END AS values",
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        annotate_types(&mut expr, None, Some(DialectType::DuckDB));
+
+        let Expression::Select(select) = &expr else {
+            panic!("expected select");
+        };
+        let Expression::Alias(alias) = &select.expressions[0] else {
+            panic!("expected alias");
+        };
+        assert_eq!(
+            alias.this.inferred_type(),
+            Some(&DataType::Array {
+                element_type: Box::new(DataType::Double {
+                    precision: None,
+                    scale: None,
+                }),
+                dimension: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_transparent_wrappers_preserve_scalar_types() {
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table("flags", &[("flag".to_string(), DataType::Boolean)], None)
+            .unwrap();
+        let varchar = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+
+        let mut parenthesized = parse_one(
+            "SELECT (CASE WHEN flag THEN 'yes' ELSE 'no' END) AS label FROM flags",
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        annotate_types(&mut parenthesized, Some(&schema), Some(DialectType::DuckDB));
+
+        let Expression::Select(select) = &parenthesized else {
+            panic!("expected select");
+        };
+        let Expression::Alias(alias) = &select.expressions[0] else {
+            panic!("expected alias");
+        };
+        let Expression::Paren(paren) = &alias.this else {
+            panic!("expected parenthesized expression");
+        };
+        let Expression::Case(case) = &paren.this else {
+            panic!("expected case");
+        };
+        let Expression::Column(column) = &case.whens[0].0 else {
+            panic!("expected column condition");
+        };
+
+        assert_eq!(alias.this.inferred_type(), Some(&varchar));
+        assert_eq!(case.inferred_type.as_ref(), Some(&varchar));
+        assert_eq!(column.inferred_type.as_ref(), Some(&DataType::Boolean));
+        assert_eq!(alias.inferred_type.as_ref(), Some(&varchar));
+
+        let mut annotated = parse_one(
+            "SELECT CASE WHEN flag THEN 'yes' ELSE 'no' END /*tail*/ FROM flags",
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        annotate_types(&mut annotated, Some(&schema), Some(DialectType::DuckDB));
+
+        let Expression::Select(select) = &annotated else {
+            panic!("expected select");
+        };
+        let Expression::Annotated(annotated) = &select.expressions[0] else {
+            panic!("expected comment annotation wrapper");
+        };
+        let Expression::Case(case) = &annotated.this else {
+            panic!("expected case");
+        };
+        let Expression::Column(column) = &case.whens[0].0 else {
+            panic!("expected column condition");
+        };
+
+        assert_eq!(select.expressions[0].inferred_type(), Some(&varchar));
+        assert_eq!(case.inferred_type.as_ref(), Some(&varchar));
+        assert_eq!(column.inferred_type.as_ref(), Some(&DataType::Boolean));
     }
 
     #[test]
@@ -3119,5 +4343,59 @@ mod tests {
             alias.this.inferred_type(),
             Some(&DataType::BigInt { length: None })
         );
+    }
+
+    #[test]
+    fn test_annotate_duckdb_median_node_types() {
+        let cases = [
+            (
+                "SELECT MEDIAN(CAST(1 AS INTEGER)) AS result",
+                DataType::Double {
+                    precision: None,
+                    scale: None,
+                },
+            ),
+            (
+                "SELECT MEDIAN(CAST(1 AS FLOAT)) AS result",
+                DataType::Float {
+                    precision: None,
+                    scale: None,
+                    real_spelling: false,
+                },
+            ),
+            (
+                "SELECT MEDIAN(CAST(1 AS DECIMAL(10, 2))) AS result",
+                DataType::Decimal {
+                    precision: Some(10),
+                    scale: Some(2),
+                },
+            ),
+            (
+                "SELECT MEDIAN(CAST('2024-01-01' AS DATE)) AS result",
+                DataType::Timestamp {
+                    precision: None,
+                    timezone: false,
+                },
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let mut expr = parse_one(sql, DialectType::DuckDB).unwrap();
+            annotate_types(&mut expr, None, Some(DialectType::DuckDB));
+
+            let Expression::Select(select) = &expr else {
+                panic!("expected select for {sql}");
+            };
+            let Expression::Alias(alias) = &select.expressions[0] else {
+                panic!("expected alias for {sql}");
+            };
+
+            assert_eq!(alias.this.inferred_type(), Some(&expected), "{sql}");
+            assert_eq!(
+                select.expressions[0].inferred_type(),
+                Some(&expected),
+                "{sql}"
+            );
+        }
     }
 }

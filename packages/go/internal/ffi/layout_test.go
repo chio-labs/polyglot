@@ -5,6 +5,24 @@ import (
 	"unsafe"
 )
 
+func TestCStringNativePointer(t *testing.T) {
+	if got := CString(nil); got != "" {
+		t.Fatalf("CString(nil) = %q", got)
+	}
+	for _, value := range []string{"", "hello", "é😀"} {
+		data := append([]byte(value), 0, 'x')
+		got := CString(&data[0])
+		if got != value {
+			t.Fatalf("CString = %q, want %q", got, value)
+		}
+		// The result must own its bytes after native memory is released/reused.
+		data[0] = 'z'
+		if got != value {
+			t.Fatal("CString returned a view into the native allocation")
+		}
+	}
+}
+
 func TestResultLayout(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	wantSize := ptrSize*2 + 4

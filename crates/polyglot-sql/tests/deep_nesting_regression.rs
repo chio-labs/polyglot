@@ -93,6 +93,7 @@ fn build_deep_nested_array_materialize(depth: usize) -> Expression {
     for _ in 0..depth {
         current = Expression::Array(Box::new(Array {
             expressions: vec![current],
+            inferred_type: None,
         }));
     }
 

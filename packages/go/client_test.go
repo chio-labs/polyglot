@@ -78,6 +78,24 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 	}
 }
 
+func TestColumnUseJSONCompatibility(t *testing.T) {
+	var legacy QueryAnalysis
+	if err := json.Unmarshal([]byte(`{"shape":"select","projections":[]}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.ColumnUses) != 0 {
+		t.Fatal("legacy payload acquired column uses")
+	}
+	var current QueryAnalysis
+	if err := json.Unmarshal([]byte(`{"columnUses":[{"context":"filter","scopePath":"root","expressionPath":"where_clause.this","expressionSql":"id > 0","references":[{"column":"id","sourceKind":"unknown","confidence":"unknown","unqualified":true,"span":{"start":7,"end":9}}]}]}`), &current); err != nil {
+		t.Fatal(err)
+	}
+	ref := current.ColumnUses[0].References[0]
+	if ref.Column != "id" || ref.Confidence != "unknown" || ref.Span.Start != 7 || ref.Span.End != 9 {
+		t.Fatalf("invalid flattened reference: %#v", ref)
+	}
+}
+
 func TestVersion(t *testing.T) {
 	if Version() == "" {
 		t.Fatal("Version() is empty")
@@ -231,6 +249,59 @@ func TestValidationOptionsJSON(t *testing.T) {
 	}
 	if payload != `{"strictSyntax":true,"semantic":true}` {
 		t.Fatalf("payload = %s", payload)
+	}
+}
+
+func TestSchemaValidationOptionsAndSchemaJSON(t *testing.T) {
+	strict := false
+	payload, err := marshalOptions(SchemaValidationOptions{
+		CheckTypes: true, CheckReferences: true, Strict: &strict, StrictSyntax: true, Semantic: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var options map[string]any
+	if err := json.Unmarshal([]byte(payload), &options); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"check_types", "check_references", "strict_syntax", "semantic"} {
+		if options[key] != true {
+			t.Fatalf("%s missing from %s", key, payload)
+		}
+	}
+	if options["strict"] != false {
+		t.Fatalf("strict=false lost: %s", payload)
+	}
+	payload, err = marshalOptions(SchemaValidationOptions{})
+	if err != nil || payload != "{}" {
+		t.Fatalf("default options = %s, %v", payload, err)
+	}
+	payload, err = marshalOptions(ValidationSchema{})
+	if err != nil || payload != `{"tables":[]}` {
+		t.Fatalf("empty schema = %s, %v", payload, err)
+	}
+	schema := ValidationSchema{Tables: []SchemaTable{{Name: "orders"}}}
+	payload, err = marshalOptions(schema)
+	if err != nil || !strings.Contains(payload, `"columns":[]`) {
+		t.Fatalf("open schema = %s, %v", payload, err)
+	}
+	if schema.Tables[0].Columns != nil {
+		t.Fatal("serialization mutated the caller's schema")
+	}
+}
+
+func TestValidateWithSchemaInputAndLifecycleErrors(t *testing.T) {
+	var client *Client
+	if _, err := client.ValidateWithSchema("SELECT 1", ValidationSchema{}, ""); !errors.Is(err, ErrClosed) {
+		t.Fatalf("nil client error = %v", err)
+	}
+	for _, input := range [][2]string{{"SELECT \x00", "generic"}, {"SELECT 1", "generic\x00"}} {
+		if _, err := client.ValidateWithSchema(input[0], ValidationSchema{}, input[1]); err == nil || errors.Is(err, ErrClosed) {
+			t.Fatalf("expected NUL validation error, got %v", err)
+		}
+	}
+	if _, err := client.ValidateWithSchema("SELECT 1", ValidationSchema{}, "", SchemaValidationOptions{}, SchemaValidationOptions{}); err == nil || errors.Is(err, ErrClosed) {
+		t.Fatalf("expected options count error, got %v", err)
 	}
 }
 

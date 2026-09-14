@@ -60,6 +60,7 @@ from polyglot_sql._polyglot_sql import (
     except_,
     extract,
     validate,
+    validate_with_schema,
     version as _version,
 )
 
@@ -1169,6 +1170,7 @@ __all__ = [
     "format_sql",
     "format",
     "validate",
+    "validate_with_schema",
     "optimize",
     "analyze_query",
     "lineage",

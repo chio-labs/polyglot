@@ -683,6 +683,22 @@ Each `setOperations[].branches[]` entry has a `role`: both `UNION` branches are
 For physical relation facts, `name` remains the qualified display name while
 `catalog`, `schema`, and `table` expose parsed identifier parts.
 
+`columnUses` adds scoped facts for joins, filters (including aggregate FILTER),
+grouping, HAVING/QUALIFY, window keys/frames, ordering, and set-operation filter
+inputs. Each fact has `context`, `scopePath`, `expressionPath`, dialect-rendered
+`expressionSql`, and `references`. For example, `SELECT o.id FROM orders o WHERE
+o.amount > 0` reports a `filter` use of `orders.amount` without adding it to the
+`id` projection's upstream references. Paths distinguish nested scopes and
+branches; they are not persistent IDs across query edits.
+
+Optional `span` objects use half-open Unicode-character offsets into original
+SQL. To slice in JavaScript, use `Array.from(sql).slice(start, end).join('')`, not
+`sql.slice(start, end)`. Reference spans locate occurrences, not upstream
+definitions; complete expression spans are omitted when unavailable. Repeated
+occurrences are retained. Uncertain ownership is `ambiguous` or `unknown`.
+The TypeScript `columnUses` property is optional only to accommodate older WASM
+runtimes; current builds always return an array.
+
 ```typescript
 import { analyzeQuery, Dialect } from '@polyglot-sql/sdk';
 

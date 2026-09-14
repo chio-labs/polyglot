@@ -2603,6 +2603,7 @@ impl TSQLDialect {
                     characters,
                     position: TrimPosition::Both,
                     position_explicit: false,
+                    inferred_type: f.inferred_type,
                 })))
             }
 

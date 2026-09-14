@@ -119,8 +119,8 @@ jobs:
       - name: ClickHouse coverage tests (report-only)
         run: RUST_MIN_STACK=16777216 cargo test --test custom_clickhouse_coverage -p polyglot-sql --release -- --nocapture
 
-      - name: Feature-gate check (single dialect)
-        run: cargo check -p polyglot-sql --no-default-features --features dialect-clickhouse
+      - name: Feature-gate checks
+        run: make test-rust-feature-gates
 
       - name: Feature-gate check (WASM single dialect)
         run: cargo check -p polyglot-sql-wasm --no-default-features --features "console_error_panic_hook,dialect-clickhouse"

@@ -103,9 +103,9 @@
       "description": "Schema-aware validation",
       "layers": {
         "rust": { "status": "supported", "symbols": ["validation.validate_with_schema"] },
-        "python": { "status": "unavailable", "symbols": ["validate_with_schema"], "notes": "No Python wrapper is currently exported." },
-        "ffi": { "status": "unavailable", "symbols": ["polyglot_validate_with_schema"], "notes": "No FFI export is currently available." },
-        "go": { "status": "unavailable", "symbols": ["Client.ValidateWithSchema"], "notes": "The Go SDK follows the current FFI surface." },
+        "python": { "status": "supported", "symbols": ["validate_with_schema"] },
+        "ffi": { "status": "supported", "symbols": ["polyglot_validate_with_schema"] },
+        "go": { "status": "supported", "symbols": ["Client.ValidateWithSchema"] },
         "wasm": { "status": "supported", "symbols": ["validate_with_schema"] },
         "typescript": { "status": "supported", "symbols": ["validateWithSchema"] }
       }
@@ -196,7 +196,7 @@
     },
     {
       "id": "analyze_query",
-      "description": "Structured query analysis",
+      "description": "Structured query analysis, including scoped non-projection column uses",
       "layers": {
         "rust": { "status": "supported", "symbols": ["analyze_query"] },
         "python": { "status": "supported", "symbols": ["analyze_query"] },

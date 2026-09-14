@@ -172,28 +172,12 @@ function transformNode(
     }
   }
 
-  // Unwrap the envelope to get inner data and type
+  // The shared mapper preserves scalar leaves and clones object payloads.
   const currentType = getExprType(currentNode);
-  const innerData = getExprData(currentNode);
-
-  // Unit struct variants (Null, CurrentDate, RowNumber, etc.) have null inner data
-  let newNode: Expression;
-  if (innerData === null || innerData === undefined) {
-    newNode = makeExpr(currentType, innerData);
-  } else {
-    const newInnerData = mapExpressionChildren(currentNode, (child, location) =>
-      transformNode(
-        child,
-        config,
-        location.parent,
-        location.key,
-        location.index,
-      ),
-    );
-
-    // Re-wrap in the envelope
-    newNode = makeExpr(currentType, newInnerData);
-  }
+  const newInnerData = mapExpressionChildren(currentNode, (child, location) =>
+    transformNode(child, config, location.parent, location.key, location.index),
+  );
+  const newNode = makeExpr(currentType, newInnerData);
 
   // Call leave callback
   if (config.leave) {
@@ -551,9 +535,6 @@ export function clone(node: Expression): Expression {
  */
 export function remove(node: Expression, predicate: NodePredicate): Expression {
   const nodeType = getExprType(node);
-  const innerData = getExprData(node);
-  if (innerData === null || innerData === undefined) return node;
-
   const newInnerData = mapExpressionChildren(
     node,
     (child) => remove(child, predicate),

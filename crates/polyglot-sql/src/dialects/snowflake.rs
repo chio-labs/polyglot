@@ -2389,6 +2389,7 @@ impl SnowflakeDialect {
                     expressions: f.args,
                     bracket_notation: true,
                     use_list_keyword: false,
+                    inferred_type: None,
                 },
             ))),
 
@@ -4040,6 +4041,14 @@ mod tests {
         let result = transpile_to_snowflake("SELECT a, b FROM users WHERE id = 1");
         assert!(result.contains("SELECT"));
         assert!(result.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_extract_string_comma_syntax_remains_date_part() {
+        assert_eq!(
+            transpile_to_snowflake("SELECT EXTRACT('month', a)"),
+            "SELECT DATE_PART('month', a)"
+        );
     }
 
     #[test]

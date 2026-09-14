@@ -667,6 +667,7 @@ pub(super) fn rewrite(
                             let array_with_input =
                                 Expression::Array(Box::new(crate::expressions::Array {
                                     expressions: vec![str_arg],
+                                    inferred_type: None,
                                 }));
 
                             // CASE
@@ -2121,10 +2122,12 @@ pub(super) fn rewrite(
                             let empty_keys =
                                 Expression::Array(Box::new(crate::expressions::Array {
                                     expressions: vec![],
+                                    inferred_type: None,
                                 }));
                             let empty_vals =
                                 Expression::Array(Box::new(crate::expressions::Array {
                                     expressions: vec![],
+                                    inferred_type: None,
                                 }));
                             Ok(Expression::Function(Box::new(Function::new(
                                 "MAP".to_string(),
@@ -2160,10 +2163,12 @@ pub(super) fn rewrite(
                                     let keys_arr =
                                         Expression::Array(Box::new(crate::expressions::Array {
                                             expressions: keys,
+                                            inferred_type: None,
                                         }));
                                     let vals_arr =
                                         Expression::Array(Box::new(crate::expressions::Array {
                                             expressions: vals,
+                                            inferred_type: None,
                                         }));
                                     Ok(Expression::Function(Box::new(Function::new(
                                         "MAP".to_string(),
@@ -2184,10 +2189,12 @@ pub(super) fn rewrite(
                                     let keys_arr =
                                         Expression::Array(Box::new(crate::expressions::Array {
                                             expressions: keys,
+                                            inferred_type: None,
                                         }));
                                     let vals_arr =
                                         Expression::Array(Box::new(crate::expressions::Array {
                                             expressions: vals,
+                                            inferred_type: None,
                                         }));
                                     Ok(Expression::Function(Box::new(Function::new(
                                         "MAP".to_string(),
@@ -7524,6 +7531,7 @@ pub(super) fn rewrite(
                                                 expressions: a.expressions,
                                                 bracket_notation: false,
                                                 use_list_keyword: false,
+                                                inferred_type: a.inferred_type,
                                             },
                                         )),
                                         _ => arr,
@@ -7587,6 +7595,7 @@ pub(super) fn rewrite(
                                                 expressions: a.expressions,
                                                 bracket_notation: false,
                                                 use_list_keyword: false,
+                                                inferred_type: a.inferred_type,
                                             },
                                         )),
                                         _ => arr1,
@@ -7597,6 +7606,7 @@ pub(super) fn rewrite(
                                                 expressions: a.expressions,
                                                 bracket_notation: false,
                                                 use_list_keyword: false,
+                                                inferred_type: a.inferred_type,
                                             },
                                         )),
                                         _ => arr2,
@@ -9632,6 +9642,7 @@ pub(super) fn rewrite(
                                     position: crate::expressions::TrimPosition::Leading,
                                     sql_standard_syntax: true,
                                     position_explicit: true,
+                                    inferred_type: f.inferred_type,
                                 })))
                             }
                             _ => Ok(Expression::Function(f)),
@@ -9651,6 +9662,7 @@ pub(super) fn rewrite(
                                     position: crate::expressions::TrimPosition::Trailing,
                                     sql_standard_syntax: true,
                                     position_explicit: true,
+                                    inferred_type: f.inferred_type,
                                 })))
                             }
                             _ => Ok(Expression::Function(f)),
@@ -10039,6 +10051,7 @@ pub(super) fn rewrite(
                                             expressions: vec![subquery],
                                             bracket_notation: false,
                                             use_list_keyword: false,
+                                            inferred_type: None,
                                         },
                                     )))
                                 }
@@ -10913,6 +10926,7 @@ pub(super) fn rewrite(
                             } else {
                                 Ok(Expression::Array(Box::new(crate::expressions::Array {
                                     expressions: f.args,
+                                    inferred_type: None,
                                 })))
                             }
                         }
@@ -10930,6 +10944,7 @@ pub(super) fn rewrite(
                                 | DialectType::Athena => {
                                     Ok(Expression::Array(Box::new(crate::expressions::Array {
                                         expressions: f.args,
+                                        inferred_type: None,
                                     })))
                                 }
                                 _ => Ok(Expression::Function(f)),
@@ -11003,6 +11018,7 @@ pub(super) fn rewrite(
                                     expressions: ja.expressions,
                                     bracket_notation: false,
                                     use_list_keyword: false,
+                                    inferred_type: None,
                                 },
                             ));
                             Ok(Expression::Function(Box::new(Function::new(
@@ -11020,6 +11036,7 @@ pub(super) fn rewrite(
                                     expressions: f.expressions,
                                     bracket_notation: false,
                                     use_list_keyword: false,
+                                    inferred_type: None,
                                 },
                             ));
                             Ok(Expression::Function(Box::new(Function::new(
@@ -15360,6 +15377,7 @@ pub(super) fn normalize_bigquery_function(
                                 expressions: vec![],
                                 bracket_notation: true,
                                 use_list_keyword: false,
+                                inferred_type: None,
                             }));
                         let mut new_args = args;
                         new_args.push(empty_arr);

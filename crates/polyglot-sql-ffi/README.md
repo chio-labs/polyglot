@@ -117,6 +117,7 @@ typedef struct {
 - `polyglot_format_with_options(sql, dialect, options_json)` (`FormatGuardOptions` JSON)
 - `polyglot_validate(sql, dialect)`
 - `polyglot_validate_with_options(sql, dialect, options_json)` (`ValidationOptions` JSON, e.g. `{"strictSyntax": true, "semantic": true}`)
+- `polyglot_validate_with_schema(sql, schema_json, dialect, options_json)` (`ValidationSchema` and `SchemaValidationOptions` JSON; returns `polyglot_validation_result_t`)
 - `polyglot_optimize(sql, dialect)` (full optimizer pipeline)
 - `polyglot_build(request_json)` (evaluates a versioned, stateless builder plan
   and returns either an expression AST or generated SQL)
@@ -219,6 +220,13 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_diff`: JSON array of diff edits
 - `polyglot_dialect_list`: JSON array of dialect names
 
+`QueryAnalysis.columnUses` contains the shared Rust clause-use facts: `context`,
+`scopePath`, `expressionPath`, dialect-rendered `expressionSql`, and `references`
+with existing source identity/confidence fields. Optional `span` objects use
+half-open Unicode-character offsets into the original SQL; reference spans locate
+uses rather than upstream definitions. Unavailable expression spans are omitted.
+The field is JSON-additive and requires no new C function or ABI layout change.
+
 `ValidationSchema` JSON used by schema-aware functions and `AnalyzeQueryOptions`
 uses this shape:
 
@@ -264,12 +272,34 @@ unexpanded wildcard prevents later positions from being known.
 
 ### Validation payloads
 
+`polyglot_validate_with_schema` uses the same Rust validator as Python, WASM,
+TypeScript and Go. Its schema uses the existing `{"tables": [...]}` shape.
+All four string arguments are required; pass `"{}"` for default options.
+Options are `check_types`, `check_references`, `strict`, `semantic` and
+`strict_syntax`; compound names also accept their camelCase equivalents.
+Unknown option names are rejected, not silently ignored.
+
+Unknown tables, aliases and columns are checked by default. `check_references`
+additionally enables ambiguity and foreign-key checks. `strict` overrides the
+schema's strict setting, which defaults to true; false reports reference/type
+findings as warnings. Empty column lists and wildcard (`*`) columns represent
+open schemas. Syntax errors take precedence over schema checks.
+
+SQL validation failures return status `4` and findings in `errors_json`;
+warnings return status `0` with `valid = 1`. Invalid arguments or JSON use the
+existing top-level error statuses. Free results with
+`polyglot_free_validation_result`, including failure results. The C result
+layout is unchanged; consumers must load a library exporting the new symbol.
+
 - `errors_json`: JSON array of validation error objects:
   - `message`
   - optional `line`
   - optional `column`
   - `severity`
   - `code`
+  - optional `start` and `end`: zero-based Unicode character offsets in the
+    original SQL, with an exclusive end (not UTF-8 byte offsets). Reference
+    diagnostics point to offending identifiers when source metadata exists.
 
 ## Error Codes
 

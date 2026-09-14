@@ -22,7 +22,7 @@ use crate::function_catalog::{
 };
 use crate::function_registry::canonical_typed_function_name_upper;
 use crate::optimizer::annotate_types::annotate_types;
-use crate::optimizer::qualify_columns::normalize_dotted_columns;
+use crate::optimizer::qualify_columns::normalize_dotted_columns_in_scope;
 use crate::resolver::Resolver;
 use crate::schema::{MappingSchema, Schema as SqlSchema, SchemaError, SchemaResult, TABLE_PARTS};
 use crate::scope::{build_scope, walk_in_scope};
@@ -131,13 +131,16 @@ pub struct ValidationSchema {
 }
 
 /// Options for schema-aware validation.
+/// JSON accepts snake_case names and camelCase aliases for compound names;
+/// unrecognized options are rejected to avoid silently disabling checks.
 #[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaValidationOptions {
     /// Enables type compatibility checks for expressions, DML assignments, and set operations.
-    #[serde(default)]
+    #[serde(default, alias = "checkTypes")]
     pub check_types: bool,
     /// Enables FK/reference integrity checks and query-level reference quality checks.
-    #[serde(default)]
+    #[serde(default, alias = "checkReferences")]
     pub check_references: bool,
     /// If true/false, overrides schema.strict.
     #[serde(default)]
@@ -146,7 +149,7 @@ pub struct SchemaValidationOptions {
     #[serde(default)]
     pub semantic: bool,
     /// Enables strict syntax checks (e.g. rejects trailing commas before clause boundaries).
-    #[serde(default)]
+    #[serde(default, alias = "strictSyntax")]
     pub strict_syntax: bool,
     /// Optional external function catalog plugin for dialect-specific function validation.
     #[serde(skip, default)]
@@ -462,9 +465,8 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
         "bool" | "boolean" => TypeFamily::Boolean,
         "tinyint" | "smallint" | "int2" | "int" | "integer" | "int4" | "int8" | "bigint"
         | "serial" | "smallserial" | "bigserial" | "utinyint" | "usmallint" | "uinteger"
-        | "ubigint" | "uint8" | "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64" => {
-            TypeFamily::Integer
-        }
+        | "ubigint" | "uint8" | "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64"
+        | "hugeint" | "int128" | "largeint" | "uhugeint" | "uint128" => TypeFamily::Integer,
         "numeric" | "decimal" | "dec" | "number" | "float" | "float4" | "float8" | "real"
         | "double" | "double precision" | "bfloat16" | "float16" | "float32" | "float64" => {
             TypeFamily::Numeric
@@ -812,7 +814,13 @@ fn data_type_family(data_type: &DataType) -> TypeFamily {
         DataType::TinyInt { .. }
         | DataType::SmallInt { .. }
         | DataType::Int { .. }
-        | DataType::BigInt { .. } => TypeFamily::Integer,
+        | DataType::BigInt { .. }
+        | DataType::Int128
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::UInt128 => TypeFamily::Integer,
         DataType::Float { .. } | DataType::Double { .. } | DataType::Decimal { .. } => {
             TypeFamily::Numeric
         }
@@ -2064,7 +2072,6 @@ fn check_query_reference_quality(
     stmt: &Expression,
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
-    strict: bool,
     relationships: &[DeclaredRelationship],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -2078,52 +2085,6 @@ fn check_query_reference_quality(
         let context = collect_type_check_context(&select_expr, schema_map);
         let scope = build_scope(&select_expr);
         let mut resolver = Resolver::new(&scope, resolver_schema, true);
-
-        if context.referenced_tables.len() > 1 {
-            let using_columns: HashSet<String> = select
-                .joins
-                .iter()
-                .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
-                .collect();
-
-            let mut seen = HashSet::new();
-            for column_expr in select_expr
-                .find_all(|e| matches!(e, Expression::Column(col) if col.table.is_none()))
-            {
-                let Expression::Column(column) = column_expr else {
-                    continue;
-                };
-
-                let col_name = lower(&column.name.name);
-                if col_name.is_empty()
-                    || using_columns.contains(&col_name)
-                    || !seen.insert(col_name.clone())
-                {
-                    continue;
-                }
-
-                if resolver.is_ambiguous(&col_name) {
-                    let source_count = resolver.sources_for_column(&col_name).len();
-                    errors.push(if strict {
-                        ValidationError::error(
-                            format!(
-                                "Ambiguous unqualified column '{}' found in {} referenced tables",
-                                col_name, source_count
-                            ),
-                            validation_codes::E_AMBIGUOUS_COLUMN_REFERENCE,
-                        )
-                    } else {
-                        ValidationError::warning(
-                            format!(
-                                "Ambiguous unqualified column '{}' found in {} referenced tables",
-                                col_name, source_count
-                            ),
-                            validation_codes::W_WEAK_REFERENCE_INTEGRITY,
-                        )
-                    });
-                }
-            }
-        }
 
         let mut cumulative_left_tables = select_from_table_keys(select, schema_map);
 
@@ -3322,150 +3283,262 @@ fn source_display_name(scope: &crate::scope::Scope, source_name: &str) -> String
         .unwrap_or_else(|| lower(source_name))
 }
 
-fn validate_select_columns_with_schema(
-    select: &crate::expressions::Select,
+/// Attach original token locations without manufacturing offsets for synthetic ASTs.
+fn reference_diagnostic(
+    message: String,
+    code: &str,
+    strict: bool,
+    span: Option<crate::tokens::Span>,
+) -> ValidationError {
+    let mut error = if strict {
+        ValidationError::error(message, code)
+    } else {
+        ValidationError::warning(message, code)
+    };
+    if let Some(span) = span {
+        error = error
+            .with_location(span.line, span.column)
+            .with_span(Some(span.start), Some(span.end));
+    }
+    error
+}
+
+use crate::scope::{scope_query, selected_reference_scope as selected_validation_scope};
+
+fn validate_scope_columns(
+    scope: &crate::scope::Scope,
+    ancestors: &[&crate::scope::Scope],
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     strict: bool,
+    check_references: bool,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let mut normalized_select = select.clone();
-    let _ = normalize_dotted_columns(&mut normalized_select, resolver_schema, true);
-    let select_expr = Expression::Select(Box::new(normalized_select));
-    let scope = build_scope(&select_expr);
-    let mut resolver = Resolver::new(&scope, resolver_schema, true);
-    let source_names: Vec<String> = scope.sources.keys().cloned().collect();
+    let Expression::Select(select) = &scope.expression else {
+        return errors;
+    };
 
-    for node in walk_in_scope(&select_expr, false) {
-        let Expression::Column(column) = node else {
-            continue;
-        };
-
-        let col_name = lower(&column.name.name);
-        if col_name.is_empty() {
-            continue;
-        }
-
-        if let Some(table) = &column.table {
-            let Some(source_name) = resolve_scope_source_name(&scope, &table.name) else {
-                // The table qualifier is not a declared alias or source in this scope
-                errors.push(if strict {
-                    ValidationError::error(
-                        format!(
-                            "Unknown table or alias '{}' referenced by column '{}'",
-                            table.name, col_name
-                        ),
-                        validation_codes::E_UNRESOLVED_REFERENCE,
-                    )
-                } else {
-                    ValidationError::warning(
-                        format!(
-                            "Unknown table or alias '{}' referenced by column '{}'",
-                            table.name, col_name
-                        ),
-                        validation_codes::E_UNRESOLVED_REFERENCE,
-                    )
-                });
-                continue;
-            };
-
-            if let Ok(columns) = resolver.get_source_columns(&source_name) {
-                if !columns.is_empty() && !source_has_column(&columns, &col_name) {
-                    let table_name = source_display_name(&scope, &source_name);
-                    errors.push(if strict {
-                        ValidationError::error(
-                            format!("Unknown column '{}' in table '{}'", col_name, table_name),
-                            validation_codes::E_UNKNOWN_COLUMN,
-                        )
-                    } else {
-                        ValidationError::warning(
-                            format!("Unknown column '{}' in table '{}'", col_name, table_name),
-                            validation_codes::E_UNKNOWN_COLUMN,
-                        )
-                    });
-                }
-            }
-            continue;
-        }
-
-        let matching_sources: Vec<String> = source_names
-            .iter()
-            .filter_map(|source_name| {
-                resolver
-                    .get_source_columns(source_name)
-                    .ok()
-                    .filter(|columns| !columns.is_empty() && source_has_column(columns, &col_name))
-                    .map(|_| source_name.clone())
-            })
-            .collect();
-
-        if !matching_sources.is_empty() {
-            continue;
-        }
-
-        let known_sources: Vec<String> = source_names
-            .iter()
-            .filter_map(|source_name| {
-                resolver
-                    .get_source_columns(source_name)
-                    .ok()
-                    .filter(|columns| !columns.is_empty() && !columns.iter().any(|c| c == "*"))
-                    .map(|_| source_name.clone())
-            })
-            .collect();
-
-        if known_sources.len() == 1 {
-            let table_name = source_display_name(&scope, &known_sources[0]);
-            errors.push(if strict {
-                ValidationError::error(
-                    format!("Unknown column '{}' in table '{}'", col_name, table_name),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            } else {
-                ValidationError::warning(
-                    format!("Unknown column '{}' in table '{}'", col_name, table_name),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            });
-        } else if known_sources.len() > 1 {
-            errors.push(if strict {
-                ValidationError::error(
-                    format!(
-                        "Unknown column '{}' (not found in any referenced table)",
-                        col_name
-                    ),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            } else {
-                ValidationError::warning(
-                    format!(
-                        "Unknown column '{}' (not found in any referenced table)",
-                        col_name
-                    ),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            });
-        } else if !schema_map.is_empty() {
-            let found = schema_map
-                .values()
-                .any(|table_schema| table_schema.columns.contains_key(&col_name));
-            if !found {
-                errors.push(if strict {
-                    ValidationError::error(
-                        format!("Unknown column '{}'", col_name),
-                        validation_codes::E_UNKNOWN_COLUMN,
-                    )
-                } else {
-                    ValidationError::warning(
-                        format!("Unknown column '{}'", col_name),
-                        validation_codes::E_UNKNOWN_COLUMN,
-                    )
-                });
+    // Normalize struct access with the actual lexical context. A real outer
+    // qualifier must not be reinterpreted as a column of an open local table.
+    let mut visible = crate::scope::Scope::new(scope.expression.clone());
+    for source_scope in std::iter::once(scope).chain(ancestors.iter().copied()) {
+        for (name, source) in &source_scope.sources {
+            if resolve_scope_source_name(&visible, name).is_none() {
+                visible.sources.insert(name.clone(), source.clone());
             }
         }
     }
+    let mut normalized = select.clone();
+    let mut normalizer = Resolver::new(&visible, resolver_schema, true);
+    let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+    let expression = Expression::Select(normalized);
+    let mut resolvers: Vec<_> = std::iter::once(scope)
+        .chain(ancestors.iter().copied())
+        .map(|scope| (scope, Resolver::new(scope, resolver_schema, true)))
+        .collect();
+    let using_columns: HashSet<String> = select
+        .joins
+        .iter()
+        .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
+        .collect();
 
+    for node in walk_in_scope(&expression, false) {
+        let Expression::Column(column) = node else {
+            continue;
+        };
+        let name = lower(&column.name.name);
+        if name.is_empty() || name == "*" {
+            continue;
+        }
+        let span = column.name.span.or(column.span);
+        if let Some(qualifier) = &column.table {
+            let resolved = resolvers.iter_mut().find_map(|(scope, resolver)| {
+                resolve_scope_source_name(scope, &qualifier.name).map(|source| {
+                    (
+                        *scope,
+                        resolver.get_source_columns(&source).unwrap_or_default(),
+                        source,
+                    )
+                })
+            });
+            if let Some((source_scope, columns, source)) = resolved {
+                if !columns.is_empty() && !source_has_column(&columns, &name) {
+                    errors.push(reference_diagnostic(
+                        format!(
+                            "Unknown column '{}' in table '{}'",
+                            name,
+                            source_display_name(source_scope, &source)
+                        ),
+                        validation_codes::E_UNKNOWN_COLUMN,
+                        strict,
+                        span,
+                    ));
+                }
+            } else {
+                errors.push(reference_diagnostic(
+                    format!(
+                        "Unknown table or alias '{}' referenced by column '{}'",
+                        qualifier.name, name
+                    ),
+                    validation_codes::E_UNRESOLVED_REFERENCE,
+                    strict,
+                    qualifier.span.or(column.span),
+                ));
+            }
+            continue;
+        }
+
+        let mut found = false;
+        for (source_scope, resolver) in &mut resolvers {
+            let mut matches = 0;
+            let mut open = false;
+            for source in source_scope.sources.keys() {
+                let columns = resolver.get_source_columns(source).unwrap_or_default();
+                open |= columns.is_empty() || columns.iter().any(|name| name == "*");
+                // Wildcards are not evidence of a definite ambiguity.
+                matches += usize::from(columns.iter().any(|col| col.eq_ignore_ascii_case(&name)));
+            }
+            if matches > 0 || open {
+                if matches > 1 && check_references && !using_columns.contains(&name) {
+                    errors.push(reference_diagnostic(
+                        format!(
+                            "Ambiguous unqualified column '{}' found in {} referenced tables",
+                            name, matches
+                        ),
+                        if strict {
+                            validation_codes::E_AMBIGUOUS_COLUMN_REFERENCE
+                        } else {
+                            validation_codes::W_WEAK_REFERENCE_INTEGRITY
+                        },
+                        strict,
+                        span,
+                    ));
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Preserve the existing schema-only lookup for standalone column
+            // expressions (SELECT id). Never consult unrelated tables when
+            // the query has actual sources or an enclosing query context.
+            if scope.sources.is_empty()
+                && ancestors.is_empty()
+                && (schema_map.is_empty()
+                    || schema_map
+                        .values()
+                        .any(|table| table.columns.contains_key(&name)))
+            {
+                continue;
+            }
+            let message = if scope.sources.len() == 1 {
+                let source = scope.sources.keys().next().unwrap();
+                format!(
+                    "Unknown column '{}' in table '{}'",
+                    name,
+                    source_display_name(scope, source)
+                )
+            } else {
+                format!(
+                    "Unknown column '{}' (not found in any referenced table)",
+                    name
+                )
+            };
+            errors.push(reference_diagnostic(
+                message,
+                validation_codes::E_UNKNOWN_COLUMN,
+                strict,
+                span,
+            ));
+        }
+    }
     errors
+}
+
+fn validate_scope_tree(
+    scope: &crate::scope::Scope,
+    ancestors: &[&crate::scope::Scope],
+    schema_map: &HashMap<String, TableSchemaEntry>,
+    resolver_schema: &MappingSchema,
+    strict: bool,
+    check_references: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    let selected = selected_validation_scope(scope);
+    for node in walk_in_scope(&selected.expression, false) {
+        let Expression::Table(table) = node else {
+            continue;
+        };
+        let is_cte = table.schema.is_none()
+            && table.catalog.is_none()
+            && selected
+                .cte_sources
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(&table.name.name));
+        if !is_cte {
+            validate_schema_table(table, schema_map, strict, errors);
+        }
+    }
+    errors.extend(validate_scope_columns(
+        &selected,
+        ancestors,
+        schema_map,
+        resolver_schema,
+        strict,
+        check_references,
+    ));
+
+    // CTEs and ordinary derived tables cannot see their containing SELECT's
+    // sources, but may retain ancestors of an enclosing correlated subquery.
+    for child in scope
+        .cte_scopes
+        .iter()
+        .chain(&scope.derived_table_scopes)
+        .chain(&scope.union_scopes)
+    {
+        validate_scope_tree(
+            child,
+            ancestors,
+            schema_map,
+            resolver_schema,
+            strict,
+            check_references,
+            errors,
+        );
+    }
+    let outer: Vec<_> = std::iter::once(&selected)
+        .chain(ancestors.iter().copied())
+        .collect();
+    for child in scope.subquery_scopes.iter().chain(&scope.udtf_scopes) {
+        validate_scope_tree(
+            child,
+            &outer,
+            schema_map,
+            resolver_schema,
+            strict,
+            check_references,
+            errors,
+        );
+    }
+}
+
+fn validate_schema_table(
+    table: &TableRef,
+    schema_map: &HashMap<String, TableSchemaEntry>,
+    strict: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !table_ref_candidates(table)
+        .iter()
+        .any(|key| schema_map.contains_key(key))
+    {
+        errors.push(reference_diagnostic(
+            format!("Unknown table '{}'", table_ref_display_name(table)),
+            validation_codes::E_UNKNOWN_TABLE,
+            strict,
+            table.name.span,
+        ));
+    }
 }
 
 fn validate_statement_with_schema(
@@ -3473,59 +3546,36 @@ fn validate_statement_with_schema(
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     strict: bool,
+    check_references: bool,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let cte_aliases = collect_cte_aliases(stmt);
-    let mut seen_tables: HashSet<String> = HashSet::new();
-
-    // Table validation (E200)
-    for node in stmt.find_all(|e| matches!(e, Expression::Table(_))) {
-        let Expression::Table(table) = node else {
-            continue;
-        };
-
-        if cte_aliases.contains(&lower(&table.name.name)) {
-            continue;
-        }
-
-        let resolved_key = table_ref_candidates(table)
-            .into_iter()
-            .find(|k| schema_map.contains_key(k));
-        let table_key = resolved_key
-            .clone()
-            .unwrap_or_else(|| lower(&table_ref_display_name(table)));
-
-        if !seen_tables.insert(table_key) {
-            continue;
-        }
-
-        if resolved_key.is_none() {
-            errors.push(if strict {
-                ValidationError::error(
-                    format!("Unknown table '{}'", table_ref_display_name(table)),
-                    validation_codes::E_UNKNOWN_TABLE,
-                )
-            } else {
-                ValidationError::warning(
-                    format!("Unknown table '{}'", table_ref_display_name(table)),
-                    validation_codes::E_UNKNOWN_TABLE,
-                )
-            });
+    // Visit each query tree once, including queries embedded in DML/DDL.
+    let mut pending = vec![stmt];
+    while let Some(expression) = pending.pop() {
+        if matches!(
+            scope_query(expression),
+            Expression::Select(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_)
+        ) {
+            let scope = build_scope(expression);
+            validate_scope_tree(
+                &scope,
+                &[],
+                schema_map,
+                resolver_schema,
+                strict,
+                check_references,
+                &mut errors,
+            );
+        } else {
+            if let Expression::Table(table) = expression {
+                validate_schema_table(table, schema_map, strict, &mut errors);
+            }
+            pending.extend(expression.children().into_iter().rev());
         }
     }
-
-    for node in stmt.dfs() {
-        let Expression::Select(select) = node else {
-            continue;
-        };
-        errors.extend(validate_select_columns_with_schema(
-            select,
-            schema_map,
-            resolver_schema,
-            strict,
-        ));
-    }
-
     errors
 }
 
@@ -3590,6 +3640,7 @@ pub fn validate_with_schema(
             &schema_map,
             &resolver_schema,
             strict,
+            options.check_references,
         ));
         if options.check_types {
             all_errors.extend(check_types(
@@ -3605,7 +3656,6 @@ pub fn validate_with_schema(
                 stmt,
                 &schema_map,
                 &resolver_schema,
-                strict,
                 &declared_relationships,
             ));
         }

@@ -55,9 +55,9 @@
 //! .build();
 //! ```
 
-pub(crate) mod engine;
 pub mod plan;
 
+use crate::ast_mutation as engine;
 use crate::expressions::*;
 use crate::generator::{Generator, GeneratorConfig, NotInStyle};
 use crate::parser::Parser;
@@ -552,6 +552,7 @@ pub fn trim(expr: Expr) -> Expr {
         position: TrimPosition::Both,
         sql_standard_syntax: false,
         position_explicit: false,
+        inferred_type: None,
     })))
 }
 
@@ -2809,6 +2810,37 @@ mod tests {
     fn test_cast() {
         let sql = select([col("id").cast("VARCHAR")]).from("users").to_sql();
         assert_eq!(sql, "SELECT CAST(id AS VARCHAR) FROM users");
+    }
+
+    #[test]
+    fn test_cast_int128() {
+        for name in ["HUGEINT", "INT128"] {
+            let Expression::Cast(cast) = col("value").cast(name).0 else {
+                panic!("expected cast");
+            };
+            assert_eq!(cast.to, DataType::Int128);
+        }
+    }
+
+    #[test]
+    fn test_cast_unsigned_integer_types() {
+        for (name, expected) in [
+            ("UTINYINT", DataType::UInt8),
+            ("UINT8", DataType::UInt8),
+            ("USMALLINT", DataType::UInt16),
+            ("UINT16", DataType::UInt16),
+            ("UINTEGER", DataType::UInt32),
+            ("UINT32", DataType::UInt32),
+            ("UBIGINT", DataType::UInt64),
+            ("UINT64", DataType::UInt64),
+            ("UHUGEINT", DataType::UInt128),
+            ("UINT128", DataType::UInt128),
+        ] {
+            let Expression::Cast(cast) = col("value").cast(name).0 else {
+                panic!("expected cast")
+            };
+            assert_eq!(cast.to, expected, "{name}");
+        }
     }
 
     #[test]

@@ -4359,6 +4359,7 @@ fn propagate_struct_names_in_expr(expr: Expression) -> Result<Expression> {
         if let Some(new_elements) = propagate_in_elements(&arr.expressions) {
             return Ok(Expression::Array(Box::new(crate::expressions::Array {
                 expressions: new_elements,
+                inferred_type: arr.inferred_type.clone(),
             })));
         }
     }
@@ -4370,6 +4371,7 @@ fn propagate_struct_names_in_expr(expr: Expression) -> Result<Expression> {
                 expressions: new_elements,
                 bracket_notation: arr.bracket_notation,
                 use_list_keyword: arr.use_list_keyword,
+                inferred_type: arr.inferred_type.clone(),
             })));
         }
     }

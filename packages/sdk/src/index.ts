@@ -93,9 +93,9 @@ export interface TranspileResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -110,9 +110,9 @@ export interface ParseResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -127,9 +127,9 @@ export interface DataTypeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -144,9 +144,9 @@ export interface GenerateDataTypeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -182,9 +182,9 @@ export interface TokenizeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -304,6 +304,45 @@ export interface QueryAnalysis {
   baseTables: RelationFact[];
   starProjections: StarProjectionFact[];
   setOperations: SetOperationFact[];
+  /** Present in current runtimes; optional for compatibility with older WASM builds. */
+  columnUses?: ColumnUseFact[];
+}
+
+/** Half-open offsets in original SQL, measured in Unicode characters, not UTF-16 units. */
+export interface QuerySourceSpan {
+  start: number;
+  end: number;
+}
+
+export type ColumnUseContext =
+  | 'join'
+  | 'filter'
+  | 'group'
+  | 'having'
+  | 'qualify'
+  | 'window_partition'
+  | 'window_order'
+  | 'window_frame'
+  | 'order'
+  | 'aggregate_order'
+  | 'set_operation_filter';
+
+export interface ColumnUseReferenceFact extends ColumnReferenceFact {
+  /** Original occurrence, not the upstream column definition. */
+  span?: QuerySourceSpan;
+}
+
+export interface ColumnUseFact {
+  context: ColumnUseContext;
+  /** Deterministic scope path, including CTE/subquery/set-operation branch indices. */
+  scopePath: string;
+  /** AST field/index path relative to the scope. Not a persistent ID across edits. */
+  expressionPath: string;
+  /** Dialect-rendered SQL, not necessarily the original source text. */
+  expressionSql: string;
+  /** Only present when a complete original expression range is available. */
+  span?: QuerySourceSpan;
+  references: ColumnUseReferenceFact[];
 }
 
 export interface QueryAnalysisResult {

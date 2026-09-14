@@ -971,6 +971,7 @@ impl DialectImpl for PostgresDialect {
                     position: t.position,
                     sql_standard_syntax: true,
                     position_explicit: t.position_explicit,
+                    inferred_type: t.inferred_type,
                 })))
             }
 
@@ -1255,6 +1256,7 @@ impl PostgresDialect {
                     position: crate::expressions::TrimPosition::Both,
                     sql_standard_syntax: true,
                     position_explicit: false,
+                    inferred_type: f.inferred_type,
                 })))
             }
 

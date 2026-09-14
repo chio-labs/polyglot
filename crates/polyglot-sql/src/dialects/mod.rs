@@ -278,11 +278,12 @@ pub enum DialectType {
 
 impl DialectType {
     /// Whether SELECT projections may use string literals as column aliases.
-    pub(crate) const fn supports_string_aliases(self) -> bool {
+    /// DuckDB permits this only when the alias has an explicit AS keyword.
+    pub(crate) const fn supports_string_aliases(self, explicit_as: bool) -> bool {
         matches!(
             self,
             DialectType::TSQL | DialectType::Fabric | DialectType::MySQL | DialectType::SQLite
-        )
+        ) || (matches!(self, DialectType::DuckDB) && explicit_as)
     }
 }
 

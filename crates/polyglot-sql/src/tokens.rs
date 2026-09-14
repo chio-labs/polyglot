@@ -30,17 +30,25 @@ pub fn parse_dollar_string_token(text: &str) -> (Option<String>, String) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Span {
-    /// Starting byte offset
+    /// Starting Unicode character offset (not a UTF-8 byte or UTF-16 code-unit offset).
     pub start: usize,
-    /// Ending byte offset (exclusive)
+    /// Ending Unicode character offset (exclusive).
     pub end: usize,
-    /// Line number (1-based)
+    /// Cursor line after consuming the token (1-based).
     pub line: usize,
-    /// Column number (1-based)
+    /// Cursor column after consuming the token (1-based, in Unicode characters).
     pub column: usize,
 }
 
 impl Span {
+    /// Cover two source ranges, retaining the ending range's cursor location.
+    pub(crate) fn through(self, end: Self) -> Self {
+        Self {
+            start: self.start,
+            ..end
+        }
+    }
+
     pub fn new(start: usize, end: usize, line: usize, column: usize) -> Self {
         Self {
             start,

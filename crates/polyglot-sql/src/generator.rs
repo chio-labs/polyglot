@@ -6760,6 +6760,7 @@ impl Generator {
                                             expressions: f.args.clone(),
                                             bracket_notation: true,
                                             use_list_keyword: false,
+                                            inferred_type: None,
                                         },
                                     ));
                                 }
@@ -6784,6 +6785,7 @@ impl Generator {
                                             expressions: f.args.clone(),
                                             bracket_notation: true,
                                             use_list_keyword: false,
+                                            inferred_type: None,
                                         },
                                     ));
                                 }
@@ -25939,6 +25941,35 @@ impl Generator {
                     if let Some(n) = length {
                         self.write(&format!("({})", n));
                     }
+                }
+            }
+            DataType::Int128 => match self.config.dialect {
+                // Preserve native Int128 output; explicit nullability is represented
+                // by DataType::Nullable, as with the former Custom("INT128") form.
+                Some(DialectType::ClickHouse) => self.write("Int128"),
+                Some(DialectType::StarRocks) => self.write_keyword("LARGEINT"),
+                // Preserve the full width, including for targets without a native equivalent.
+                _ => self.write_keyword("INT128"),
+            },
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128 => {
+                let (canonical, clickhouse) = match dt {
+                    DataType::UInt8 => ("UTINYINT", "UInt8"),
+                    DataType::UInt16 => ("USMALLINT", "UInt16"),
+                    DataType::UInt32 => ("UINTEGER", "UInt32"),
+                    DataType::UInt64 => ("UBIGINT", "UInt64"),
+                    DataType::UInt128 => ("UINT128", "UInt128"),
+                    _ => unreachable!(),
+                };
+                if self.config.dialect == Some(DialectType::ClickHouse) {
+                    // As with Int128, only an explicit Nullable wrapper adds nullability.
+                    self.write(clickhouse);
+                } else {
+                    // Do not silently discard signedness or narrow unsupported targets.
+                    self.write_keyword(canonical);
                 }
             }
             DataType::BigInt { length } => {

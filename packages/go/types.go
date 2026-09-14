@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.9.2"
+const sdkVersion = "0.10.0"
 
 func Version() string {
 	return sdkVersion
@@ -59,14 +59,27 @@ type ValidationOptions struct {
 	Semantic     bool `json:"semantic,omitempty"`
 }
 
+// SchemaValidationOptions controls the shared Rust schema validator. Unknown
+// identifiers are checked by default. Strict overrides ValidationSchema.Strict;
+// nil inherits the schema setting (which defaults to true).
+type SchemaValidationOptions struct {
+	CheckTypes      bool  `json:"check_types,omitempty"`
+	CheckReferences bool  `json:"check_references,omitempty"`
+	Strict          *bool `json:"strict,omitempty"`
+	Semantic        bool  `json:"semantic,omitempty"`
+	StrictSyntax    bool  `json:"strict_syntax,omitempty"`
+}
+
 type ValidationError struct {
 	Message  string `json:"message"`
 	Line     *int   `json:"line,omitempty"`
 	Column   *int   `json:"column,omitempty"`
 	Severity string `json:"severity"`
 	Code     string `json:"code"`
-	Start    *int   `json:"start,omitempty"`
-	End      *int   `json:"end,omitempty"`
+	// Start and End are Unicode character offsets, suitable for slicing []rune(sql).
+	// End is exclusive; nil means the source range is unavailable.
+	Start *int `json:"start,omitempty"`
+	End   *int `json:"end,omitempty"`
 }
 
 type SchemaColumnReference struct {
@@ -109,6 +122,20 @@ type SchemaTable struct {
 type ValidationSchema struct {
 	Tables []SchemaTable `json:"tables"`
 	Strict *bool         `json:"strict,omitempty"`
+}
+
+// MarshalJSON represents nil table/column slices as empty arrays, matching the
+// shared schema contract. An empty column list denotes an open schema.
+func (schema ValidationSchema) MarshalJSON() ([]byte, error) {
+	type wireSchema ValidationSchema
+	wire := wireSchema(schema)
+	wire.Tables = append([]SchemaTable{}, schema.Tables...)
+	for i := range wire.Tables {
+		if wire.Tables[i].Columns == nil {
+			wire.Tables[i].Columns = []SchemaColumn{}
+		}
+	}
+	return json.Marshal(wire)
 }
 
 type LineageNode struct {
@@ -169,6 +196,47 @@ type QueryAnalysis struct {
 	BaseTables      []RelationFact       `json:"baseTables"`
 	StarProjections []StarProjectionFact `json:"starProjections"`
 	SetOperations   []SetOperationFact   `json:"setOperations"`
+	ColumnUses      []ColumnUseFact      `json:"columnUses"`
+}
+
+// QuerySourceSpan is a half-open range of Unicode characters in the original SQL.
+type QuerySourceSpan struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+// ColumnUseReferenceFact locates the use, not its upstream column definition.
+type ColumnUseReferenceFact struct {
+	ColumnReferenceFact
+	Span *QuerySourceSpan `json:"span,omitempty"`
+}
+
+type ColumnUseContext string
+
+const (
+	ColumnUseJoin               ColumnUseContext = "join"
+	ColumnUseFilter             ColumnUseContext = "filter"
+	ColumnUseGroup              ColumnUseContext = "group"
+	ColumnUseHaving             ColumnUseContext = "having"
+	ColumnUseQualify            ColumnUseContext = "qualify"
+	ColumnUseWindowPartition    ColumnUseContext = "window_partition"
+	ColumnUseWindowOrder        ColumnUseContext = "window_order"
+	ColumnUseWindowFrame        ColumnUseContext = "window_frame"
+	ColumnUseOrder              ColumnUseContext = "order"
+	ColumnUseAggregateOrder     ColumnUseContext = "aggregate_order"
+	ColumnUseSetOperationFilter ColumnUseContext = "set_operation_filter"
+)
+
+// ColumnUseFact groups references by their containing expression. Paths identify
+// locations within an analysis, not persistent IDs across SQL edits. ExpressionSQL
+// is dialect-rendered SQL; Span is absent unless a complete source range is known.
+type ColumnUseFact struct {
+	Context        ColumnUseContext         `json:"context"`
+	ScopePath      string                   `json:"scopePath"`
+	ExpressionPath string                   `json:"expressionPath"`
+	ExpressionSQL  string                   `json:"expressionSql"`
+	Span           *QuerySourceSpan         `json:"span,omitempty"`
+	References     []ColumnUseReferenceFact `json:"references"`
 }
 
 type ProjectionFact struct {

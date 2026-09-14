@@ -148,6 +148,7 @@ These methods are available on `*Client` and as package-level wrappers:
 | `Build(expression Expression) (json.RawMessage, error)` | Evaluate an immutable builder plan and return its JSON AST. |
 | `BuildSQL(expression Expression, dialect string) (string, error)` | Evaluate an immutable builder plan and render SQL for a dialect. |
 | `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic warnings; diagnostics are returned as data. |
+| `ValidateWithSchema(sql string, schema ValidationSchema, dialect string, options ...SchemaValidationOptions) (ValidationResult, error)` | Validate references and optional types using the shared Rust engine. |
 | `Dialects() ([]string, error)` | Return supported dialect names. |
 | `DialectCount() (int, error)` | Return the number of supported dialects. |
 
@@ -374,6 +375,15 @@ and schema-expanded columns, and `ProjectionFact.Nullability` is one of
 Each `SetOperationBranchFact.Role` is `value` for value-producing branches or
 `filter` for the right branch of `EXCEPT` and `INTERSECT`.
 
+`ColumnUses` groups non-projection references by clause, covering joins, filters,
+grouping, HAVING/QUALIFY, window keys/frames, ordering, and set-operation filter
+inputs. `ScopePath` and `ExpressionPath` distinguish nested expressions and
+branches. `ExpressionSQL` is dialect-rendered, not necessarily original text.
+Optional `Span` ranges are half-open Unicode-character offsets; slice `[]rune(sql)`
+to recover source text. Reference spans locate uses, not upstream definitions.
+Repeated occurrences are retained and uncertain references remain `ambiguous`
+or `unknown`. Older runtime payloads decode with an empty/nil `ColumnUses` slice.
+
 ### OpenLineage
 
 | API | Description |
@@ -433,7 +443,9 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
 | `AnalyzeQueryOptions` | `Dialect`, `Schema` |
-| `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations` |
+| `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations`, `ColumnUses` |
+| `ColumnUseFact` | `Context`, `ScopePath`, `ExpressionPath`, `ExpressionSQL`, `Span`, `References` |
+| `ColumnUseReferenceFact` | Embedded `ColumnReferenceFact`, optional original-use `Span` |
 | `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `TransformFunction`, `CastType`, `TypeHint`, `Nullability`, `Upstream` |
 | `TransformFunctionFact` | `Name`, `LiteralArgs`, `ColumnArgs` |
 | `CTEFact` | `Name`, `Columns`, `BodySQL`, `OutputColumns` |
@@ -515,6 +527,45 @@ if err != nil {
 fmt.Println(result.Valid)
 fmt.Println(result.Errors)
 ```
+
+Schema-aware validation is also available on `Client` and through the default
+client package wrapper:
+
+```go
+schema := polyglot.ValidationSchema{Tables: []polyglot.SchemaTable{
+    {Name: "orders", Columns: []polyglot.SchemaColumn{{Name: "order_id", Type: "INT"}}},
+}}
+sql := "SELECT o.order_id FROM orders o WHERE o.missing_column = TRUE"
+result, err := client.ValidateWithSchema(sql, schema, "snowflake", polyglot.SchemaValidationOptions{
+    CheckTypes: true,
+    CheckReferences: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+for _, finding := range result.Errors {
+    fmt.Println(finding.Code, finding.Message)
+    if finding.Start != nil && finding.End != nil {
+        fmt.Println(string([]rune(sql)[*finding.Start:*finding.End]))
+    }
+}
+```
+
+Unknown tables, aliases and columns are checked by default. `CheckReferences`
+additionally checks ambiguity and foreign-key metadata. `CheckTypes` enables
+type checks. `Strict` is an optional `*bool`: nil inherits `schema.Strict`,
+which defaults to true; false reports reference/type findings as warnings.
+`StrictSyntax` and `Semantic` behave as for `Validate`. An empty dialect selects
+`generic`; at most one options value may be supplied.
+
+Empty or nil column slices and wildcard (`*`) columns represent open schemas.
+Other nonempty column lists are treated as complete. Nil table/column slices
+serialize as empty arrays without modifying the caller's schema. Diagnostic
+`Start`/`End` values are Unicode character offsets, not byte offsets; slice
+`[]rune(sql)` rather than the SQL string directly. Unavailable ranges are nil.
+Validation findings are data; invalid arguments and native-library failures
+remain Go errors. This API requires the matching updated FFI library with the
+`polyglot_validate_with_schema` export.
 
 Strict syntax and query-quality warnings use the same Rust validation path as
 the other SDKs:

@@ -685,18 +685,7 @@ fn rewrite_using_columns_in_expression(
 /// unambiguous column in the current scope, rewrite it to a [`DotAccess`] rooted
 /// at the qualified source column. Validation calls this same helper so it uses
 /// exactly the same interpretation as schema-aware analysis and lineage.
-pub(crate) fn normalize_dotted_columns(
-    select: &mut Select,
-    schema: &dyn Schema,
-    infer_schema: bool,
-) -> QualifyColumnsResult<()> {
-    let scope_expression = Expression::Select(Box::new(select.clone()));
-    let scope = build_scope(&scope_expression);
-    let mut resolver = Resolver::new(&scope, schema, infer_schema);
-    normalize_dotted_columns_in_scope(select, &scope, &mut resolver)
-}
-
-fn normalize_dotted_columns_in_scope(
+pub(crate) fn normalize_dotted_columns_in_scope(
     select: &mut Select,
     scope: &Scope,
     resolver: &mut Resolver,
@@ -732,7 +721,7 @@ fn normalize_dotted_columns_in_scope(
     Ok(())
 }
 
-fn normalize_dotted_columns_in_expression(
+pub(crate) fn normalize_dotted_columns_in_expression(
     expression: &mut Expression,
     scope: &Scope,
     resolver: &mut Resolver,

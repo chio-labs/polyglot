@@ -362,8 +362,8 @@ impl FabricDialect {
                 name: "UNIQUEIDENTIFIER".to_string(),
             },
 
-            // TinyInt -> SMALLINT
-            DataType::TinyInt { .. } => DataType::Custom {
+            // Preserve the existing signed/unsigned 8-bit mapping for typed ASTs.
+            DataType::TinyInt { .. } | DataType::UInt8 => DataType::Custom {
                 name: "SMALLINT".to_string(),
             },
 

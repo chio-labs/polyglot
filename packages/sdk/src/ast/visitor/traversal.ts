@@ -169,8 +169,11 @@ export function mapExpressionChildren(
     node: Expression,
     location: ExpressionLocation,
   ) => boolean,
-): Record<string, unknown> {
-  const innerData = getExprData(parent);
+): unknown {
+  const innerData: unknown = getExprData(parent);
+  // Unit variants have null payloads; nested enums can serialize to strings
+  // (e.g. ColumnPosition::First). These leaves have no expression children.
+  if (innerData === null || typeof innerData !== 'object') return innerData;
   const processed: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(innerData)) {

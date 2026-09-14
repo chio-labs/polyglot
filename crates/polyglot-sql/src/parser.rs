@@ -172,6 +172,11 @@ fn convert_name_is_known_custom(name: &str) -> bool {
             | "UINT32"
             | "UINT64"
             | "UINT128"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
             | "UINT256"
             | "FLOAT32"
             | "FLOAT64"
@@ -3751,8 +3756,16 @@ impl Parser {
                         // Allow keywords as aliases (e.g., SELECT 1 AS filter)
                         // Use the projection-specific parser so dialects that support
                         // string aliases can treat the string as a quoted identifier.
-                        let alias = self.parse_projection_alias_identifier()?;
-                        let mut trailing_comments = self.previous_trailing_comments().to_vec();
+                        let duckdb_string_alias = self.config.dialect
+                            == Some(crate::dialects::DialectType::DuckDB)
+                            && self.check(TokenType::String);
+                        let alias = self.parse_projection_alias_identifier(true)?;
+                        let mut trailing_comments = if duckdb_string_alias {
+                            as_comments
+                        } else {
+                            Vec::new()
+                        };
+                        trailing_comments.extend_from_slice(self.previous_trailing_comments());
                         // If parse_comparison stored pending leading comments (no comparison
                         // followed), use those. Otherwise use the leading_comments we captured
                         // before parse_expression(). Both come from the same token, so we
@@ -3762,18 +3775,37 @@ impl Parser {
                         } else {
                             trailing_comments.extend(leading_comments.iter().cloned());
                         }
-                        Expression::Alias(Box::new(Alias {
-                            this: expr,
-                            alias,
-                            column_aliases: Vec::new(),
-                            alias_explicit_as: true,
-                            alias_keyword,
-                            pre_alias_comments,
-                            trailing_comments,
-                            inferred_type: None,
-                        }))
+                        if duckdb_string_alias && alias.name.is_empty() {
+                            // DuckDB treats AS '' as no effective alias. Do not
+                            // generate AS "", which is an invalid identifier.
+                            let attached_comments = expr.get_comments();
+                            let mut comments: Vec<_> = pre_alias_comments
+                                .into_iter()
+                                .filter(|comment| !attached_comments.contains(&comment.as_str()))
+                                .collect();
+                            comments.extend(trailing_comments);
+                            if comments.is_empty() {
+                                expr
+                            } else {
+                                Expression::Annotated(Box::new(Annotated {
+                                    this: expr,
+                                    trailing_comments: comments,
+                                }))
+                            }
+                        } else {
+                            Expression::Alias(Box::new(Alias {
+                                this: expr,
+                                alias,
+                                column_aliases: Vec::new(),
+                                alias_explicit_as: true,
+                                alias_keyword,
+                                pre_alias_comments,
+                                trailing_comments,
+                                inferred_type: None,
+                            }))
+                        }
                     }
-                } else if ((self.check(TokenType::Var) && !self.check_keyword()) || self.check(TokenType::QuotedIdentifier) || (self.check(TokenType::String) && self.supports_string_aliases()) || self.can_be_alias_keyword() || self.is_command_keyword_as_alias() || self.check(TokenType::Overlaps)
+                } else if ((self.check(TokenType::Var) && !self.check_keyword()) || self.check(TokenType::QuotedIdentifier) || (self.check(TokenType::String) && self.supports_string_aliases(false)) || self.can_be_alias_keyword() || self.is_command_keyword_as_alias() || self.check(TokenType::Overlaps)
                     // ClickHouse: APPLY without ( is an implicit alias (e.g., SELECT col apply)
                     || (self.check(TokenType::Apply) && !self.check_next(TokenType::LParen)
                         && matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse))))
@@ -3810,7 +3842,7 @@ impl Parser {
                     // Implicit alias (without AS) - allow Var tokens, quoted identifiers,
                     // dialect-gated string aliases, command keywords, and OVERLAPS.
                     // But NOT when it's the Oracle BULK COLLECT INTO sequence
-                    let alias = self.parse_projection_alias_identifier()?;
+                    let alias = self.parse_projection_alias_identifier(false)?;
                     let trailing_comments = self.previous_trailing_comments().to_vec();
                     Expression::Alias(Box::new(Alias {
                         this: expr,
@@ -4247,7 +4279,7 @@ impl Parser {
         {
             // ClickHouse: `values` as a table name (not followed by LParen)
             let token = self.advance();
-            let ident = Identifier::new(token.text);
+            let ident = Identifier::new(token.text).with_span(token.span);
             let trailing_comments = self.previous_trailing_comments().to_vec();
             Expression::boxed_table(TableRef {
                 name: ident,
@@ -4393,13 +4425,8 @@ impl Parser {
                                 || self.check(TokenType::Identifier)
                                 || self.check(TokenType::Var)
                             {
-                                let alias_name = self.advance_text();
-                                with_offset_alias = Some(crate::expressions::Identifier {
-                                    name: alias_name,
-                                    quoted: false,
-                                    trailing_comments: Vec::new(),
-                                    span: None,
-                                });
+                                let alias_name = Self::identifier_from_token(self.advance(), false);
+                                with_offset_alias = Some(alias_name);
                             }
                         }
                         Some(Box::new(Expression::Boolean(BooleanLiteral {
@@ -5294,13 +5321,8 @@ impl Parser {
                             if has_as
                                 || (self.check(TokenType::Identifier) || self.check(TokenType::Var))
                             {
-                                let alias_name = self.advance_text();
-                                Some(crate::expressions::Identifier {
-                                    name: alias_name,
-                                    quoted: false,
-                                    trailing_comments: Vec::new(),
-                                    span: None,
-                                })
+                                let alias_name = Self::identifier_from_token(self.advance(), false);
+                                Some(alias_name)
                             } else {
                                 None
                             }
@@ -5527,7 +5549,7 @@ impl Parser {
                 name: string_token.text.to_string(),
                 quoted: true,
                 trailing_comments: Vec::new(),
-                span: None,
+                span: Some(string_token.span),
             };
             let trailing_comments = self.previous_trailing_comments().to_vec();
             Expression::boxed_table(TableRef {
@@ -6008,7 +6030,8 @@ impl Parser {
                     if self.check(TokenType::RParen) {
                         break;
                     }
-                    column_aliases.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                    column_aliases
+                        .push(self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?);
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -6026,14 +6049,17 @@ impl Parser {
                 }));
             } else {
                 let alias_ident_parsed = self.expect_identifier_or_alias_keyword_with_quoted()?;
+                let alias_span = alias_ident_parsed.span;
                 let alias = alias_ident_parsed.name;
                 let alias_is_quoted = alias_ident_parsed.quoted;
                 let make_alias_ident = |name: String| -> Identifier {
-                    if alias_is_quoted {
+                    let mut identifier = if alias_is_quoted {
                         Identifier::quoted(name)
                     } else {
                         Identifier::new(name)
-                    }
+                    };
+                    identifier.span = alias_span;
+                    identifier
                 };
                 // Check for column aliases: AS t(c1, c2) or AS t(c1 type1, c2 type2) for table functions
                 if self.match_token(TokenType::LParen) {
@@ -6082,7 +6108,9 @@ impl Parser {
                             if self.check(TokenType::RParen) {
                                 break;
                             }
-                            aliases.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                            aliases.push(
+                                self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?,
+                            );
                             if !self.match_token(TokenType::Comma) {
                                 break;
                             }
@@ -6197,54 +6225,18 @@ impl Parser {
                     };
                 }
             } // close the else for AS (col1, col2) handling
-        } else if (self.check(TokenType::QuotedIdentifier)
-            || (self.check(TokenType::Var) && !self.check_keyword() && !self.check_identifier("MATCH_CONDITION")
-                && !(self.check_identifier("ARRAY") && self.check_next(TokenType::Join)
-                     && matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse)))
-                // TSQL: OPTION(LABEL = 'foo') is a query hint, not an alias
-                && !(self.check_identifier("OPTION") && self.check_next(TokenType::LParen))
-                // MySQL: LOCK IN SHARE MODE is a locking clause, not an alias
-                && !(self.check_identifier("LOCK") && self.check_next(TokenType::In))
-                // ClickHouse: PARALLEL WITH is a statement separator, not a table alias
-                && !(self.check_identifier("PARALLEL") && self.check_next(TokenType::With)
-                     && matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse)))
-                // DuckDB: POSITIONAL JOIN is a join method, not a table alias
-                && !(self.check_identifier("POSITIONAL") && self.check_next(TokenType::Join))))
-            || self.is_command_keyword_as_alias()
-            // ClickHouse: allow FIRST/LAST as implicit table aliases
-            // (they're keywords used in NULLS FIRST/LAST but also valid as identifiers)
-            || (matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse))
-                && (self.check(TokenType::First) || self.check(TokenType::Last)))
-            // PIVOT/UNPIVOT can be table aliases when not followed by clause-starting tokens
-            || (self.check(TokenType::Pivot) && !self.check_next(TokenType::LParen))
-            || (self.check(TokenType::Unpivot) && !self.is_unpivot_clause_start())
-            // PARTITION can be a table alias when the dialect doesn't support partition selection
-            || (self.check(TokenType::Partition) && !matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::MySQL)
-                | Some(crate::dialects::DialectType::SingleStore)
-                | Some(crate::dialects::DialectType::Doris)
-                | Some(crate::dialects::DialectType::StarRocks)
-            ))
-            || (self.check(TokenType::Window) && {
-                // WINDOW can be a table alias if NOT followed by an identifier (window definition)
-                let next_pos = self.current + 1;
-                next_pos >= self.tokens.len()
-                    || (self.tokens[next_pos].token_type != TokenType::Var
-                        && self.tokens[next_pos].token_type != TokenType::Identifier)
-            })
-        {
-            // Implicit alias (but not MATCH_CONDITION which is a join condition keyword)
-            // Also allow command keywords (GET, PUT, etc.) and WINDOW (when not a clause) as implicit table aliases
+        } else if self.can_parse_implicit_table_alias() {
             let is_keyword_alias = self.peek().token_type.is_keyword();
             let is_quoted_alias = self.peek().token_type == TokenType::QuotedIdentifier;
+            let alias_span = self.peek().span;
             let alias = self.advance_text();
             // Check for column aliases: t(c1, c2)
             // Use expect_identifier_or_keyword to allow keywords like KEY, INDEX, VALUE as column aliases
             let mut column_aliases = if self.match_token(TokenType::LParen) {
                 let mut aliases = Vec::new();
                 loop {
-                    aliases.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                    aliases
+                        .push(self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?);
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -6265,9 +6257,9 @@ impl Parser {
             }
             let make_alias_ident = |name: String| -> Identifier {
                 if is_quoted_alias {
-                    Identifier::quoted(name)
+                    Identifier::quoted(name).with_span(alias_span)
                 } else {
-                    Identifier::new(name)
+                    Identifier::new(name).with_span(alias_span)
                 }
             };
             expr = match expr {
@@ -6335,13 +6327,8 @@ impl Parser {
             let offset_alias = {
                 let has_as = self.match_token(TokenType::As);
                 if has_as || self.check(TokenType::Identifier) || self.check(TokenType::Var) {
-                    let alias_name = self.advance_text();
-                    Some(crate::expressions::Identifier {
-                        name: alias_name,
-                        quoted: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    })
+                    let alias_name = Self::identifier_from_token(self.advance(), false);
+                    Some(alias_name)
                 } else {
                     None
                 }
@@ -6433,7 +6420,7 @@ impl Parser {
                 self.skip(); // consume LParen
                 let mut aliases = Vec::new();
                 loop {
-                    aliases.push(Identifier::new(self.advance_text()));
+                    aliases.push(Self::identifier_from_token(self.advance(), false));
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -6549,9 +6536,9 @@ impl Parser {
             {
                 let tok = self.advance();
                 let alias = if tok.token_type == TokenType::QuotedIdentifier {
-                    Identifier::quoted(tok.text.to_string())
+                    Identifier::quoted(tok.text.to_string()).with_span(tok.span)
                 } else {
-                    Identifier::new(tok.text.to_string())
+                    Identifier::new(tok.text.clone()).with_span(tok.span)
                 };
                 let alias_columns = self.parse_alias_column_list_if_present()?;
                 match &mut expr {
@@ -6590,7 +6577,7 @@ impl Parser {
                     let col_name = parts.join(".");
                     let alias_expr = if let Some(alias) = t.alias {
                         Expression::Alias(Box::new(Alias {
-                            this: Expression::boxed_column(Column {
+                            this: Self::parsed_column(Column {
                                 name: Identifier::new(&col_name),
                                 table: None,
                                 join_mark: false,
@@ -6607,7 +6594,7 @@ impl Parser {
                             inferred_type: None,
                         }))
                     } else {
-                        Expression::boxed_column(Column {
+                        Self::parsed_column(Column {
                             name: Identifier::new(&col_name),
                             table: None,
                             join_mark: false,
@@ -6733,7 +6720,9 @@ impl Parser {
                     let name_upper = table.name.name.to_ascii_uppercase();
                     if name_upper.contains("INFORMATION_SCHEMA.") {
                         // Set alias to be the full quoted table name
-                        table.alias = Some(table.name.clone());
+                        let mut alias = table.name.clone();
+                        alias.span = None; // Synthesized alias, not an occurrence in the source.
+                        table.alias = Some(alias);
                         table.alias_explicit_as = true;
                     }
                 }
@@ -6758,7 +6747,10 @@ impl Parser {
                             name: merged_name,
                             quoted: true,
                             trailing_comments: Vec::new(),
-                            span: None,
+                            span: schema
+                                .span
+                                .zip(table.name.span)
+                                .map(|(start, end)| start.through(end)),
                         };
 
                         // Shift: schema becomes catalog, catalog becomes None or stays
@@ -6972,13 +6964,14 @@ impl Parser {
                 let col = self.expect_identifier_or_keyword()?;
                 let mut extra_cols = Vec::new();
                 while self.match_token(TokenType::Comma) {
-                    extra_cols.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                    extra_cols
+                        .push(self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?);
                 }
                 self.expect(TokenType::RParen)?;
                 (Identifier::new(col), true, extra_cols)
             } else {
                 (
-                    Identifier::new(self.expect_identifier_or_keyword()?),
+                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?,
                     false,
                     Vec::new(),
                 )
@@ -6986,7 +6979,7 @@ impl Parser {
 
         // FOR name_column
         self.expect(TokenType::For)?;
-        let name_column = Identifier::new(self.expect_identifier_or_keyword()?);
+        let name_column = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
 
         // IN (columns with optional aliases)
         // Format: col1 [AS alias1], col2 [AS alias2], ...
@@ -7133,6 +7126,7 @@ impl Parser {
     /// Returns the identifier, possibly with merged hyphenated parts and quoted flag set.
     fn parse_bigquery_table_part(&mut self) -> Result<Identifier> {
         use crate::dialects::DialectType;
+        let start = self.peek().span;
 
         // Try to parse a number for BigQuery numeric table parts (e.g., foo.bar.25)
         if matches!(self.config.dialect, Some(DialectType::BigQuery))
@@ -7152,7 +7146,7 @@ impl Parser {
                 name,
                 quoted: true,
                 trailing_comments: Vec::new(),
-                span: None,
+                span: Some(start.through(self.previous().span)),
             });
         }
 
@@ -7175,7 +7169,7 @@ impl Parser {
                 name,
                 quoted: true,
                 trailing_comments: Vec::new(),
-                span: None,
+                span: Some(start.through(self.previous().span)),
             });
         }
 
@@ -7210,7 +7204,7 @@ impl Parser {
                     name,
                     quoted: false,
                     trailing_comments: Vec::new(),
-                    span: None,
+                    span: Some(start.through(self.previous().span)),
                 };
             }
         }
@@ -9454,7 +9448,7 @@ impl Parser {
 
             // Handle AS alias for measures
             if self.match_token(TokenType::As) {
-                let alias = Identifier::new(self.expect_identifier()?);
+                let alias = self.parse_unquoted_identifier(Self::expect_identifier)?;
                 expr = Expression::Alias(Box::new(Alias::new(expr, alias)));
             }
 
@@ -9650,7 +9644,7 @@ impl Parser {
         let mut definitions = Vec::new();
 
         loop {
-            let name = Identifier::new(self.expect_identifier()?);
+            let name = self.parse_unquoted_identifier(Self::expect_identifier)?;
             self.expect(TokenType::As)?;
             let expr = self.parse_expression()?;
 
@@ -9679,7 +9673,7 @@ impl Parser {
 
             // Parse table alias (comes before AS)
             let table_alias = if self.check(TokenType::Var) && !self.check_keyword() {
-                Some(Identifier::new(self.expect_identifier()?))
+                Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
             } else {
                 None
             };
@@ -9691,7 +9685,9 @@ impl Parser {
                 // Check for parenthesized alias list: AS ("a", "b")
                 if self.match_token(TokenType::LParen) {
                     loop {
-                        aliases.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                        aliases.push(
+                            self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?,
+                        );
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -9701,7 +9697,9 @@ impl Parser {
                     // Non-parenthesized aliases: AS a, b, c
                     // Use expect_identifier_or_keyword because aliases like "key", "value", "pos" may be keywords
                     loop {
-                        aliases.push(Identifier::new(self.expect_identifier_or_keyword()?));
+                        aliases.push(
+                            self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?,
+                        );
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -9743,7 +9741,7 @@ impl Parser {
         let mut windows = Vec::new();
 
         loop {
-            let name = self.expect_identifier()?;
+            let name = self.parse_unquoted_identifier(Self::expect_identifier)?;
             self.expect(TokenType::As)?;
             self.expect(TokenType::LParen)?;
 
@@ -9765,7 +9763,7 @@ impl Parser {
                             | TokenType::Comma
                     )
                 }) {
-                Some(self.expect_identifier()?)
+                Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
             } else {
                 None
             };
@@ -9788,9 +9786,9 @@ impl Parser {
             self.expect(TokenType::RParen)?;
 
             windows.push(NamedWindow {
-                name: Identifier::new(name),
+                name,
                 spec: Over {
-                    window_name: window_name.map(|n| Identifier::new(n)),
+                    window_name,
                     partition_by: partition_by.unwrap_or_default(),
                     order_by: order_by.map(|o| o.expressions).unwrap_or_default(),
                     frame,
@@ -10593,7 +10591,7 @@ impl Parser {
                 .parse_identifier_list()?
                 .into_iter()
                 .map(|id| {
-                    Expression::boxed_column(Column {
+                    Self::parsed_column(Column {
                         name: id,
                         table: None,
                         join_mark: false,
@@ -10686,7 +10684,7 @@ impl Parser {
                 self.expect(TokenType::RParen)?;
                 // Handle optional alias after subquery: (SELECT 1) AS a
                 let alias = if self.match_token(TokenType::As) {
-                    Some(Identifier::new(self.expect_identifier()?))
+                    Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
                 } else {
                     None
                 };
@@ -10716,7 +10714,7 @@ impl Parser {
                 self.expect(TokenType::RParen)?;
                 // Handle optional alias after subquery
                 let alias = if self.match_token(TokenType::As) {
-                    Some(Identifier::new(self.expect_identifier()?))
+                    Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
                 } else {
                     None
                 };
@@ -11017,7 +11015,10 @@ impl Parser {
 
         // Optional alias (PostgreSQL: INSERT INTO table AS t(...), Oracle: INSERT INTO table t ...)
         let (alias, alias_explicit_as) = if self.match_token(TokenType::As) {
-            (Some(Identifier::new(self.expect_identifier()?)), true)
+            (
+                Some(self.parse_unquoted_identifier(Self::expect_identifier)?),
+                true,
+            )
         } else if self.is_identifier_token()
             && !self.check(TokenType::Values)
             && !self.check(TokenType::Select)
@@ -11031,7 +11032,10 @@ impl Parser {
             && !self.check(TokenType::LParen)
         {
             // Implicit alias without AS (e.g., INSERT INTO dest d VALUES ...)
-            (Some(Identifier::new(self.expect_identifier()?)), false)
+            (
+                Some(self.parse_unquoted_identifier(Self::expect_identifier)?),
+                false,
+            )
         } else {
             (None, false)
         };
@@ -11061,7 +11065,7 @@ impl Parser {
             self.expect(TokenType::LParen)?;
             let mut parts = Vec::new();
             loop {
-                let col = Identifier::new(self.expect_identifier()?);
+                let col = self.parse_unquoted_identifier(Self::expect_identifier)?;
                 let value = if self.match_token(TokenType::Eq) {
                     Some(self.parse_expression()?)
                 } else {
@@ -11409,7 +11413,7 @@ impl Parser {
                     // Handle qualified column: table.column
                     let column = if self.match_token(TokenType::Dot) {
                         let col = self.expect_identifier_with_quoted()?;
-                        Expression::boxed_column(Column {
+                        Self::parsed_column(Column {
                             name: col,
                             table: Some(col_name),
                             join_mark: false,
@@ -11553,7 +11557,7 @@ impl Parser {
                 // Handle qualified column: table.column
                 let column = if self.match_token(TokenType::Dot) {
                     let col = self.expect_identifier_with_quoted()?;
-                    Expression::boxed_column(Column {
+                    Self::parsed_column(Column {
                         name: col,
                         table: Some(col_name),
                         join_mark: false,
@@ -12001,7 +12005,10 @@ impl Parser {
                     name: format!("{}.{}", col_ident.name, part.name),
                     quoted: col_ident.quoted || part.quoted,
                     trailing_comments: Vec::new(),
-                    span: None,
+                    span: col_ident
+                        .span
+                        .zip(part.span)
+                        .map(|(start, end)| start.through(end)),
                 };
             }
             self.expect(TokenType::Eq)?;
@@ -13215,7 +13222,7 @@ impl Parser {
                     self.expect(TokenType::RParen)?;
                     redshift_ctas_properties.push(Expression::DistKeyProperty(Box::new(
                         DistKeyProperty {
-                            this: Box::new(Expression::boxed_column(Column {
+                            this: Box::new(Self::parsed_column(Column {
                                 name: Identifier::new(col),
                                 table: None,
                                 join_mark: false,
@@ -13233,7 +13240,7 @@ impl Parser {
                     let mut cols = Vec::new();
                     loop {
                         let col = self.expect_identifier()?;
-                        cols.push(Expression::boxed_column(Column {
+                        cols.push(Self::parsed_column(Column {
                             name: Identifier::new(col),
                             table: None,
                             join_mark: false,
@@ -13268,7 +13275,7 @@ impl Parser {
                     let mut cols = Vec::new();
                     loop {
                         let col = self.expect_identifier()?;
-                        cols.push(Expression::boxed_column(Column {
+                        cols.push(Self::parsed_column(Column {
                             name: Identifier::new(col),
                             table: None,
                             join_mark: false,
@@ -14426,7 +14433,7 @@ impl Parser {
                         self.expect(TokenType::RParen)?;
                         cols.into_iter()
                             .map(|id| {
-                                Expression::boxed_column(Column {
+                                Self::parsed_column(Column {
                                     name: id,
                                     table: None,
                                     join_mark: false,
@@ -14469,7 +14476,7 @@ impl Parser {
                         self.expect(TokenType::RParen)?;
                         cols.into_iter()
                             .map(|id| {
-                                Expression::boxed_column(Column {
+                                Self::parsed_column(Column {
                                     name: id,
                                     table: None,
                                     join_mark: false,
@@ -14506,7 +14513,7 @@ impl Parser {
                         self.expect(TokenType::RParen)?;
                         cols.into_iter()
                             .map(|id| {
-                                Expression::boxed_column(Column {
+                                Self::parsed_column(Column {
                                     name: id,
                                     table: None,
                                     join_mark: false,
@@ -15970,7 +15977,10 @@ impl Parser {
                     name: format!("{}.{}", name.name, sub.name),
                     quoted: name.quoted,
                     trailing_comments: sub.trailing_comments,
-                    span: None,
+                    span: name
+                        .span
+                        .zip(sub.span)
+                        .map(|(start, end)| start.through(end)),
                 };
             }
         }
@@ -17307,7 +17317,10 @@ impl Parser {
                             Expression::Literal(Box::new(Literal::String(self.advance_text())))
                         } else if self.is_identifier_token() || self.is_safe_keyword_as_identifier()
                         {
-                            Expression::Identifier(Identifier::new(self.advance_text()))
+                            Expression::Identifier(Self::identifier_from_token(
+                                self.advance(),
+                                false,
+                            ))
                         } else {
                             break;
                         };
@@ -17332,7 +17345,7 @@ impl Parser {
                 let format = if self.check(TokenType::String) {
                     Expression::Literal(Box::new(Literal::String(self.advance_text())))
                 } else if self.is_identifier_token() || self.is_safe_keyword_as_identifier() {
-                    Expression::Identifier(Identifier::new(self.advance_text()))
+                    Expression::Identifier(Self::identifier_from_token(self.advance(), false))
                 } else {
                     break;
                 };
@@ -18266,7 +18279,7 @@ impl Parser {
             && !self.check(TokenType::Using)
             && self.is_identifier_token()
         {
-            Some(Identifier::new(self.advance_text()))
+            Some(Self::identifier_from_token(self.advance(), false))
         } else {
             None
         };
@@ -20963,8 +20976,8 @@ impl Parser {
             }
 
             self.match_token(TokenType::Column); // optional COLUMN keyword
-            let old_name = Identifier::new(self.expect_identifier()?);
-            let new_name = Identifier::new(self.expect_identifier()?);
+            let old_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+            let new_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
             // Try to parse data type - it's optional in SingleStore
             let data_type = if !self.is_at_end()
                 && !self.check(TokenType::Comment)
@@ -21565,7 +21578,7 @@ impl Parser {
                 if self.match_identifier("FILTER_COLUMN") {
                     self.expect(TokenType::Eq)?;
                     let col = self.expect_identifier_or_keyword()?;
-                    filter_column = Some(Box::new(Expression::boxed_column(Column {
+                    filter_column = Some(Box::new(Self::parsed_column(Column {
                         name: Identifier::new(col),
                         table: None,
                         join_mark: false,
@@ -22052,39 +22065,40 @@ impl Parser {
         }
 
         self.expect(TokenType::Table)?;
-        let table = Identifier::new(self.expect_identifier()?);
+        let table = self.parse_unquoted_identifier(Self::expect_identifier)?;
 
         // Check for OPTIONS clause
-        let options =
-            if self.check(TokenType::Var) && self.peek_text().eq_ignore_ascii_case("OPTIONS") {
-                self.skip();
-                self.expect(TokenType::LParen)?;
-                let mut opts = Vec::new();
-                loop {
-                    // Parse key = value pairs (key can be string literal or identifier)
-                    let key = if self.check(TokenType::NationalString) {
-                        let token = self.advance();
-                        Expression::Literal(Box::new(Literal::NationalString(token.text)))
-                    } else if self.check(TokenType::String) {
-                        let token = self.advance();
-                        Expression::Literal(Box::new(Literal::String(token.text)))
-                    } else {
-                        Expression::Identifier(Identifier::new(self.expect_identifier()?))
-                    };
-                    // Eq is optional - Spark allows space-separated key value pairs
-                    // e.g., OPTIONS ('storageLevel' 'DISK_ONLY') or OPTIONS ('key' = 'value')
-                    let _ = self.match_token(TokenType::Eq);
-                    let value = self.parse_expression()?;
-                    opts.push((key, value));
-                    if !self.match_token(TokenType::Comma) {
-                        break;
-                    }
+        let options = if self.check(TokenType::Var)
+            && self.peek_text().eq_ignore_ascii_case("OPTIONS")
+        {
+            self.skip();
+            self.expect(TokenType::LParen)?;
+            let mut opts = Vec::new();
+            loop {
+                // Parse key = value pairs (key can be string literal or identifier)
+                let key = if self.check(TokenType::NationalString) {
+                    let token = self.advance();
+                    Expression::Literal(Box::new(Literal::NationalString(token.text)))
+                } else if self.check(TokenType::String) {
+                    let token = self.advance();
+                    Expression::Literal(Box::new(Literal::String(token.text)))
+                } else {
+                    Expression::Identifier(self.parse_unquoted_identifier(Self::expect_identifier)?)
+                };
+                // Eq is optional - Spark allows space-separated key value pairs
+                // e.g., OPTIONS ('storageLevel' 'DISK_ONLY') or OPTIONS ('key' = 'value')
+                let _ = self.match_token(TokenType::Eq);
+                let value = self.parse_expression()?;
+                opts.push((key, value));
+                if !self.match_token(TokenType::Comma) {
+                    break;
                 }
-                self.expect(TokenType::RParen)?;
-                opts
-            } else {
-                Vec::new()
-            };
+            }
+            self.expect(TokenType::RParen)?;
+            opts
+        } else {
+            Vec::new()
+        };
 
         // Check for AS clause or implicit query (SELECT without AS in Spark)
         let query = if self.match_token(TokenType::As) {
@@ -22111,7 +22125,7 @@ impl Parser {
         self.expect(TokenType::Table)?;
 
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
-        let table = Identifier::new(self.expect_identifier()?);
+        let table = self.parse_unquoted_identifier(Self::expect_identifier)?;
 
         Ok(Expression::Uncache(Box::new(Uncache { table, if_exists })))
     }
@@ -22156,7 +22170,7 @@ impl Parser {
             self.expect(TokenType::LParen)?;
             let mut partitions = Vec::new();
             loop {
-                let col = Identifier::new(self.expect_identifier_or_keyword()?);
+                let col = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
                 self.expect(TokenType::Eq)?;
                 let val = self.parse_expression()?;
                 partitions.push((col, val));
@@ -23722,7 +23736,7 @@ impl Parser {
                         expressions: columns
                             .into_iter()
                             .map(|c| {
-                                Expression::boxed_column(Column {
+                                Self::parsed_column(Column {
                                     name: Identifier::new(c),
                                     table: None,
                                     join_mark: false,
@@ -23970,7 +23984,7 @@ impl Parser {
                             let nested_value = self.parse_copy_param_value()?;
                             // Create an Eq expression for the nested key=value
                             values.push(Expression::Eq(Box::new(BinaryOp {
-                                left: Expression::boxed_column(Column {
+                                left: Self::parsed_column(Column {
                                     name: Identifier::new(nested_key),
                                     table: None,
                                     join_mark: false,
@@ -23986,7 +24000,7 @@ impl Parser {
                             })));
                         } else {
                             // Just a keyword/value without =
-                            values.push(Expression::boxed_column(Column {
+                            values.push(Self::parsed_column(Column {
                                 name: Identifier::new(nested_key),
                                 table: None,
                                 join_mark: false,
@@ -24047,7 +24061,7 @@ impl Parser {
                             if self.match_token(TokenType::Eq) {
                                 let val = self.parse_copy_param_value()?;
                                 values.push(Expression::Eq(Box::new(BinaryOp {
-                                    left: Expression::boxed_column(Column {
+                                    left: Self::parsed_column(Column {
                                         name: Identifier::new(key),
                                         table: None,
                                         join_mark: false,
@@ -24063,7 +24077,7 @@ impl Parser {
                                 })));
                             } else {
                                 // Just an identifier without =
-                                values.push(Expression::boxed_column(Column {
+                                values.push(Self::parsed_column(Column {
                                     name: Identifier::new(key),
                                     table: None,
                                     join_mark: false,
@@ -24165,8 +24179,8 @@ impl Parser {
         // Handle quoted identifier (e.g., STORAGE_INTEGRATION = "storage")
         if self.check(TokenType::QuotedIdentifier) {
             let token = self.advance();
-            return Ok(Expression::boxed_column(Column {
-                name: Identifier::quoted(token.text.to_string()),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::quoted(token.text.to_string()).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -24194,7 +24208,7 @@ impl Parser {
                 let second = self.expect_identifier_or_keyword()?;
                 if self.match_token(TokenType::Dot) {
                     let third = self.expect_identifier_or_keyword()?;
-                    return Ok(Expression::boxed_column(Column {
+                    return Ok(Self::parsed_column(Column {
                         name: Identifier::new(format!("{}.{}.{}", first, second, third)),
                         table: None,
                         join_mark: false,
@@ -24203,7 +24217,7 @@ impl Parser {
                         inferred_type: None,
                     }));
                 }
-                return Ok(Expression::boxed_column(Column {
+                return Ok(Self::parsed_column(Column {
                     name: Identifier::new(format!("{}.{}", first, second)),
                     table: None,
                     join_mark: false,
@@ -24212,7 +24226,7 @@ impl Parser {
                     inferred_type: None,
                 }));
             }
-            return Ok(Expression::boxed_column(Column {
+            return Ok(Self::parsed_column(Column {
                 name: Identifier::new(first),
                 table: None,
                 join_mark: false,
@@ -24633,7 +24647,7 @@ impl Parser {
         // Identifier (could be a stage name without @)
         if self.check(TokenType::Var) || self.check_keyword() {
             let ident = self.advance_text();
-            return Ok(Expression::boxed_column(Column {
+            return Ok(Self::parsed_column(Column {
                 name: Identifier::new(ident),
                 table: None,
                 join_mark: false,
@@ -25244,7 +25258,7 @@ impl Parser {
                 let output = self.match_token(TokenType::Output);
                 parameters.push(ExecuteParameter {
                     name: param_name.clone(),
-                    value: Expression::boxed_column(Column {
+                    value: Self::parsed_column(Column {
                         name: Identifier::new(&param_name),
                         table: None,
                         join_mark: false,
@@ -26164,7 +26178,7 @@ impl Parser {
 
             // Parse value - handle ON/OFF keywords as identifiers (MySQL: SET autocommit = ON)
             let value = if self.check(TokenType::On) || self.check_keyword_text("OFF") {
-                Expression::Identifier(Identifier::new(self.advance_text()))
+                Expression::Identifier(Self::identifier_from_token(self.advance(), false))
             } else if self.match_token(TokenType::Default) {
                 Expression::Identifier(Identifier::new("DEFAULT".to_string()))
             } else {
@@ -26288,20 +26302,20 @@ impl Parser {
 
     /// Parse a qualified name (schema.table.column or just table)
     fn parse_qualified_name(&mut self) -> Result<Expression> {
-        let first = self.expect_identifier_or_keyword()?;
+        let first = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
         let mut parts = vec![first];
 
         while self.match_token(TokenType::Dot) {
-            let next = self.expect_identifier_or_keyword()?;
+            let next = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
             parts.push(next);
         }
 
         if parts.len() == 1 {
-            Ok(Expression::Identifier(Identifier::new(parts.remove(0))))
+            Ok(Expression::Identifier(parts.remove(0)))
         } else if parts.len() == 2 {
-            Ok(Expression::boxed_column(Column {
-                table: Some(Identifier::new(parts[0].clone())),
-                name: Identifier::new(parts[1].clone()),
+            Ok(Self::parsed_column(Column {
+                table: Some(parts[0].clone()),
+                name: parts[1].clone(),
                 join_mark: false,
                 trailing_comments: Vec::new(),
                 span: None,
@@ -26310,10 +26324,21 @@ impl Parser {
         } else {
             // For 3+ parts, create a Column with concatenated table parts
             let column_name = parts.pop().unwrap();
-            let table_name = parts.join(".");
-            Ok(Expression::boxed_column(Column {
-                table: Some(Identifier::new(table_name)),
-                name: Identifier::new(column_name),
+            let table_span = parts
+                .first()
+                .and_then(|id| id.span)
+                .zip(parts.last().and_then(|id| id.span))
+                .map(|(start, end)| start.through(end));
+            let table_name = parts
+                .iter()
+                .map(|id| id.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let mut table = Identifier::new(table_name);
+            table.span = table_span;
+            Ok(Self::parsed_column(Column {
+                table: Some(table),
+                name: column_name,
                 join_mark: false,
                 trailing_comments: Vec::new(),
                 span: None,
@@ -26390,7 +26415,7 @@ impl Parser {
         };
 
         let authorization = if self.match_token(TokenType::Authorization) {
-            Some(Identifier::new(self.expect_identifier()?))
+            Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
         } else {
             None
         };
@@ -26406,7 +26431,9 @@ impl Parser {
                 let prop_name = if self.check(TokenType::String) {
                     Expression::Literal(Box::new(Literal::String(self.expect_string()?)))
                 } else {
-                    Expression::Identifier(Identifier::new(self.expect_identifier_or_keyword()?))
+                    Expression::Identifier(
+                        self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?,
+                    )
                 };
                 self.expect(TokenType::Eq)?;
                 // Parse property value
@@ -26471,7 +26498,7 @@ impl Parser {
 
         let if_not_exists =
             self.match_keywords(&[TokenType::If, TokenType::Not, TokenType::Exists]);
-        let name = Identifier::new(self.expect_identifier()?);
+        let name = self.parse_unquoted_identifier(Self::expect_identifier)?;
 
         // Check for Snowflake CLONE clause
         let clone_from = if self.match_identifier("CLONE") {
@@ -27227,12 +27254,7 @@ impl Parser {
                         let first_ident =
                             if self.check(TokenType::Input) || self.check(TokenType::Output) {
                                 let token = self.advance();
-                                Identifier {
-                                    name: token.text,
-                                    quoted: false,
-                                    trailing_comments: Vec::new(),
-                                    span: None,
-                                }
+                                Self::identifier_from_token(token, false)
                             } else {
                                 self.expect_identifier_with_quoted()?
                             };
@@ -27246,12 +27268,7 @@ impl Parser {
                     let first_ident =
                         if self.check(TokenType::Input) || self.check(TokenType::Output) {
                             let token = self.advance();
-                            Identifier {
-                                name: token.text,
-                                quoted: false,
-                                trailing_comments: Vec::new(),
-                                span: None,
-                            }
+                            Self::identifier_from_token(token, false)
                         } else {
                             self.expect_identifier_with_quoted()?
                         };
@@ -27271,12 +27288,7 @@ impl Parser {
                 // Handle keywords like INPUT that may be used as parameter names
                 let first_ident = if self.check(TokenType::Input) || self.check(TokenType::Output) {
                     let token = self.advance();
-                    Identifier {
-                        name: token.text,
-                        quoted: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    }
+                    Self::identifier_from_token(token, false)
                 } else {
                     self.expect_identifier_with_quoted()?
                 };
@@ -27964,7 +27976,7 @@ impl Parser {
                 if self.match_token(TokenType::Of) {
                     let mut cols = Vec::new();
                     loop {
-                        cols.push(Identifier::new(self.expect_identifier()?));
+                        cols.push(self.parse_unquoted_identifier(Self::expect_identifier)?);
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -28002,7 +28014,7 @@ impl Parser {
                 let is_table = self.match_token(TokenType::Table);
                 let _is_row = !is_table && self.match_token(TokenType::Row);
                 self.match_token(TokenType::As);
-                let alias = Identifier::new(self.expect_identifier()?);
+                let alias = self.parse_unquoted_identifier(Self::expect_identifier)?;
 
                 if is_old {
                     if is_table {
@@ -28150,7 +28162,7 @@ impl Parser {
         self.expect(TokenType::Trigger)?;
 
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
-        let name = Identifier::new(self.expect_identifier()?);
+        let name = self.parse_unquoted_identifier(Self::expect_identifier)?;
 
         let table = if self.match_token(TokenType::On) {
             Some(self.parse_table_ref()?)
@@ -28210,10 +28222,10 @@ impl Parser {
             // Composite type
             let mut attrs = Vec::new();
             loop {
-                let attr_name = Identifier::new(self.expect_identifier()?);
+                let attr_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
                 let data_type = self.parse_data_type()?;
                 let collate = if self.match_identifier("COLLATE") {
-                    Some(Identifier::new(self.expect_identifier()?))
+                    Some(self.parse_unquoted_identifier(Self::expect_identifier)?)
                 } else {
                     None
                 };
@@ -28294,7 +28306,7 @@ impl Parser {
             if self.match_token(TokenType::Default) {
                 default = Some(self.parse_expression()?);
             } else if self.match_token(TokenType::Constraint) {
-                let constr_name = Some(Identifier::new(self.expect_identifier()?));
+                let constr_name = Some(self.parse_unquoted_identifier(Self::expect_identifier)?);
                 self.expect(TokenType::Check)?;
                 self.expect(TokenType::LParen)?;
                 let check_expr = self.parse_expression()?;
@@ -28587,7 +28599,7 @@ impl Parser {
             actions.push(AlterViewAction::UnsetTblproperties(keys));
         } else if self.match_token(TokenType::Alter) {
             self.match_token(TokenType::Column);
-            let col_name = Identifier::new(self.expect_identifier()?);
+            let col_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
             let action = self.parse_alter_column_action()?;
             actions.push(AlterViewAction::AlterColumn {
                 name: col_name,
@@ -30498,7 +30510,9 @@ impl Parser {
             "UUID" | "JSON" | "JSONB" | "XML" | "BIT" | "VARBIT" |
             // Range types (PostgreSQL)
             "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE"
-        );
+        ) || (self.config.dialect
+            == Some(crate::dialects::DialectType::DuckDB)
+            && DataType::from_unsigned_name(&type_name).is_some());
 
         if !is_type_literal_type {
             return Ok(None);
@@ -30599,6 +30613,10 @@ impl Parser {
 
         // Parse the data type
         let data_type = match type_name.as_str() {
+            name if DataType::from_unsigned_name(name).is_some() => {
+                DataType::from_unsigned_name(name).unwrap()
+            }
+            name if self.is_int128_type_name(name) => DataType::Int128,
             "INT" | "INTEGER" => DataType::Int {
                 length: None,
                 integer_spelling: type_name == "INTEGER",
@@ -30719,7 +30737,7 @@ impl Parser {
         {
             let token = self.advance();
             let col_name = &token.text[1..];
-            let col_expr = Expression::boxed_column(Column {
+            let col_expr = Self::parsed_column(Column {
                 name: Identifier::new(col_name),
                 table: None,
                 join_mark: false,
@@ -30756,7 +30774,7 @@ impl Parser {
             let col_name = &token.text[1..]; // strip leading @
 
             // Create column expression for the identifier part
-            let col_expr = Expression::boxed_column(Column {
+            let col_expr = Self::parsed_column(Column {
                 name: Identifier::new(col_name),
                 table: None,
                 join_mark: false,
@@ -31447,6 +31465,7 @@ impl Parser {
             expressions,
             bracket_notation: true,
             use_list_keyword: false,
+            inferred_type: None,
         }))
     }
 
@@ -31676,7 +31695,7 @@ impl Parser {
                 let mut params = Vec::new();
                 loop {
                     let tok = self.advance();
-                    params.push(Identifier::new(tok.text));
+                    params.push(Identifier::new(tok.text.clone()).with_span(tok.span));
                     if self.match_token(TokenType::Comma) {
                         continue;
                     }
@@ -32231,7 +32250,7 @@ impl Parser {
             if self.check(TokenType::Number) {
                 let field_name = self.advance_text();
                 let col_expr = Expression::Dot(Box::new(DotAccess {
-                    this: Expression::boxed_column(Column {
+                    this: Self::parsed_column(Column {
                         name: ident,
                         table: None,
                         join_mark: false,
@@ -32255,7 +32274,7 @@ impl Parser {
                 let num = self.advance_text();
                 let field_name = format!("-{}", num);
                 let col_expr = Expression::Dot(Box::new(DotAccess {
-                    this: Expression::boxed_column(Column {
+                    this: Self::parsed_column(Column {
                         name: ident,
                         table: None,
                         join_mark: false,
@@ -32282,7 +32301,7 @@ impl Parser {
                     field_name.push_str(&self.advance_text());
                 }
                 let col_expr = Expression::Dot(Box::new(DotAccess {
-                    this: Expression::boxed_column(Column {
+                    this: Self::parsed_column(Column {
                         name: ident,
                         table: None,
                         join_mark: false,
@@ -32304,7 +32323,7 @@ impl Parser {
                     && self.match_token(TokenType::RParen)
                 {
                     let trailing_comments = self.previous_trailing_comments().to_vec();
-                    let col = Expression::boxed_column(Column {
+                    let col = Self::parsed_column(Column {
                         name: col_ident,
                         table: Some(ident),
                         join_mark: true,
@@ -32326,7 +32345,7 @@ impl Parser {
                     self.parse_function_arguments()?
                 };
                 self.expect(TokenType::RParen)?;
-                let this = Expression::boxed_column(Column {
+                let this = Self::parsed_column(Column {
                     name: ident.clone(),
                     table: None,
                     join_mark: false,
@@ -32339,7 +32358,7 @@ impl Parser {
             }
 
             let trailing_comments = self.previous_trailing_comments().to_vec();
-            let col = Expression::boxed_column(Column {
+            let col = Self::parsed_column(Column {
                 name: col_ident,
                 table: Some(ident),
                 join_mark: false,
@@ -32384,7 +32403,7 @@ impl Parser {
         }
 
         let trailing_comments = self.previous_trailing_comments().to_vec();
-        let col = Expression::boxed_column(Column {
+        let col = Self::parsed_column(Column {
             name: ident,
             table: None,
             join_mark: false,
@@ -32894,7 +32913,9 @@ impl Parser {
             && !self.check_next(TokenType::LParen)
         {
             let tok = self.advance();
-            return Ok(Expression::Identifier(Identifier::new(tok.text)));
+            return Ok(Expression::Identifier(
+                Identifier::new(tok.text.clone()).with_span(tok.span),
+            ));
         }
         if self.match_token(TokenType::Exists) {
             self.expect(TokenType::LParen)?;
@@ -32949,7 +32970,9 @@ impl Parser {
             }
             // INTERVAL is used as an identifier
             let token = self.advance();
-            return Ok(Expression::Identifier(Identifier::new(token.text)));
+            return Ok(Expression::Identifier(
+                Identifier::new(token.text).with_span(token.span),
+            ));
         }
 
         // DATE literal: DATE '2024-01-15' or DATE function: DATE(expr)
@@ -32978,8 +33001,8 @@ impl Parser {
                 return self.maybe_parse_over(func_expr);
             }
             // Fallback to DATE as column reference - preserve original case
-            return Ok(Expression::boxed_column(Column {
-                name: Identifier::new(original_text),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -33002,8 +33025,8 @@ impl Parser {
                 return self.maybe_parse_over(func_expr);
             }
             // Fallback to TIME as column reference - preserve original case
-            return self.maybe_parse_subscript(Expression::boxed_column(Column {
-                name: Identifier::new(original_text),
+            return self.maybe_parse_subscript(Self::parsed_column(Column {
+                name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -33053,8 +33076,8 @@ impl Parser {
                 })));
             }
 
-            return self.maybe_parse_subscript(Expression::boxed_column(Column {
-                name: Identifier::new(original_text),
+            return self.maybe_parse_subscript(Self::parsed_column(Column {
+                name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -33225,8 +33248,8 @@ impl Parser {
                 return Ok(Expression::DataType(data_type));
             }
             // Fallback to TIMESTAMP as column reference - preserve original case
-            return Ok(Expression::boxed_column(Column {
-                name: Identifier::new(original_text),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -33251,8 +33274,8 @@ impl Parser {
                 return self.maybe_parse_over(func_expr);
             }
             // Fallback to DATETIME as column reference - preserve original case
-            return Ok(Expression::boxed_column(Column {
-                name: Identifier::new(original_text),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -33298,12 +33321,7 @@ impl Parser {
                     && (text.starts_with("0x") || text.starts_with("0X"))
                     && !text[2..].chars().all(|c| c.is_ascii_hexdigit())
                 {
-                    let ident = Expression::Identifier(Identifier {
-                        name: token.text,
-                        quoted: true,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    });
+                    let ident = Expression::Identifier(Self::identifier_from_token(token, true));
                     return self.maybe_parse_subscript(ident);
                 }
             }
@@ -33479,12 +33497,7 @@ impl Parser {
                     && (text.starts_with("0x") || text.starts_with("0X"))
                     && !text[2..].chars().all(|c| c.is_ascii_hexdigit())
                 {
-                    let ident = Expression::Identifier(Identifier {
-                        name: token.text,
-                        quoted: true,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    });
+                    let ident = Expression::Identifier(Self::identifier_from_token(token, true));
                     return self.maybe_parse_subscript(ident);
                 }
             }
@@ -33646,7 +33659,10 @@ impl Parser {
                         self.expect(TokenType::RParen)?;
 
                         // Create CAST(ARRAY[args] AS ARRAY<TYPE>)
-                        let array_expr = Expression::Array(Box::new(Array { expressions }));
+                        let array_expr = Expression::Array(Box::new(Array {
+                            expressions,
+                            inferred_type: None,
+                        }));
                         let cast_expr = Expression::Cast(Box::new(Cast {
                             this: array_expr,
                             to: data_type,
@@ -33667,7 +33683,10 @@ impl Parser {
                     };
                     self.expect(TokenType::RBracket)?;
                     // Create CAST(Array(values) AS DataType)
-                    let array_expr = Expression::Array(Box::new(Array { expressions }));
+                    let array_expr = Expression::Array(Box::new(Array {
+                        expressions,
+                        inferred_type: None,
+                    }));
                     let cast_expr = Expression::Cast(Box::new(Cast {
                         this: array_expr,
                         to: data_type,
@@ -33733,7 +33752,7 @@ impl Parser {
             && self.check_next(TokenType::Dot)
         {
             let token = self.advance();
-            let ident = Identifier::new(token.text);
+            let ident = Identifier::new(token.text).with_span(token.span);
             self.expect(TokenType::Dot)?;
             if self.match_token(TokenType::Star) {
                 // case.* or top.*
@@ -33744,7 +33763,7 @@ impl Parser {
             let col_ident = self.expect_identifier_or_keyword_with_quoted()?;
             // Capture trailing comments from the column name token
             let trailing_comments = self.previous_trailing_comments().to_vec();
-            let mut col = Expression::boxed_column(Column {
+            let mut col = Self::parsed_column(Column {
                 name: col_ident,
                 table: Some(ident),
                 join_mark: false,
@@ -34046,24 +34065,25 @@ impl Parser {
             let name = token.text.to_string();
             if self.match_token(TokenType::Dot) {
                 // from.col qualified reference
-                let col_name = self.expect_identifier_or_keyword()?;
-                return Ok(Expression::Column(Box::new(crate::expressions::Column {
-                    name: Identifier::new(col_name),
-                    table: Some(Identifier::new(name)),
+                let col_name =
+                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                return Ok(Self::parsed_column(Column {
+                    name: col_name,
+                    table: Some(Identifier::new(name).with_span(token.span)),
                     join_mark: false,
                     trailing_comments: Vec::new(),
                     span: None,
                     inferred_type: None,
-                })));
+                }));
             }
-            return Ok(Expression::Column(Box::new(crate::expressions::Column {
-                name: Identifier::new(name),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::new(name).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
                 span: None,
                 inferred_type: None,
-            })));
+            }));
         }
 
         // ClickHouse: `except` as identifier in expression context (set operations are handled at statement level)
@@ -34077,24 +34097,25 @@ impl Parser {
             let token = self.advance();
             let name = token.text.to_string();
             if self.match_token(TokenType::Dot) {
-                let col_name = self.expect_identifier_or_keyword()?;
-                return Ok(Expression::Column(Box::new(crate::expressions::Column {
-                    name: Identifier::new(col_name),
-                    table: Some(Identifier::new(name)),
+                let col_name =
+                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                return Ok(Self::parsed_column(Column {
+                    name: col_name,
+                    table: Some(Identifier::new(name).with_span(token.span)),
                     join_mark: false,
                     trailing_comments: Vec::new(),
                     span: None,
                     inferred_type: None,
-                })));
+                }));
             }
-            return Ok(Expression::Column(Box::new(crate::expressions::Column {
-                name: Identifier::new(name),
+            return Ok(Self::parsed_column(Column {
+                name: Identifier::new(name).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
                 span: None,
                 inferred_type: None,
-            })));
+            }));
         }
 
         // ClickHouse: structural keywords like FROM, ON, JOIN can be used as identifiers
@@ -34126,8 +34147,8 @@ impl Parser {
             );
             if is_expr_context {
                 let token = self.advance();
-                return Ok(Expression::boxed_column(Column {
-                    name: Identifier::new(token.text),
+                return Ok(Self::parsed_column(Column {
+                    name: Identifier::new(token.text).with_span(token.span),
                     table: None,
                     join_mark: false,
                     trailing_comments: Vec::new(),
@@ -34218,7 +34239,7 @@ impl Parser {
             if self.match_token(TokenType::Dot) {
                 if self.match_token(TokenType::Star) {
                     // keyword.* with potential modifiers
-                    let ident = Identifier::new(name);
+                    let ident = Identifier::new(name).with_span(token.span);
                     let star = self.parse_star_modifiers(Some(ident))?;
                     return Ok(Expression::Star(star));
                 }
@@ -34237,8 +34258,8 @@ impl Parser {
                         field_name.push_str(&self.advance_text());
                     }
                     let col = Expression::Dot(Box::new(DotAccess {
-                        this: Expression::boxed_column(Column {
-                            name: Identifier::new(name),
+                        this: Self::parsed_column(Column {
+                            name: Identifier::new(name).with_span(token.span),
                             table: None,
                             join_mark: false,
                             trailing_comments: Vec::new(),
@@ -34255,8 +34276,8 @@ impl Parser {
                 if self.check(TokenType::Number) {
                     let field_name = self.advance_text();
                     let col_expr = Expression::Dot(Box::new(DotAccess {
-                        this: Expression::boxed_column(Column {
-                            name: Identifier::new(name),
+                        this: Self::parsed_column(Column {
+                            name: Identifier::new(name).with_span(token.span),
                             table: None,
                             join_mark: false,
                             trailing_comments: Vec::new(),
@@ -34282,7 +34303,7 @@ impl Parser {
                     };
                     self.expect(TokenType::RParen)?;
                     let method_call = self.parse_method_call_expression(
-                        Expression::Identifier(Identifier::new(name)),
+                        Expression::Identifier(Identifier::new(name).with_span(token.span)),
                         col_ident,
                         args,
                     );
@@ -34291,9 +34312,9 @@ impl Parser {
 
                 // Capture trailing comments from the column name token
                 let trailing_comments = self.previous_trailing_comments().to_vec();
-                let mut col = Expression::boxed_column(Column {
+                let mut col = Self::parsed_column(Column {
                     name: col_ident,
-                    table: Some(Identifier::new(name)),
+                    table: Some(Identifier::new(name).with_span(token.span)),
                     join_mark: false,
                     trailing_comments,
                     span: None,
@@ -34319,8 +34340,8 @@ impl Parser {
             // Simple identifier (keyword used as column name)
             // Capture trailing comments from the keyword token
             let trailing_comments = self.previous_trailing_comments().to_vec();
-            let ident = Identifier::new(name);
-            let col = Expression::boxed_column(Column {
+            let ident = Identifier::new(name).with_span(token.span);
+            let col = Self::parsed_column(Column {
                 name: ident,
                 table: None,
                 join_mark: false,
@@ -34597,7 +34618,7 @@ impl Parser {
             && self.check_next(TokenType::Dot)
         {
             let token = self.advance();
-            let ident = Identifier::new(token.text);
+            let ident = Identifier::new(token.text).with_span(token.span);
             self.expect(TokenType::Dot)?;
             if self.match_token(TokenType::Star) {
                 let star = self.parse_star_modifiers(Some(ident))?;
@@ -34605,7 +34626,7 @@ impl Parser {
             }
             let col_ident = self.expect_identifier_or_keyword_with_quoted()?;
             let trailing_comments = self.previous_trailing_comments().to_vec();
-            let mut col = Expression::boxed_column(Column {
+            let mut col = Self::parsed_column(Column {
                 name: col_ident,
                 table: Some(ident),
                 join_mark: false,
@@ -34662,8 +34683,8 @@ impl Parser {
         {
             let token = self.advance();
             let trailing_comments = self.previous_trailing_comments().to_vec();
-            let col = Expression::boxed_column(Column {
-                name: Identifier::new(token.text),
+            let col = Self::parsed_column(Column {
+                name: Identifier::new(token.text).with_span(token.span),
                 table: None,
                 join_mark: false,
                 trailing_comments,
@@ -34833,7 +34854,8 @@ impl Parser {
                         let alias_token = self.advance();
                         Expression::Alias(Box::new(crate::expressions::Alias {
                             this,
-                            alias: Identifier::new(alias_token.text.to_string()),
+                            alias: Identifier::new(alias_token.text.clone())
+                                .with_span(alias_token.span),
                             column_aliases: Vec::new(),
                             alias_explicit_as: false,
                             alias_keyword: None,
@@ -34875,7 +34897,8 @@ impl Parser {
                             let alias_token = self.advance();
                             Expression::Alias(Box::new(crate::expressions::Alias {
                                 this: arg,
-                                alias: Identifier::new(alias_token.text.to_string()),
+                                alias: Identifier::new(alias_token.text.clone())
+                                    .with_span(alias_token.span),
                                 column_aliases: Vec::new(),
                                 alias_explicit_as: false,
                                 alias_keyword: None,
@@ -35949,7 +35972,11 @@ impl Parser {
                     }))));
                 }
 
-                if self.check(TokenType::String) {
+                // A quoted date part followed by FROM is standard EXTRACT syntax
+                // (for example, DuckDB accepts EXTRACT('year' FROM value)). Keep
+                // comma-style string arguments on the generic function path for
+                // dialects such as Snowflake.
+                if self.check(TokenType::String) && !self.check_next(TokenType::From) {
                     let args = self.parse_expression_list()?;
                     self.expect(TokenType::RParen)?;
                     return Ok(Some(Expression::Function(Box::new(Function {
@@ -36438,6 +36465,7 @@ impl Parser {
                             position,
                             sql_standard_syntax: true,
                             position_explicit,
+                            inferred_type: None,
                         }))))
                     } else {
                         let first_expr = self.parse_bitwise_or()?;
@@ -36452,6 +36480,7 @@ impl Parser {
                                 position,
                                 sql_standard_syntax: true,
                                 position_explicit,
+                                inferred_type: None,
                             }))))
                         } else {
                             self.expect(TokenType::RParen)?;
@@ -36461,6 +36490,7 @@ impl Parser {
                                 position,
                                 sql_standard_syntax: true,
                                 position_explicit,
+                                inferred_type: None,
                             }))))
                         }
                     }
@@ -36477,6 +36507,7 @@ impl Parser {
                             position: TrimPosition::Both,
                             sql_standard_syntax: true,
                             position_explicit: false,
+                            inferred_type: None,
                         }))))
                     } else if self.match_token(TokenType::Comma) {
                         let second_expr = self.parse_expression()?;
@@ -36496,6 +36527,7 @@ impl Parser {
                             position: TrimPosition::Both,
                             sql_standard_syntax: false,
                             position_explicit: false,
+                            inferred_type: None,
                         }))))
                     } else {
                         self.expect(TokenType::RParen)?;
@@ -36505,6 +36537,7 @@ impl Parser {
                             position: TrimPosition::Both,
                             sql_standard_syntax: false,
                             position_explicit: false,
+                            inferred_type: None,
                         }))))
                     }
                 }
@@ -38972,7 +39005,7 @@ impl Parser {
                     name: alias_token.text.to_string(),
                     quoted: alias_token.token_type == TokenType::QuotedIdentifier,
                     trailing_comments: Vec::new(),
-                    span: None,
+                    span: Some(alias_token.span),
                 };
                 return Expression::Alias(Box::new(crate::expressions::Alias {
                     this: expr,
@@ -39028,14 +39061,14 @@ impl Parser {
                     if self.match_token(TokenType::FArrow) {
                         let value = self.parse_function_argument_value()?;
                         Expression::NamedArgument(Box::new(NamedArgument {
-                            name: Identifier::new(ident_name),
+                            name: Identifier::new(ident_name).with_span(ident_token.span),
                             value,
                             separator: NamedArgSeparator::DArrow,
                         }))
                     } else if self.match_token(TokenType::ColonEq) {
                         let value = self.parse_expression()?;
                         Expression::NamedArgument(Box::new(NamedArgument {
-                            name: Identifier::new(ident_name),
+                            name: Identifier::new(ident_name).with_span(ident_token.span),
                             value,
                             separator: NamedArgSeparator::ColonEq,
                         }))
@@ -39071,7 +39104,7 @@ impl Parser {
                 if self.match_token(TokenType::Arrow) {
                     let body = self.parse_expression()?;
                     Expression::Lambda(Box::new(LambdaExpr {
-                        parameters: vec![Identifier::new(ident_name)],
+                        parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
                         body,
                         colon: false,
                         parameter_types: vec![Some(type_annotation)],
@@ -39083,7 +39116,7 @@ impl Parser {
             } else if self.match_token(TokenType::Arrow) {
                 let body = self.parse_expression()?;
                 Expression::Lambda(Box::new(LambdaExpr {
-                    parameters: vec![Identifier::new(ident_name)],
+                    parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
                     body,
                     colon: false,
                     parameter_types: Vec::new(),
@@ -39091,14 +39124,14 @@ impl Parser {
             } else if self.match_token(TokenType::FArrow) {
                 let value = self.parse_function_argument_value()?;
                 Expression::NamedArgument(Box::new(NamedArgument {
-                    name: Identifier::new(ident_name),
+                    name: Identifier::new(ident_name).with_span(ident_token.span),
                     value,
                     separator: NamedArgSeparator::DArrow,
                 }))
             } else if self.match_token(TokenType::ColonEq) {
                 let value = self.parse_expression()?;
                 Expression::NamedArgument(Box::new(NamedArgument {
-                    name: Identifier::new(ident_name),
+                    name: Identifier::new(ident_name).with_span(ident_token.span),
                     value,
                     separator: NamedArgSeparator::ColonEq,
                 }))
@@ -39134,11 +39167,12 @@ impl Parser {
                 self.skip();
                 let alias_token = self.advance();
                 let alias_name = if alias_token.token_type == TokenType::QuotedIdentifier {
-                    let mut ident = Identifier::new(alias_token.text.to_string());
+                    let mut ident =
+                        Identifier::new(alias_token.text.clone()).with_span(alias_token.span);
                     ident.quoted = true;
                     ident
                 } else {
-                    Identifier::new(alias_token.text.to_string())
+                    Identifier::new(alias_token.text.clone()).with_span(alias_token.span)
                 };
                 Expression::Alias(Box::new(crate::expressions::Alias {
                     this: arg,
@@ -39580,6 +39614,7 @@ impl Parser {
                     expressions: Vec::new(),
                     bracket_notation: true,
                     use_list_keyword: false,
+                    inferred_type: None,
                 })));
             }
 
@@ -39597,6 +39632,7 @@ impl Parser {
                 expressions,
                 bracket_notation: true,
                 use_list_keyword: false,
+                inferred_type: None,
             })));
         }
 
@@ -39611,9 +39647,9 @@ impl Parser {
                         self.expect_identifier_with_quoted()?
                     } else {
                         let token = self.advance();
-                        Identifier::new(token.text)
+                        Identifier::new(token.text).with_span(token.span)
                     };
-                    return Ok(Expression::boxed_column(Column {
+                    return Ok(Self::parsed_column(Column {
                         name: second_ident,
                         table: Some(first_ident),
                         join_mark: false,
@@ -39624,7 +39660,7 @@ impl Parser {
                 }
             }
 
-            return Ok(Expression::boxed_column(Column {
+            return Ok(Self::parsed_column(Column {
                 name: first_ident,
                 table: None,
                 join_mark: false,
@@ -39637,7 +39673,7 @@ impl Parser {
         // Keywords as identifiers (possibly qualified)
         if self.is_safe_keyword_as_identifier() {
             let token = self.advance();
-            let first_ident = Identifier::new(token.text);
+            let first_ident = Identifier::new(token.text).with_span(token.span);
 
             // Check for qualified name: identifier.identifier
             if self.match_token(TokenType::Dot) {
@@ -39646,9 +39682,9 @@ impl Parser {
                         self.expect_identifier_with_quoted()?
                     } else {
                         let token = self.advance();
-                        Identifier::new(token.text)
+                        Identifier::new(token.text).with_span(token.span)
                     };
-                    return Ok(Expression::boxed_column(Column {
+                    return Ok(Self::parsed_column(Column {
                         name: second_ident,
                         table: Some(first_ident),
                         join_mark: false,
@@ -39659,7 +39695,7 @@ impl Parser {
                 }
             }
 
-            return Ok(Expression::boxed_column(Column {
+            return Ok(Self::parsed_column(Column {
                 name: first_ident,
                 table: None,
                 join_mark: false,
@@ -39750,6 +39786,7 @@ impl Parser {
                             expressions: Vec::new(),
                             bracket_notation: false, // Has ARRAY/LIST keyword
                             use_list_keyword,
+                            inferred_type: None,
                         }));
                     } else {
                         let expressions = self.parse_expression_list()?;
@@ -39758,6 +39795,7 @@ impl Parser {
                             expressions,
                             bracket_notation: false, // Has ARRAY/LIST keyword
                             use_list_keyword,
+                            inferred_type: None,
                         }));
                     }
                     continue;
@@ -39933,7 +39971,7 @@ impl Parser {
                 // Handle chained dot access (a.b.c.d)
                 if self.match_token(TokenType::Star) {
                     // expr.* - struct field expansion with potential modifiers (EXCEPT, REPLACE, etc.)
-                    let table_name = match &expr {
+                    let mut table_name = match &expr {
                         Expression::Column(col) => {
                             if let Some(ref table) = col.table {
                                 Some(Identifier::new(format!("{}.{}", table.name, col.name.name)))
@@ -39963,6 +40001,9 @@ impl Parser {
                         }
                         _ => None,
                     };
+                    if let Some(table) = &mut table_name {
+                        table.span = Self::reference_span(&expr);
+                    }
                     if table_name.is_some() {
                         let star = self.parse_star_modifiers(table_name)?;
                         expr = Expression::Star(star);
@@ -40056,7 +40097,7 @@ impl Parser {
                     || self.check_keyword()
                 {
                     let is_quoted = self.check(TokenType::QuotedIdentifier);
-                    let field_name = self.advance_text();
+                    let ident = Self::identifier_from_token(self.advance(), is_quoted);
                     // Check if this is a method call (field followed by parentheses)
                     if self.check(TokenType::LParen) && !is_quoted {
                         // This is a method call like a.b.C() or x.EXTRACT()
@@ -40068,16 +40109,8 @@ impl Parser {
                         };
                         self.expect(TokenType::RParen)?;
                         // Create a method call expression (DotAccess with function call)
-                        expr = self.parse_method_call_expression(
-                            expr,
-                            Identifier::new(field_name),
-                            args,
-                        );
+                        expr = self.parse_method_call_expression(expr, ident, args);
                     } else {
-                        let mut ident = Identifier::new(field_name);
-                        if is_quoted {
-                            ident.quoted = true;
-                        }
                         expr = Expression::Dot(Box::new(DotAccess {
                             this: expr,
                             field: ident,
@@ -40086,10 +40119,10 @@ impl Parser {
                     }
                 } else if self.check(TokenType::Number) {
                     // Handle numeric field access like a.0 or x.1
-                    let field_name = self.advance_text();
+                    let field = Self::identifier_from_token(self.advance(), false);
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
-                        field: Identifier::new(field_name),
+                        field,
                         inferred_type: None,
                     }));
                 } else if matches!(
@@ -40398,9 +40431,9 @@ impl Parser {
         // Handle OVER window_name (without parentheses)
         if !self.check(TokenType::LParen) {
             // OVER window_name - just a named window reference
-            let window_name = self.expect_identifier_or_keyword()?;
+            let window_name = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
             return Ok(Over {
-                window_name: Some(Identifier::new(window_name)),
+                window_name: Some(window_name),
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
                 frame: None,
@@ -40425,7 +40458,7 @@ impl Parser {
         {
             // Look ahead to see if next token indicates this is a window name
             let pos = self.current;
-            let name = self.advance_text();
+            let name = Self::identifier_from_token(self.advance(), false);
             // If next token is a keyword that can follow a window name, this is a named reference
             if self.check(TokenType::Order)
                 || self.check(TokenType::Partition)
@@ -40436,7 +40469,7 @@ impl Parser {
                 || self.check(TokenType::Distribute)
                 || self.check(TokenType::Sort)
             {
-                Some(Identifier::new(name))
+                Some(name)
             } else {
                 // Not a named window, restore position
                 self.current = pos;
@@ -41926,7 +41959,15 @@ impl Parser {
         Ok(Some(DataType::Oracle { oracle_type }))
     }
 
-    /// Parse a data type
+    /// Recognize equivalent signed 128-bit type names across parser entry points.
+    fn is_int128_type_name(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("INT128")
+            || name.eq_ignore_ascii_case("HUGEINT")
+            || (self.config.dialect == Some(crate::dialects::DialectType::StarRocks)
+                && name.eq_ignore_ascii_case("LARGEINT"))
+    }
+
+    /// Parse a data type.
     fn parse_data_type(&mut self) -> Result<DataType> {
         // Handle special token types that represent data type keywords
         // Teradata tokenizes ST_GEOMETRY as TokenType::Geometry
@@ -41983,6 +42024,10 @@ impl Parser {
         }
 
         let base_type = match name.as_str() {
+            name if DataType::from_unsigned_name(name).is_some() => {
+                Ok(DataType::from_unsigned_name(name).unwrap())
+            }
+            name if self.is_int128_type_name(name) => Ok(DataType::Int128),
             "INT" | "INTEGER" => {
                 // MySQL allows INT(N) for display width; ClickHouse allows INT()
                 let length = if self.match_token(TokenType::LParen) {
@@ -43116,6 +43161,10 @@ impl Parser {
 
         // Handle parametric types like ARRAY<T>, MAP<K,V>
         let base_type = match name.as_str() {
+            name if DataType::from_unsigned_name(name).is_some() => {
+                DataType::from_unsigned_name(name).unwrap()
+            }
+            name if self.is_int128_type_name(name) => DataType::Int128,
             "ARRAY" => {
                 if self.match_token(TokenType::Lt) {
                     let element_type = self.parse_data_type()?;
@@ -44054,6 +44103,12 @@ impl Parser {
             DataType::Int { length: None, .. } => "INT".to_string(),
             DataType::BigInt { length: Some(n) } => format!("BIGINT({})", n),
             DataType::BigInt { length: None } => "BIGINT".to_string(),
+            DataType::Int128 => "INT128".to_string(),
+            DataType::UInt8 => "UTINYINT".to_string(),
+            DataType::UInt16 => "USMALLINT".to_string(),
+            DataType::UInt32 => "UINTEGER".to_string(),
+            DataType::UInt64 => "UBIGINT".to_string(),
+            DataType::UInt128 => "UINT128".to_string(),
             DataType::SmallInt { length: Some(n) } => format!("SMALLINT({})", n),
             DataType::SmallInt { length: None } => "SMALLINT".to_string(),
             DataType::TinyInt { length: Some(n) } => format!("TINYINT({})", n),
@@ -44310,6 +44365,10 @@ impl Parser {
     /// This is used for standalone type expressions like ARRAY<T>
     fn parse_data_type_from_name(&mut self, name: &str) -> Result<DataType> {
         match name {
+            name if DataType::from_unsigned_name(name).is_some() => {
+                Ok(DataType::from_unsigned_name(name).unwrap())
+            }
+            name if self.is_int128_type_name(name) => Ok(DataType::Int128),
             "ARRAY" => {
                 if self.match_token(TokenType::Lt) {
                     let element_type = self.parse_data_type()?;
@@ -44386,6 +44445,10 @@ impl Parser {
     fn convert_name_to_type(&self, name: &str) -> Result<DataType> {
         let upper = name.to_ascii_uppercase();
         Ok(match upper.as_str() {
+            name if DataType::from_unsigned_name(name).is_some() => {
+                DataType::from_unsigned_name(name).unwrap()
+            }
+            name if self.is_int128_type_name(name) => DataType::Int128,
             "INT" => DataType::Int {
                 length: None,
                 integer_spelling: false,
@@ -44481,6 +44544,7 @@ impl Parser {
             if self.match_token(TokenType::LParen) {
                 // EXCLUDE (col1, col2) or EXCEPT (A.COL_1, B.COL_2)
                 loop {
+                    let start = self.peek().span;
                     // ClickHouse: allow string literals in EXCEPT ('col_regex')
                     // and keywords like 'key', 'index' as column names
                     let col = if self.check(TokenType::String) {
@@ -44497,9 +44561,14 @@ impl Parser {
                         } else {
                             self.expect_identifier()?
                         };
-                        columns.push(Identifier::new(format!("{}.{}", col, subcol)));
+                        columns.push(
+                            Identifier::new(format!("{}.{}", col, subcol))
+                                .with_span(start.through(self.previous().span)),
+                        );
                     } else {
-                        columns.push(Identifier::new(col));
+                        columns.push(
+                            Identifier::new(col).with_span(start.through(self.previous().span)),
+                        );
                     }
                     if !self.match_token(TokenType::Comma) {
                         break;
@@ -44510,6 +44579,7 @@ impl Parser {
                 // EXCLUDE col (single column, Snowflake) or EXCEPT col1, col2 (ClickHouse)
                 // or EXCEPT 'regex' (ClickHouse)
                 loop {
+                    let start = self.peek().span;
                     let col = if self.check(TokenType::String) {
                         self.advance_text()
                     } else if self.is_safe_keyword_as_identifier() {
@@ -44517,7 +44587,8 @@ impl Parser {
                     } else {
                         self.expect_identifier()?
                     };
-                    columns.push(Identifier::new(col));
+                    columns
+                        .push(Identifier::new(col).with_span(start.through(self.previous().span)));
                     // ClickHouse allows comma-separated columns without parens: EXCEPT col1, col2
                     // But only if the next token after comma looks like a column name
                     if !matches!(
@@ -44549,8 +44620,9 @@ impl Parser {
                 loop {
                     let expr = self.parse_expression()?;
                     self.expect(TokenType::As)?;
-                    let alias = self.expect_identifier_or_keyword()?;
-                    replacements.push(Alias::new(expr, Identifier::new(alias)));
+                    let alias =
+                        self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                    replacements.push(Alias::new(expr, alias));
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -44564,8 +44636,8 @@ impl Parser {
                 // Multiple entries require parens: REPLACE(expr1 AS name1, expr2 AS name2)
                 let expr = self.parse_expression()?;
                 self.expect(TokenType::As)?;
-                let alias = self.expect_identifier_or_keyword()?;
-                replacements.push(Alias::new(expr, Identifier::new(alias)));
+                let alias = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                replacements.push(Alias::new(expr, alias));
             } else {
                 return Err(self.parse_error("Expected LParen after REPLACE"));
             }
@@ -44577,10 +44649,10 @@ impl Parser {
             let mut renames = Vec::new();
             if self.match_token(TokenType::LParen) {
                 loop {
-                    let old_name = self.expect_identifier()?;
+                    let old_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
                     self.expect(TokenType::As)?;
-                    let new_name = self.expect_identifier()?;
-                    renames.push((Identifier::new(old_name), Identifier::new(new_name)));
+                    let new_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                    renames.push((old_name, new_name));
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -44588,10 +44660,10 @@ impl Parser {
                 self.expect(TokenType::RParen)?;
             } else {
                 // Single rename without parens
-                let old_name = self.expect_identifier()?;
+                let old_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
                 self.expect(TokenType::As)?;
-                let new_name = self.expect_identifier()?;
-                renames.push((Identifier::new(old_name), Identifier::new(new_name)));
+                let new_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                renames.push((old_name, new_name));
             }
             rename = Some(renames);
         }
@@ -45393,43 +45465,115 @@ impl Parser {
         // Check for common type keywords that might appear in lambda annotations
         // Use text comparison to avoid depending on specific TokenType variants
         let text_upper = token.text.to_ascii_uppercase();
-        matches!(
-            text_upper.as_str(),
-            "INT"
-                | "INTEGER"
-                | "BIGINT"
-                | "SMALLINT"
-                | "TINYINT"
-                | "DOUBLE"
-                | "FLOAT"
-                | "DECIMAL"
-                | "NUMERIC"
-                | "REAL"
-                | "VARCHAR"
-                | "CHAR"
-                | "TEXT"
-                | "STRING"
-                | "NVARCHAR"
-                | "NCHAR"
-                | "BOOLEAN"
-                | "BOOL"
-                | "DATE"
-                | "TIME"
-                | "TIMESTAMP"
-                | "DATETIME"
-                | "INTERVAL"
-                | "BINARY"
-                | "VARBINARY"
-                | "BLOB"
-                | "ARRAY"
-                | "MAP"
-                | "STRUCT"
-                | "OBJECT"
-                | "VARIANT"
-                | "JSON"
-                | "NUMBER"
-                | "VARCHAR2"
-        )
+        DataType::from_unsigned_name(&text_upper).is_some()
+            || matches!(
+                text_upper.as_str(),
+                "INT"
+                    | "INTEGER"
+                    | "BIGINT"
+                    | "SMALLINT"
+                    | "TINYINT"
+                    | "DOUBLE"
+                    | "FLOAT"
+                    | "DECIMAL"
+                    | "NUMERIC"
+                    | "REAL"
+                    | "VARCHAR"
+                    | "CHAR"
+                    | "TEXT"
+                    | "STRING"
+                    | "NVARCHAR"
+                    | "NCHAR"
+                    | "BOOLEAN"
+                    | "BOOL"
+                    | "DATE"
+                    | "TIME"
+                    | "TIMESTAMP"
+                    | "DATETIME"
+                    | "INTERVAL"
+                    | "BINARY"
+                    | "VARBINARY"
+                    | "BLOB"
+                    | "ARRAY"
+                    | "MAP"
+                    | "STRUCT"
+                    | "OBJECT"
+                    | "VARIANT"
+                    | "JSON"
+                    | "NUMBER"
+                    | "VARCHAR2"
+            )
+    }
+
+    /// Check for an implicit relation alias while preserving clause and join boundaries.
+    /// Shared by FROM and JOIN sources, including subqueries and table functions.
+    fn can_parse_implicit_table_alias(&self) -> bool {
+        if self.is_at_end() {
+            return false;
+        }
+
+        let dialect_keyword_alias = match self.config.dialect {
+            // These shared tokenizer keywords are valid unquoted DuckDB identifiers.
+            // Keep the allowance local to relation aliases: FIRST/LAST still have
+            // ordering semantics, and TOP remains a clause token in TSQL.
+            Some(crate::dialects::DialectType::DuckDB) => matches!(
+                self.peek().token_type,
+                TokenType::Top
+                    | TokenType::First
+                    | TokenType::Last
+                    | TokenType::Begin
+                    | TokenType::Type
+            ),
+            Some(crate::dialects::DialectType::ClickHouse) => {
+                matches!(self.peek().token_type, TokenType::First | TokenType::Last)
+            }
+            _ => false,
+        };
+
+        self.check(TokenType::QuotedIdentifier)
+            || (self.check(TokenType::Var)
+                && !self.check_keyword()
+                && !self.check_identifier("MATCH_CONDITION")
+                && !(self.check_identifier("ARRAY")
+                    && self.check_next(TokenType::Join)
+                    && matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    ))
+                // TSQL: OPTION(LABEL = 'foo') is a query hint, not an alias.
+                && !(self.check_identifier("OPTION") && self.check_next(TokenType::LParen))
+                // MySQL: LOCK IN SHARE MODE is a locking clause, not an alias.
+                && !(self.check_identifier("LOCK") && self.check_next(TokenType::In))
+                // ClickHouse: PARALLEL WITH is a statement separator, not an alias.
+                && !(self.check_identifier("PARALLEL")
+                    && self.check_next(TokenType::With)
+                    && matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    ))
+                // DuckDB: POSITIONAL JOIN is a join method, not an alias.
+                && !(self.check_identifier("POSITIONAL") && self.check_next(TokenType::Join)))
+            || self.is_command_keyword_as_alias()
+            || dialect_keyword_alias
+            // PIVOT/UNPIVOT can be aliases when not followed by clause-starting tokens.
+            || (self.check(TokenType::Pivot) && !self.check_next(TokenType::LParen))
+            || (self.check(TokenType::Unpivot) && !self.is_unpivot_clause_start())
+            // PARTITION can be an alias when the dialect lacks partition selection.
+            || (self.check(TokenType::Partition)
+                && !matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::MySQL)
+                        | Some(crate::dialects::DialectType::SingleStore)
+                        | Some(crate::dialects::DialectType::Doris)
+                        | Some(crate::dialects::DialectType::StarRocks)
+                ))
+            || (self.check(TokenType::Window) && {
+                // WINDOW can be an alias unless followed by a window definition.
+                let next_pos = self.current + 1;
+                next_pos >= self.tokens.len()
+                    || (self.tokens[next_pos].token_type != TokenType::Var
+                        && self.tokens[next_pos].token_type != TokenType::Identifier)
+            })
     }
 
     /// Check if current token is a command keyword that can safely be used as an implicit alias.
@@ -45673,6 +45817,7 @@ impl Parser {
     /// Parse a MySQL numeric-starting identifier (e.g., 00f, 1d)
     /// Merges the number token with connected identifier tokens
     fn parse_mysql_numeric_identifier(&mut self) -> Identifier {
+        let start = self.peek().span;
         let num_token = self.advance();
         let mut name = num_token.text.to_string();
         // Merge with connected identifier/var tokens
@@ -45688,7 +45833,7 @@ impl Parser {
             // sqlglot treats this as an identifier token and re-emits it quoted.
             quoted: true,
             trailing_comments: Vec::new(),
-            span: None,
+            span: Some(start.through(self.previous().span)),
         }
     }
 
@@ -45746,6 +45891,51 @@ impl Parser {
         self.is_identifier_token() || self.check_keyword()
     }
 
+    /// Construct an identifier directly from its consumed source token.
+    fn identifier_from_token(token: Token, quoted: bool) -> Identifier {
+        Identifier {
+            name: token.text,
+            quoted,
+            trailing_comments: Vec::new(),
+            span: Some(token.span),
+        }
+    }
+
+    /// Preserve the range when a legacy grammar path returns an unquoted name.
+    fn parse_unquoted_identifier(
+        &mut self,
+        parse_name: fn(&mut Self) -> Result<String>,
+    ) -> Result<Identifier> {
+        let start = self.peek().span;
+        let name = parse_name(self)?;
+        Ok(Identifier::new(name).with_span(start.through(self.previous().span)))
+    }
+
+    /// Derive column ranges only from source-backed identifier components.
+    /// Generated columns with unpositioned components remain unpositioned.
+    fn parsed_column(mut column: Column) -> Expression {
+        if column.span.is_none() {
+            column.span = match (&column.table, column.name.span) {
+                (None, span) => span,
+                (Some(table), Some(end)) => table.span.map(|start| start.through(end)),
+                _ => None,
+            };
+        }
+        Expression::boxed_column(column)
+    }
+
+    /// Range of a source-backed reference, including chained struct fields.
+    fn reference_span(expr: &Expression) -> Option<Span> {
+        match expr {
+            Expression::Column(column) => column.span,
+            Expression::Identifier(identifier) => identifier.span,
+            Expression::Dot(dot) => Self::reference_span(&dot.this)
+                .zip(dot.field.span)
+                .map(|(start, end)| start.through(end)),
+            _ => None,
+        }
+    }
+
     /// Expect an identifier and return an Identifier struct with quoted flag
     fn expect_identifier_with_quoted(&mut self) -> Result<Identifier> {
         if self.is_mysql_numeric_identifier() {
@@ -45754,18 +45944,14 @@ impl Parser {
         if self.is_identifier_token() {
             let token = self.advance();
             let quoted = token.token_type == TokenType::QuotedIdentifier;
-            Ok(Identifier {
-                name: token.text,
-                quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, quoted))
         } else if self.check(TokenType::LBrace)
             && matches!(
                 self.config.dialect,
                 Some(crate::dialects::DialectType::ClickHouse)
             )
         {
+            let start = self.peek().span;
             if let Some(param_expr) = self.parse_clickhouse_braced_parameter()? {
                 if let Expression::Parameter(param) = &param_expr {
                     let name = format!(
@@ -45777,7 +45963,7 @@ impl Parser {
                         name,
                         quoted: false,
                         trailing_comments: Vec::new(),
-                        span: None,
+                        span: Some(start.through(self.previous().span)),
                     });
                 }
             }
@@ -45805,22 +45991,17 @@ impl Parser {
     }
 
     /// Whether the active dialect supports string literals as projection aliases.
-    fn supports_string_aliases(&self) -> bool {
+    fn supports_string_aliases(&self, explicit_as: bool) -> bool {
         self.config
             .dialect
-            .is_some_and(crate::dialects::DialectType::supports_string_aliases)
+            .is_some_and(|dialect| dialect.supports_string_aliases(explicit_as))
     }
 
     /// Parse a SELECT projection alias without widening identifier parsing elsewhere.
-    fn parse_projection_alias_identifier(&mut self) -> Result<Identifier> {
-        if self.check(TokenType::String) && self.supports_string_aliases() {
+    fn parse_projection_alias_identifier(&mut self, explicit_as: bool) -> Result<Identifier> {
+        if self.check(TokenType::String) && self.supports_string_aliases(explicit_as) {
             let token = self.advance();
-            Ok(Identifier {
-                name: token.text,
-                quoted: true,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, true))
         } else {
             self.expect_identifier_or_keyword_with_quoted()
         }
@@ -45848,18 +46029,13 @@ impl Parser {
                 name,
                 quoted: false,
                 trailing_comments: Vec::new(),
-                span: None,
+                span: Some(token.span),
             });
         }
         if self.is_identifier_or_keyword_token() {
             let token = self.advance();
             let quoted = token.token_type == TokenType::QuotedIdentifier;
-            Ok(Identifier {
-                name: token.text,
-                quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, quoted))
         } else if self.check(TokenType::LBrace)
             && matches!(
                 self.config.dialect,
@@ -45867,6 +46043,7 @@ impl Parser {
             )
         {
             // ClickHouse query parameter: {name:Type}
+            let start = self.peek().span;
             if let Some(param_expr) = self.parse_clickhouse_braced_parameter()? {
                 // Extract the parameter name to use as the identifier
                 if let Expression::Parameter(param) = &param_expr {
@@ -45879,7 +46056,7 @@ impl Parser {
                         name,
                         quoted: false,
                         trailing_comments: Vec::new(),
-                        span: None,
+                        span: Some(start.through(self.previous().span)),
                     });
                 }
             }
@@ -46001,12 +46178,7 @@ impl Parser {
         if self.is_identifier_token() || self.is_safe_keyword_as_identifier() {
             let token = self.advance();
             let quoted = token.token_type == TokenType::QuotedIdentifier;
-            Ok(Identifier {
-                name: token.text,
-                quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, quoted))
         } else if self.check(TokenType::LBrace)
             && matches!(
                 self.config.dialect,
@@ -46053,12 +46225,7 @@ impl Parser {
         {
             let token = self.advance();
             let quoted = token.token_type == TokenType::QuotedIdentifier;
-            Ok(Identifier {
-                name: token.text,
-                quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, quoted))
         } else if self.check(TokenType::String)
             && matches!(
                 self.config.dialect,
@@ -46067,12 +46234,7 @@ impl Parser {
         {
             // DuckDB allows string literals as identifiers (e.g., WITH 'x' AS (...))
             let token = self.advance();
-            Ok(Identifier {
-                name: token.text,
-                quoted: true,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Ok(Self::identifier_from_token(token, true))
         } else {
             Err(self.parse_error(format!(
                 "Expected identifier, got {:?}",
@@ -46489,7 +46651,7 @@ impl Parser {
                 if self.match_token(TokenType::Arrow) {
                     let body = self.parse_expression()?;
                     Expression::Lambda(Box::new(LambdaExpr {
-                        parameters: vec![Identifier::new(ident_name)],
+                        parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
                         body,
                         colon: false,
                         parameter_types: Vec::new(),
@@ -46505,7 +46667,9 @@ impl Parser {
                     if self.match_token(TokenType::Arrow) {
                         let body = self.parse_expression()?;
                         Expression::Lambda(Box::new(LambdaExpr {
-                            parameters: vec![Identifier::new(ident_name)],
+                            parameters: vec![
+                                Identifier::new(ident_name).with_span(ident_token.span)
+                            ],
                             body,
                             colon: false,
                             parameter_types: vec![Some(type_annotation)],
@@ -46590,6 +46754,7 @@ impl Parser {
         let mut identifiers = Vec::new();
 
         loop {
+            let start = self.peek().span;
             // Allow keywords as identifiers in identifier lists (e.g., CTE column aliases)
             // Check if it's a quoted identifier before consuming
             let quoted = self.check(TokenType::QuotedIdentifier);
@@ -46610,7 +46775,7 @@ impl Parser {
                 name,
                 quoted,
                 trailing_comments,
-                span: None,
+                span: Some(start.through(self.previous().span)),
             });
 
             if !self.match_token(TokenType::Comma) {
@@ -46641,13 +46806,14 @@ impl Parser {
                 Some(crate::dialects::DialectType::ClickHouse)
             ) && self.match_token(TokenType::Star)
             {
-                identifiers.push(Identifier::new("*".to_string()));
+                identifiers.push(Identifier::new("*").with_span(self.previous().span));
                 if !self.match_token(TokenType::Comma) {
                     break;
                 }
                 continue;
             }
             // Check if it's a quoted identifier before consuming
+            let mut start = self.peek().span;
             let quoted = self.check(TokenType::QuotedIdentifier);
             let mut name = self.expect_identifier_or_safe_keyword()?;
             let mut final_quoted = quoted;
@@ -46655,6 +46821,7 @@ impl Parser {
             // Handle qualified names: table.column or schema.table.column
             // Keep only the final column name
             while self.match_token(TokenType::Dot) {
+                start = self.peek().span;
                 final_quoted = self.check(TokenType::QuotedIdentifier);
                 name = self.expect_identifier_or_safe_keyword()?;
             }
@@ -46666,6 +46833,7 @@ impl Parser {
             ) && self.match_token(TokenType::As)
             {
                 // Use the alias name instead
+                start = self.peek().span;
                 final_quoted = self.check(TokenType::QuotedIdentifier);
                 name = self.expect_identifier_or_safe_keyword()?;
             }
@@ -46675,7 +46843,7 @@ impl Parser {
                 name,
                 quoted: final_quoted,
                 trailing_comments,
-                span: None,
+                span: Some(start.through(self.previous().span)),
             });
 
             if !self.match_token(TokenType::Comma) {
@@ -46692,6 +46860,7 @@ impl Parser {
         let mut identifiers = Vec::new();
 
         loop {
+            let start = self.peek().span;
             let quoted = self.check(TokenType::QuotedIdentifier);
             let name = self.expect_identifier_or_safe_keyword()?;
             let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -46717,7 +46886,7 @@ impl Parser {
                 name: display_name,
                 quoted,
                 trailing_comments,
-                span: None,
+                span: Some(start.through(self.previous().span)),
             });
 
             if !self.match_token(TokenType::Comma) {
@@ -46740,6 +46909,7 @@ impl Parser {
             let (expression, prefix_length) = if self.check(TokenType::LParen) {
                 (self.parse_expression()?, None)
             } else {
+                let start = self.peek().span;
                 let quoted = self.check(TokenType::QuotedIdentifier);
                 let name = self.expect_identifier_or_safe_keyword()?;
                 let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -46747,7 +46917,7 @@ impl Parser {
                     name,
                     quoted,
                     trailing_comments,
-                    span: None,
+                    span: Some(start.through(self.previous().span)),
                 };
                 let prefix_length = if self.match_token(TokenType::LParen) {
                     if !self.check(TokenType::Number) {
@@ -48282,7 +48452,9 @@ impl Parser {
                         } else if val_token.token_type == TokenType::False {
                             Expression::Boolean(BooleanLiteral { value: false })
                         } else {
-                            Expression::Identifier(Identifier::new(val_token.text.to_string()))
+                            Expression::Identifier(
+                                Identifier::new(val_token.text.clone()).with_span(val_token.span),
+                            )
                         };
                         Some(Box::new(val_expr))
                     } else {
@@ -48827,7 +48999,10 @@ impl Parser {
             }
         } else {
             // Array literal: [1, 2, 3]
-            Ok(Some(Expression::Array(Box::new(Array { expressions }))))
+            Ok(Some(Expression::Array(Box::new(Array {
+                expressions,
+                inferred_type: None,
+            }))))
         }
     }
 
@@ -49497,7 +49672,7 @@ impl Parser {
             // Handle .* (qualified star) with modifiers
             if self.match_token(TokenType::Star) {
                 // Determine table name from the expression
-                let table_name = match &result {
+                let mut table_name = match &result {
                     Some(Expression::Column(col)) if col.table.is_none() => Some(col.name.clone()),
                     Some(Expression::Dot(dot)) => {
                         // For deep qualified names like schema.table.*, use the whole expression name
@@ -49520,6 +49695,9 @@ impl Parser {
                     }
                     _ => None,
                 };
+                if let Some(table) = &mut table_name {
+                    table.span = result.as_ref().and_then(Self::reference_span);
+                }
                 let star = self.parse_star_modifiers(table_name)?;
                 result = Some(Expression::Star(star));
                 break;
@@ -49539,7 +49717,7 @@ impl Parser {
                     name: token.text,
                     quoted: token.token_type == TokenType::QuotedIdentifier,
                     trailing_comments: Vec::new(),
-                    span: None,
+                    span: Some(token.span),
                 };
                 result = Some(Expression::Dot(Box::new(DotAccess {
                     this: result.take().unwrap(),
@@ -49619,7 +49797,7 @@ impl Parser {
             // If it's an identifier, wrap it in a Column expression
             match &field {
                 Expression::Identifier(id) => {
-                    return Ok(Some(Expression::boxed_column(Column {
+                    return Ok(Some(Self::parsed_column(Column {
                         name: id.clone(),
                         table: None,
                         join_mark: false,
@@ -50588,6 +50766,12 @@ impl Parser {
     /// Convert a DataType to its SQL string representation
     fn data_type_to_sql(&self, dt: &DataType) -> String {
         match dt {
+            DataType::Int128 => "INT128".to_string(),
+            DataType::UInt8 => "UTINYINT".to_string(),
+            DataType::UInt16 => "USMALLINT".to_string(),
+            DataType::UInt32 => "UINTEGER".to_string(),
+            DataType::UInt64 => "UBIGINT".to_string(),
+            DataType::UInt128 => "UINT128".to_string(),
             DataType::Boolean => "BOOLEAN".to_string(),
             DataType::TinyInt { length } => {
                 if let Some(n) = length {
@@ -51277,12 +51461,9 @@ impl Parser {
         // Allow keywords as identifiers in field context (e.g., "schema" as a field name)
         if self.check_keyword() {
             let token = self.advance();
-            return Ok(Some(Expression::Identifier(Identifier {
-                name: token.text,
-                quoted: false,
-                trailing_comments: Vec::new(),
-                span: None,
-            })));
+            return Ok(Some(Expression::Identifier(Self::identifier_from_token(
+                token, false,
+            ))));
         }
         Ok(None)
     }
@@ -51631,7 +51812,7 @@ impl Parser {
                         ident.quoted = true;
                         ident
                     } else {
-                        Identifier::new(alias_token.text.to_string())
+                        Identifier::new(alias_token.text.clone()).with_span(alias_token.span)
                     };
                     args.push(Expression::Alias(Box::new(crate::expressions::Alias {
                         this: expr,
@@ -51791,7 +51972,7 @@ impl Parser {
         };
 
         // Return the name as a Column expression
-        Ok(Some(Expression::boxed_column(Column {
+        Ok(Some(Self::parsed_column(Column {
             name: Identifier {
                 name: name.map(|n| n.name).unwrap_or_default(),
                 quoted: false,
@@ -52454,25 +52635,19 @@ impl Parser {
         }
 
         // Try to match Var token type
-        if self.match_token(TokenType::Var) {
-            let text = self.previous_text().to_string();
-            return Ok(Some(Expression::Identifier(Identifier {
-                name: text,
-                quoted: false,
-                trailing_comments: Vec::new(),
-                span: None,
-            })));
+        if self.check(TokenType::Var) {
+            return Ok(Some(Expression::Identifier(Self::identifier_from_token(
+                self.advance(),
+                false,
+            ))));
         }
 
         // Try to match string as identifier (some dialects allow this)
-        if self.match_token(TokenType::String) {
-            let text = self.previous_text().to_string();
-            return Ok(Some(Expression::Identifier(Identifier {
-                name: text,
-                quoted: true,
-                trailing_comments: Vec::new(),
-                span: None,
-            })));
+        if self.check(TokenType::String) {
+            return Ok(Some(Expression::Identifier(Self::identifier_from_token(
+                self.advance(),
+                true,
+            ))));
         }
 
         // Accept keywords as identifiers in some contexts
@@ -52497,16 +52672,12 @@ impl Parser {
     /// Python: if self._match(TokenType.IDENTIFIER): return self._identifier_expression(quoted=True)
     pub fn parse_identifier(&mut self) -> Result<Option<Expression>> {
         // Match quoted identifiers (e.g., "column_name" or `column_name`)
-        if self.match_token(TokenType::QuotedIdentifier) || self.match_token(TokenType::Identifier)
-        {
-            let text = self.previous_text().to_string();
-            let quoted = self.previous().token_type == TokenType::QuotedIdentifier;
-            return Ok(Some(Expression::Identifier(Identifier {
-                name: text,
+        if self.check(TokenType::QuotedIdentifier) || self.check(TokenType::Identifier) {
+            let quoted = self.peek().token_type == TokenType::QuotedIdentifier;
+            return Ok(Some(Expression::Identifier(Self::identifier_from_token(
+                self.advance(),
                 quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })));
+            ))));
         }
         Ok(None)
     }
@@ -53674,12 +53845,7 @@ impl Parser {
                 if self.is_identifier_token() {
                     let token = self.advance();
                     let quoted = token.token_type == TokenType::QuotedIdentifier;
-                    params.push(Identifier {
-                        name: token.text,
-                        quoted,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    });
+                    params.push(Self::identifier_from_token(token, quoted));
                 } else {
                     break;
                 }
@@ -54259,14 +54425,16 @@ impl Parser {
             };
             // Parse optional alias: (SELECT ...) AS y(col1, col2)
             if self.match_token(TokenType::As) {
-                let alias_name = self.expect_identifier_or_keyword()?;
-                subq.alias = Some(Identifier::new(alias_name));
+                let alias_name =
+                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                subq.alias = Some(alias_name);
                 // Parse optional column aliases: AS alias(col1, col2)
                 if self.match_token(TokenType::LParen) {
                     let mut cols = Vec::new();
                     loop {
-                        let col_name = self.expect_identifier_or_keyword()?;
-                        cols.push(Identifier::new(col_name));
+                        let col_name =
+                            self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                        cols.push(col_name);
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -54276,14 +54444,16 @@ impl Parser {
                 }
             } else if self.is_identifier_token() || self.is_safe_keyword_as_identifier() {
                 // Implicit alias without AS
-                let alias_name = self.expect_identifier_or_keyword()?;
-                subq.alias = Some(Identifier::new(alias_name));
+                let alias_name =
+                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                subq.alias = Some(alias_name);
                 // Parse optional column aliases: alias(col1, col2)
                 if self.match_token(TokenType::LParen) {
                     let mut cols = Vec::new();
                     loop {
-                        let col_name = self.expect_identifier_or_keyword()?;
-                        cols.push(Identifier::new(col_name));
+                        let col_name =
+                            self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                        cols.push(col_name);
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -54480,7 +54650,7 @@ impl Parser {
                                 if let Expression::Identifier(table_ident) = col {
                                     if let Some(col_expr) = self.parse_id_var()? {
                                         if let Expression::Identifier(col_ident) = col_expr {
-                                            Expression::boxed_column(Column {
+                                            Self::parsed_column(Column {
                                                 name: col_ident,
                                                 table: Some(table_ident),
                                                 join_mark: false,
@@ -54582,7 +54752,7 @@ impl Parser {
                                         // Parse the column part after the dot
                                         if let Some(col_expr) = self.parse_id_var()? {
                                             if let Expression::Identifier(col_ident) = col_expr {
-                                                Expression::boxed_column(Column {
+                                                Self::parsed_column(Column {
                                                     name: col_ident,
                                                     table: Some(table_ident),
                                                     join_mark: false,
@@ -55015,7 +55185,7 @@ impl Parser {
                     name: token.text,
                     quoted: token.token_type == TokenType::QuotedIdentifier,
                     trailing_comments: Vec::new(),
-                    span: None,
+                    span: Some(token.span),
                 });
             } else {
                 break;
@@ -55024,7 +55194,7 @@ impl Parser {
 
         // Build a Column expression from the parts
         let this = if parts.len() == 1 {
-            Expression::boxed_column(Column {
+            Self::parsed_column(Column {
                 name: parts.remove(0),
                 table: None,
                 join_mark: false,
@@ -55033,7 +55203,7 @@ impl Parser {
                 inferred_type: None,
             })
         } else if parts.len() == 2 {
-            Expression::boxed_column(Column {
+            Self::parsed_column(Column {
                 name: parts.remove(1),
                 table: Some(parts.remove(0)),
                 join_mark: false,
@@ -57839,11 +58009,12 @@ impl Parser {
                 self.skip(); // consume AS
                 let alias_token = self.advance();
                 let alias_name = if alias_token.token_type == TokenType::QuotedIdentifier {
-                    let mut ident = Identifier::new(alias_token.text.to_string());
+                    let mut ident =
+                        Identifier::new(alias_token.text.clone()).with_span(alias_token.span);
                     ident.quoted = true;
                     ident
                 } else {
-                    Identifier::new(alias_token.text.to_string())
+                    Identifier::new(alias_token.text.clone()).with_span(alias_token.span)
                 };
                 return Expression::Alias(Box::new(crate::expressions::Alias::new(
                     expr, alias_name,
@@ -59671,12 +59842,7 @@ impl Parser {
         if self.is_identifier_token() {
             let token = self.advance();
             let quoted = token.token_type == TokenType::QuotedIdentifier;
-            Some(Identifier {
-                name: token.text,
-                quoted,
-                trailing_comments: Vec::new(),
-                span: None,
-            })
+            Some(Self::identifier_from_token(token, quoted))
         } else {
             None
         }
@@ -59740,12 +59906,7 @@ impl Parser {
                 } else if self.is_safe_keyword_as_identifier() {
                     // ClickHouse: allow keywords like 'key' as column names in EXCEPT
                     let token = self.advance();
-                    columns.push(Identifier {
-                        name: token.text,
-                        quoted: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                    });
+                    columns.push(Self::identifier_from_token(token, false));
                 } else {
                     break;
                 }
@@ -60190,10 +60351,10 @@ impl Parser {
                 && !self.check(TokenType::Var)
             {
                 let token = self.advance();
-                return Ok(Some(Identifier::new(token.text)));
+                return Ok(Some(Identifier::new(token.text).with_span(token.span)));
             }
             let token = self.advance();
-            let mut alias = Identifier::new(token.text);
+            let mut alias = Identifier::new(token.text).with_span(token.span);
             if token.token_type == TokenType::QuotedIdentifier {
                 alias.quoted = true;
             }
@@ -60538,7 +60699,7 @@ impl Parser {
 
         let alias_token = self.advance();
         let is_quoted = alias_token.token_type == TokenType::QuotedIdentifier;
-        let mut alias_ident = Identifier::new(alias_token.text.to_string());
+        let mut alias_ident = Identifier::new(alias_token.text.clone()).with_span(alias_token.span);
         if is_quoted {
             alias_ident.quoted = true;
         }
@@ -61079,6 +61240,7 @@ impl Parser {
             position,
             sql_standard_syntax,
             position_explicit,
+            inferred_type: None,
         }))))
     }
 
@@ -63041,7 +63203,387 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_identifier_and_column_source_spans() {
+        use crate::DialectType;
+        fn check(value: &serde_json::Value, sql: &str, errors: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("name").is_some_and(|name| name.is_string())
+                        && fields.contains_key("quoted")
+                        && !fields.contains_key("args")
+                    {
+                        if let Some(span) = fields.get("span") {
+                            let span: Span = serde_json::from_value(span.clone()).unwrap();
+                            assert!(
+                                span.start < span.end && span.end <= sql.chars().count(),
+                                "{value} in {sql}"
+                            );
+                        } else {
+                            errors.push(format!("unpositioned identifier {value} in {sql}"));
+                        }
+                    }
+                    if let Some(column) = fields.get("column").filter(|v| v.is_object()) {
+                        if column.get("span").is_none() {
+                            errors.push(format!("unpositioned column {column} in {sql}"));
+                        }
+                    }
+                    for child in fields.values() {
+                        check(child, sql, errors);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        check(value, sql, errors);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut errors = Vec::new();
+        for dialect in [
+            DialectType::Snowflake,
+            DialectType::DuckDB,
+            DialectType::PostgreSQL,
+            DialectType::MySQL,
+            DialectType::TSQL,
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+        ] {
+            for sql in [
+                "SELECT customer_id, customer_id FROM orders",
+                "SELECT o.customer_id AS id FROM orders AS o WHERE o.customer_id > 1",
+                "SELECT o.customer_id id FROM orders o",
+                "WITH c(x) AS (SELECT customer_id FROM orders) SELECT c.x FROM c",
+                "SELECT schema_name.t.customer_id FROM schema_name.t",
+                "CREATE TABLE schema_name.orders (customer_id INT)",
+                "INSERT INTO orders (customer_id) SELECT customer_id FROM source_table",
+                "UPDATE orders SET customer_id = other_id WHERE customer_id > 1",
+                "SELECT date, time, timestamp, interval FROM orders",
+                "SELECT t.customer_id FROM orders t JOIN customers c USING (customer_id)",
+                "SELECT SUM(customer_id) OVER w FROM orders WINDOW w AS (PARTITION BY customer_id)",
+                "SELECT f(customer_id) AS result FROM (SELECT customer_id FROM orders) AS q(customer_id)",
+            ] {
+                let ast = crate::parse_one(sql, dialect)
+                    .unwrap_or_else(|e| panic!("{dialect:?}: {sql}: {e}"));
+                check(&serde_json::to_value(ast).unwrap(), sql, &mut errors);
+            }
+        }
+        for (dialect, sql) in [
+            (DialectType::BigQuery, "SELECT `customer_id` FROM my-project.dataset.orders"),
+            (DialectType::BigQuery, "SELECT elem FROM UNNEST(items) AS elem WITH OFFSET AS off"),
+            (DialectType::MySQL, "SELECT `o`.`customer_id` AS 'label' FROM `orders` AS `o`"),
+            (DialectType::MySQL, "CREATE TABLE t (customer_id INT, INDEX ix (customer_id(10)))"),
+            (DialectType::TSQL, "SELECT [o].[customer_id] AS [id] FROM [orders] [o]"),
+            (DialectType::Snowflake, "SELECT * EXCLUDE (customer_id) REPLACE (1 AS amount) RENAME (name AS label) FROM orders"),
+            (DialectType::ClickHouse, "SELECT from.x, date.x FROM orders"),
+            (DialectType::ClickHouse, "CREATE TABLE t (nested.x INT)"),
+            (DialectType::DuckDB, "SELECT list_transform(items, x -> x + 1) FROM orders"),
+        ] {
+            let ast = crate::parse_one(sql, dialect).unwrap_or_else(|e| panic!("{dialect:?}: {sql}: {e}"));
+            check(&serde_json::to_value(ast).unwrap(), sql, &mut errors);
+        }
+        errors.sort();
+        errors.dedup();
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn test_source_spans_preserve_token_coordinates_and_serialization() {
+        let sql =
+            "SELECT\n \"café😀\".\"a\"\"b\", /* gap */ \"café😀\".\"a\"\"b\" AS label FROM orders";
+        let ast = crate::parse_one(sql, crate::DialectType::Snowflake).unwrap();
+        let select = ast.as_select().unwrap();
+        let Expression::Column(first) = &select.expressions[0] else {
+            panic!("column")
+        };
+        let span = first.span.unwrap();
+        assert_eq!(span, Span::new(8, 22, 2, 16));
+        assert_eq!(
+            sql.chars()
+                .skip(span.start)
+                .take(span.end - span.start)
+                .collect::<String>(),
+            "\"café😀\".\"a\"\"b\""
+        );
+        let name_span = first.name.span.unwrap();
+        assert_eq!(
+            sql.chars()
+                .skip(name_span.start)
+                .take(name_span.end - name_span.start)
+                .collect::<String>(),
+            "\"a\"\"b\""
+        );
+        let Expression::Alias(alias) = &select.expressions[1] else {
+            panic!("alias")
+        };
+        let Expression::Column(second) = &alias.this else {
+            panic!("column")
+        };
+        assert_ne!(first.span, second.span);
+        assert_eq!(
+            first, second,
+            "source positions do not affect structural equality"
+        );
+        let encoded = serde_json::to_value(&ast).unwrap();
+        let decoded: Expression = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(encoded, serde_json::to_value(decoded).unwrap());
+    }
+
+    #[test]
+    fn test_source_spans_across_comments_statements_and_synthetic_aliases() {
+        let sql = "SELECT a /* qualifier */ . b;\nSELECT b FROM t";
+        let ast = crate::parse(sql, crate::DialectType::Snowflake).unwrap();
+        let Expression::Column(first) = &ast[0].as_select().unwrap().expressions[0] else {
+            panic!("column")
+        };
+        let span = first.span.unwrap();
+        assert_eq!(&sql[span.start..span.end], "a /* qualifier */ . b");
+        let Expression::Column(second) = &ast[1].as_select().unwrap().expressions[0] else {
+            panic!("column")
+        };
+        assert_eq!(second.span.unwrap().start, sql.rfind("b FROM").unwrap());
+        assert_eq!(second.span.unwrap().line, 2);
+
+        let ast = crate::parse_one(
+            "SELECT * FROM `project.dataset.INFORMATION_SCHEMA.TABLES`",
+            crate::DialectType::BigQuery,
+        )
+        .unwrap();
+        let Expression::Table(table) =
+            &ast.as_select().unwrap().from.as_ref().unwrap().expressions[0]
+        else {
+            panic!("table")
+        };
+        assert!(table.name.span.is_some());
+        assert!(
+            table.alias.as_ref().unwrap().span.is_none(),
+            "generated aliases have no source occurrence"
+        );
+    }
     use crate::traversal::ExpressionWalk;
+
+    #[test]
+    fn test_int128_data_types() {
+        use crate::dialects::DialectType;
+        for (dialect, name, output) in [
+            (DialectType::DuckDB, "HUGEINT", "INT128"),
+            (DialectType::DuckDB, "int128", "INT128"),
+            (DialectType::Generic, "INT128", "INT128"),
+            (DialectType::ClickHouse, "Int128", "Int128"),
+            (DialectType::StarRocks, "LARGEINT", "LARGEINT"),
+        ] {
+            let data_type = crate::parse_data_type(name, dialect).unwrap();
+            assert_eq!(data_type, DataType::Int128, "{dialect}: {name}");
+            let serialized = serde_json::to_value(&data_type).unwrap();
+            assert_eq!(serialized, serde_json::json!({"data_type": "int128"}));
+            assert_eq!(
+                serde_json::from_value::<DataType>(serialized).unwrap(),
+                data_type
+            );
+            assert_eq!(
+                crate::generate_data_type(&data_type, dialect).unwrap(),
+                output
+            );
+
+            let sql = format!("SELECT CAST(x AS {name})");
+            let expression = crate::parse_one(&sql, dialect).unwrap();
+            let cast = expression
+                .find(|e| matches!(e, Expression::Cast(_)))
+                .unwrap();
+            let Expression::Cast(cast) = cast else {
+                unreachable!()
+            };
+            assert_eq!(cast.to, DataType::Int128, "{sql}");
+            assert_eq!(
+                crate::generate(&expression, dialect).unwrap(),
+                format!("SELECT CAST(x AS {output})")
+            );
+        }
+
+        // Keep genuinely user-defined types distinct.
+        for name in ["LARGEINT", "my_type"] {
+            assert!(matches!(
+                crate::parse_data_type(name, DialectType::DuckDB).unwrap(),
+                DataType::Custom { .. }
+            ));
+        }
+        let legacy = DataType::Custom {
+            name: "HUGEINT".to_string(),
+        };
+        assert_eq!(
+            crate::generate_data_type(&legacy, DialectType::DuckDB).unwrap(),
+            "HUGEINT"
+        );
+        assert_eq!(
+            crate::generate_data_type(&DataType::Int128, DialectType::PostgreSQL).unwrap(),
+            "INT128"
+        );
+        assert!(crate::parse_data_type("HUGEINT SELECT 1", DialectType::DuckDB).is_err());
+    }
+
+    #[test]
+    fn test_unsigned_data_types_and_aliases() {
+        use crate::dialects::DialectType;
+        for (native, alias, expected, tag, output) in [
+            ("UTINYINT", "UINT8", DataType::UInt8, "uint8", "UTINYINT"),
+            (
+                "USMALLINT",
+                "UINT16",
+                DataType::UInt16,
+                "uint16",
+                "USMALLINT",
+            ),
+            ("UINTEGER", "UINT32", DataType::UInt32, "uint32", "UINTEGER"),
+            ("UBIGINT", "UINT64", DataType::UInt64, "uint64", "UBIGINT"),
+            (
+                "UHUGEINT",
+                "UINT128",
+                DataType::UInt128,
+                "uint128",
+                "UINT128",
+            ),
+        ] {
+            for name in [native, alias] {
+                let parsed = crate::parse_data_type(name, DialectType::DuckDB).unwrap();
+                assert_eq!(parsed, expected, "{name}");
+                let json = serde_json::to_value(&parsed).unwrap();
+                assert_eq!(json, serde_json::json!({"data_type": tag}));
+                assert_eq!(serde_json::from_value::<DataType>(json).unwrap(), expected);
+                assert_eq!(
+                    crate::generate_data_type(&parsed, DialectType::DuckDB).unwrap(),
+                    output
+                );
+                for sql in [
+                    format!("SELECT CAST(x AS {name})"),
+                    format!("SELECT x::{name}"),
+                    format!("SELECT {name} '1'"),
+                ] {
+                    let expr = crate::parse_one(&sql, DialectType::DuckDB)
+                        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                    let Expression::Cast(cast) =
+                        expr.find(|e| matches!(e, Expression::Cast(_))).unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(cast.to, expected, "{sql}");
+                }
+                let ddl =
+                    crate::parse_one(&format!("CREATE TABLE t(x {name})"), DialectType::DuckDB)
+                        .unwrap();
+                let Expression::CreateTable(table) = ddl else {
+                    unreachable!()
+                };
+                assert_eq!(table.columns[0].data_type, expected);
+                for nested in [
+                    format!("{name}[]"),
+                    format!("{name}[3]"),
+                    format!("STRUCT(x {name}, xs {name}[])"),
+                    format!("MAP({name}, {name}[])"),
+                ] {
+                    let dt = crate::parse_data_type(&nested, DialectType::DuckDB).unwrap();
+                    let encoded = serde_json::to_string(&dt).unwrap();
+                    assert!(encoded.contains(tag), "{nested}: {encoded}");
+                    assert!(!encoded.contains("custom"), "{nested}: {encoded}");
+                    let generated = crate::generate_data_type(&dt, DialectType::DuckDB).unwrap();
+                    assert_eq!(
+                        crate::parse_data_type(&generated, DialectType::DuckDB).unwrap(),
+                        dt
+                    );
+                }
+            }
+            let clickhouse = alias.replacen("UINT", "UInt", 1);
+            assert_eq!(
+                crate::parse_data_type(&clickhouse, DialectType::ClickHouse).unwrap(),
+                expected
+            );
+            assert_eq!(
+                crate::generate_data_type(&expected, DialectType::ClickHouse).unwrap(),
+                clickhouse
+            );
+            assert_eq!(
+                crate::generate_data_type(&expected, DialectType::PostgreSQL).unwrap(),
+                output
+            );
+            let wrapped =
+                crate::parse_data_type(&format!("Nullable({clickhouse})"), DialectType::ClickHouse)
+                    .unwrap();
+            assert_eq!(
+                wrapped,
+                DataType::Nullable {
+                    inner: Box::new(expected)
+                }
+            );
+            assert_eq!(
+                crate::generate_data_type(&wrapped, DialectType::ClickHouse).unwrap(),
+                format!("Nullable({clickhouse})")
+            );
+        }
+        // DuckDB INT8 means eight bytes, unlike UINT8's eight bits.
+        assert_eq!(
+            crate::transpile(
+                "SELECT CAST(x AS INT8), CAST(x AS UINT8)",
+                DialectType::DuckDB,
+                DialectType::DuckDB
+            )
+            .unwrap(),
+            vec!["SELECT CAST(x AS BIGINT), CAST(x AS UTINYINT)"]
+        );
+    }
+
+    #[test]
+    fn test_int128_nested_data_types() {
+        use crate::dialects::DialectType;
+        let array_type = DataType::Array {
+            element_type: Box::new(DataType::Int128),
+            dimension: None,
+        };
+        assert_eq!(
+            crate::parse_data_type("HUGEINT[]", DialectType::DuckDB).unwrap(),
+            array_type
+        );
+        let struct_type =
+            crate::parse_data_type("STRUCT(x HUGEINT, y HUGEINT[])", DialectType::DuckDB).unwrap();
+        let DataType::Struct { fields, .. } = &struct_type else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields[0].data_type, DataType::Int128);
+        assert_eq!(fields[1].data_type, array_type);
+        for name in [
+            "HUGEINT[]",
+            "HUGEINT[3]",
+            "STRUCT(x HUGEINT, y HUGEINT[])",
+            "MAP(HUGEINT, HUGEINT[])",
+        ] {
+            let data_type = crate::parse_data_type(name, DialectType::DuckDB).unwrap();
+            let sql = crate::generate_data_type(&data_type, DialectType::DuckDB).unwrap();
+            assert_eq!(
+                crate::parse_data_type(&sql, DialectType::DuckDB).unwrap(),
+                data_type
+            );
+            let expression =
+                crate::parse_one(&format!("SELECT CAST(x AS {name})"), DialectType::DuckDB)
+                    .unwrap();
+            let cast = expression
+                .find(|e| matches!(e, Expression::Cast(_)))
+                .unwrap();
+            let Expression::Cast(cast) = cast else {
+                unreachable!()
+            };
+            assert_eq!(cast.to, data_type);
+        }
+        let expression = crate::parse_one(
+            "CREATE TABLE t(h HUGEINT, hs HUGEINT[])",
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        let Expression::CreateTable(table) = expression else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(table.columns[0].data_type, DataType::Int128);
+        assert_eq!(table.columns[1].data_type, array_type);
+    }
 
     #[test]
     fn test_comment_before_limit() {
@@ -63099,6 +63641,117 @@ mod tests {
         let result = Parser::parse_sql("SELECT 1").unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].is_select());
+    }
+
+    #[test]
+    fn test_duckdb_explicit_string_projection_aliases() {
+        use crate::DialectType;
+
+        for (sql, name) in [
+            ("SELECT 1 AS 'item count'", "item count"),
+            ("SELECT 1 AS 'owner''s count'", "owner's count"),
+            ("SELECT 1 AS 'item \"count\"'", "item \"count\""),
+            ("SELECT 1 AS 'select'", "select"),
+            ("SELECT 1 AS '数量 🦆'", "数量 🦆"),
+            ("SELECT 'literal' AS 'label'", "label"),
+        ] {
+            let expression = crate::parse_one(sql, DialectType::DuckDB).unwrap();
+            let select = expression.as_select().unwrap();
+            let Expression::Alias(alias) = &select.expressions[0] else {
+                panic!("Expected projection alias for {sql}");
+            };
+            assert_eq!(alias.alias.name, name, "{sql}");
+            assert!(alias.alias.quoted, "{sql}");
+            assert!(alias.alias_explicit_as, "{sql}");
+            assert!(matches!(alias.this, Expression::Literal(_)), "{sql}");
+        }
+
+        let sql = "SELECT COUNT(*) FILTER (WHERE state = 'open') AS 'Open', \
+                   COUNT(*) FILTER (WHERE state = 'closed') AS 'Closed' FROM work_items";
+        let expression = crate::parse_one(sql, DialectType::DuckDB).unwrap();
+        let select = expression.as_select().unwrap();
+        assert_eq!(select.expressions.len(), 2);
+        for (projection, name) in select.expressions.iter().zip(["Open", "Closed"]) {
+            let Expression::Alias(alias) = projection else {
+                panic!("Expected filtered aggregate alias");
+            };
+            assert_eq!(alias.alias.name, name);
+            assert!(alias.alias.quoted);
+            let Expression::Count(count) = &alias.this else {
+                panic!("Expected COUNT expression");
+            };
+            assert!(count.star);
+            assert_eq!(
+                count.filter.as_ref().unwrap().sql_for(DialectType::DuckDB),
+                format!("state = '{}'", name.to_lowercase())
+            );
+        }
+
+        let sql = "SELECT 1 AS /* alias comment */ 'label'";
+        let expression = crate::parse_one(sql, DialectType::DuckDB).unwrap();
+        assert_eq!(
+            expression.sql_for(DialectType::DuckDB),
+            "SELECT 1 AS \"label\" /* alias comment */"
+        );
+    }
+
+    #[test]
+    fn test_duckdb_string_projection_alias_requires_as() {
+        for sql in [
+            "SELECT 1 'item count'",
+            "SELECT COUNT(*) 'item count' FROM events",
+            "SELECT 1 AS",
+            "SELECT 1 AS 123",
+        ] {
+            assert!(
+                crate::parse_one(sql, crate::DialectType::DuckDB).is_err(),
+                "Should reject {sql}"
+            );
+        }
+        let expression =
+            crate::parse_one("SELECT 'item count'", crate::DialectType::DuckDB).unwrap();
+        assert!(matches!(
+            &expression.as_select().unwrap().expressions[0],
+            Expression::Literal(literal) if matches!(literal.as_ref(), Literal::String(value) if value == "item count")
+        ));
+    }
+
+    #[test]
+    fn test_duckdb_empty_string_projection_alias() {
+        use crate::DialectType;
+
+        for sql in [
+            "SELECT 1 AS ''",
+            "SELECT 1 + 2 AS ''",
+            "SELECT 'literal' AS ''",
+            "SELECT created_at AS '' FROM events",
+        ] {
+            let expression = crate::parse_one(sql, DialectType::DuckDB).unwrap();
+            assert!(!expression
+                .dfs()
+                .any(|node| matches!(node, Expression::Alias(_))));
+            assert_eq!(
+                expression.sql_for(DialectType::DuckDB),
+                sql.replace(" AS ''", ""),
+                "{sql}"
+            );
+        }
+
+        for value in ["1", "created_at", "created_at + 1"] {
+            let sql = format!(
+                "SELECT {value} /* before */ AS /* after_as */ '' /* after_alias */ FROM events"
+            );
+            let expression = crate::parse_one(&sql, DialectType::DuckDB).unwrap();
+            assert!(!expression
+                .dfs()
+                .any(|node| matches!(node, Expression::Alias(_))));
+            let generated = expression.sql_for(DialectType::DuckDB);
+            for comment in ["/* before */", "/* after_as */", "/* after_alias */"] {
+                assert_eq!(generated.matches(comment).count(), 1, "{generated}");
+            }
+            assert!(!generated.contains("AS \"\""), "{generated}");
+            crate::parse_one(&generated, DialectType::DuckDB).unwrap();
+        }
     }
 
     #[test]

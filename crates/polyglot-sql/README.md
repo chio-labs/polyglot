@@ -25,7 +25,7 @@ By default, `polyglot-sql` enables the full public API. Parser-only consumers ca
 disable default features and opt into only the dialect parsers they need:
 
 ```toml
-polyglot-sql = { version = "0.9.2", default-features = false }
+polyglot-sql = { version = "0.10.0", default-features = false }
 ```
 
 ```toml
@@ -478,6 +478,11 @@ Athena, BigQuery, ClickHouse, CockroachDB, DataFusion, Databricks, Doris, Dremio
 | `planner` | Enable logical planning helpers |
 | `time` | Enable time-format conversion helpers |
 | `bindings` | Enable `ts-rs` TypeScript type generation |
+
+With `default-features = false`, `ast-tools` and `semantic` can be used without
+enabling `builder` or `generate`. AST transforms reuse the same internal mutation
+primitives as the native and serializable builders, while the public builder APIs
+remain gated by `builder`.
 
 ## License
 

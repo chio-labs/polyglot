@@ -15,6 +15,8 @@
 mod ast_children;
 pub mod ast_json;
 #[cfg(any(feature = "ast-tools", feature = "generate", feature = "semantic"))]
+mod ast_mutation;
+#[cfg(any(feature = "ast-tools", feature = "generate", feature = "semantic"))]
 pub mod ast_transforms;
 #[cfg(feature = "builder")]
 pub mod builder;
@@ -108,10 +110,11 @@ pub use optimizer::{
 pub use parser::Parser;
 #[cfg(all(feature = "semantic", feature = "generate"))]
 pub use query_analysis::{
-    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, CteFact, ProjectionFact,
-    ProjectionNullability, QueryAnalysis, QueryShape, ReferenceConfidence, RelationFact,
-    SetOperationBranchFact, SetOperationBranchRole, SetOperationFact, StarProjectionFact,
-    TransformFunctionFact, TransformKind,
+    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, ColumnUseContext, ColumnUseFact,
+    ColumnUseReferenceFact, CteFact, ProjectionFact, ProjectionNullability, QueryAnalysis,
+    QueryShape, QuerySourceSpan, ReferenceConfidence, RelationFact, SetOperationBranchFact,
+    SetOperationBranchRole, SetOperationFact, StarProjectionFact, TransformFunctionFact,
+    TransformKind,
 };
 #[cfg(feature = "semantic")]
 pub use resolver::{is_column_ambiguous, resolve_column, Resolver, ResolverError, ResolverResult};

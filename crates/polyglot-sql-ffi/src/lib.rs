@@ -44,4 +44,6 @@ pub use parse::{polyglot_parse, polyglot_parse_data_type, polyglot_parse_one};
 pub use query_analysis::polyglot_analyze_query;
 pub use tokenize::polyglot_tokenize;
 pub use transpile::{polyglot_transpile, polyglot_transpile_with_options};
-pub use validate::{polyglot_validate, polyglot_validate_with_options};
+pub use validate::{
+    polyglot_validate, polyglot_validate_with_options, polyglot_validate_with_schema,
+};

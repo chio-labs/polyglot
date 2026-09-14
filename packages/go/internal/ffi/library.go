@@ -20,6 +20,7 @@ type Library struct {
 	GenerateDataType         func(string, string) Result
 	Validate                 func(string, string) ValidationResult
 	ValidateWithOptions      func(string, string, string) ValidationResult
+	ValidateWithSchema       func(string, string, string, string) ValidationResult
 	Parse                    func(string, string) Result
 	ParseOne                 func(string, string) Result
 	ParseDataType            func(string, string) Result
@@ -42,10 +43,10 @@ type Library struct {
 	OpenLineageJobEvent      func(string, string) Result
 	OpenLineageRunEvent      func(string, string) Result
 	AnalyzeQuery             func(string, string) Result
-	DialectList              func() uintptr
+	DialectList              func() *byte
 	DialectCount             func() int32
-	Version                  func() uintptr
-	FreeString               func(uintptr)
+	Version                  func() *byte
+	FreeString               func(*byte)
 	FreeResult               func(Result)
 	FreeValidationResult     func(ValidationResult)
 }
@@ -92,6 +93,7 @@ func (l *Library) registerAll() error {
 		{"polyglot_generate_data_type", &l.GenerateDataType},
 		{"polyglot_validate", &l.Validate},
 		{"polyglot_validate_with_options", &l.ValidateWithOptions},
+		{"polyglot_validate_with_schema", &l.ValidateWithSchema},
 		{"polyglot_parse", &l.Parse},
 		{"polyglot_parse_one", &l.ParseOne},
 		{"polyglot_parse_data_type", &l.ParseDataType},

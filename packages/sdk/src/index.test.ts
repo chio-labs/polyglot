@@ -154,6 +154,32 @@ describe('Polyglot SDK', () => {
   });
 
   describe('parse', () => {
+    it('preserves identifier and column source spans across WASM', () => {
+      const result = parse('SELECT customer_id FROM orders', Dialect.Snowflake);
+      const tree = result.ast?.[0];
+      if (!tree || !('select' in tree)) throw new Error('Expected SELECT');
+      const expression = tree.select.expressions[0];
+      if (!expression || !('column' in expression))
+        throw new Error('Expected column');
+      const expected = { start: 7, end: 18, line: 1, column: 19 };
+      expect(expression.column.span).toEqual(expected);
+      expect(expression.column.name.span).toEqual(expected);
+    });
+
+    it('uses Unicode character offsets for qualified source spans', () => {
+      const sql = 'SELECT "é😀", "a"."b" FROM "t"';
+      const tree = parse(sql, Dialect.Snowflake).ast?.[0];
+      if (!tree || !('select' in tree)) throw new Error('Expected SELECT');
+      const expression = tree.select.expressions[1];
+      if (!expression || !('column' in expression))
+        throw new Error('Expected column');
+      const span = expression.column.span;
+      if (!span) throw new Error('Expected source span');
+      expect(Array.from(sql).slice(span.start, span.end).join('')).toBe(
+        '"a"."b"',
+      );
+    });
+
     it('should parse a simple SELECT statement', () => {
       const result = parse('SELECT 1', Dialect.Generic);
       expect(result.success).toBe(true);
@@ -198,6 +224,136 @@ describe('Polyglot SDK', () => {
       const generated = generate(parsed.ast, Dialect.TiDB);
       expect(generated.success).toBe(true);
       expect(generated.sql).toEqual([sql]);
+    });
+
+    it('should parse DuckDB EXTRACT date parts and infer their result types', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'events',
+            columns: [{ name: 'created_at', type: 'TIMESTAMP' }],
+          },
+        ],
+      };
+
+      for (const [datePart, expectedType] of [
+        ["'year'", 'BIGINT'],
+        ["'month'", 'BIGINT'],
+        ["'day'", 'BIGINT'],
+        ['YEAR', 'BIGINT'],
+        ["'second'", 'BIGINT'],
+        ["'epoch'", 'DOUBLE'],
+        ['EPOCH', 'DOUBLE'],
+        ["'EpOcH'", 'DOUBLE'],
+        ["'julian'", 'DOUBLE'],
+        ['JULIAN', 'DOUBLE'],
+        ["'JuLiAn'", 'DOUBLE'],
+      ]) {
+        const sql = `SELECT EXTRACT(${datePart} FROM created_at) AS extracted FROM events`;
+        const parsed = parse(sql, Dialect.DuckDB);
+        expect(parsed.success, sql).toBe(true);
+
+        const analysis = analyzeQuery(sql, {
+          dialect: Dialect.DuckDB,
+          schema,
+        });
+        expect(analysis.success, sql).toBe(true);
+        expect(analysis.analysis?.projections[0]).toMatchObject({
+          name: 'extracted',
+          typeHint: expectedType,
+        });
+      }
+    });
+
+    it('should parse DuckDB keyword relation aliases with and without AS', () => {
+      for (const template of [
+        'WITH ranked_items AS (SELECT 1 AS item_id) SELECT top.item_id FROM ranked_items {as}top',
+        'WITH ranked_items AS (SELECT 1 AS item_id), selected_items AS (SELECT 1 AS item_id) SELECT top.item_id FROM selected_items JOIN ranked_items {as}top ON top.item_id = selected_items.item_id',
+      ]) {
+        const expected = template.replace('{as}', 'AS ');
+        for (const asKeyword of ['', 'AS ']) {
+          const sql = template.replace('{as}', asKeyword);
+          const parsed = parse(sql, Dialect.DuckDB);
+          expect(parsed.success, sql).toBe(true);
+          expect(parsed.ast, sql).toHaveLength(1);
+
+          const generated = generate(parsed.ast, Dialect.DuckDB);
+          expect(generated.success, sql).toBe(true);
+          expect(generated.sql, sql).toEqual([expected]);
+        }
+      }
+    });
+
+    it('should accept DuckDB single-quoted projection aliases only after AS', () => {
+      for (const [sql, names, expectedSql] of [
+        [
+          "SELECT 1 AS 'item count'",
+          ['item count'],
+          'SELECT 1 AS "item count"',
+        ],
+        [
+          "SELECT 1 AS 'owner''s count'",
+          ["owner's count"],
+          'SELECT 1 AS "owner\'s count"',
+        ],
+        [
+          'SELECT 1 AS \'item "count"\'',
+          ['item "count"'],
+          'SELECT 1 AS "item ""count"""',
+        ],
+        [
+          "SELECT COUNT(*) FILTER (WHERE state = 'open') AS 'Open', COUNT(*) FILTER (WHERE state = 'closed') AS 'Closed' FROM work_items",
+          ['Open', 'Closed'],
+          'SELECT COUNT(*) FILTER(WHERE state = \'open\') AS "Open", COUNT(*) FILTER(WHERE state = \'closed\') AS "Closed" FROM work_items',
+        ],
+      ] as const) {
+        const parsed = parse(sql, Dialect.DuckDB);
+        expect(parsed.success, sql).toBe(true);
+        const aliases = sdk.ast
+          .findByType(parsed.ast![0], 'alias')
+          .filter(sdk.ast.isAlias);
+        expect(
+          aliases.map((node) => node.alias.alias.name),
+          sql,
+        ).toEqual(names);
+        for (const alias of aliases) {
+          expect(alias.alias.alias.quoted, sql).toBe(true);
+        }
+        const generated = generate(parsed.ast, Dialect.DuckDB);
+        expect(generated.success, sql).toBe(true);
+        expect(generated.sql, sql).toEqual([expectedSql]);
+        expect(transpile(sql, Dialect.DuckDB, Dialect.DuckDB).sql, sql).toEqual(
+          [expectedSql],
+        );
+        const analysis = analyzeQuery(sql, { dialect: Dialect.DuckDB });
+        expect(analysis.success, sql).toBe(true);
+        expect(
+          analysis.analysis?.projections.map((p) => p.name),
+          sql,
+        ).toEqual(names);
+      }
+      expect(parse("SELECT 1 'item count'", Dialect.DuckDB).success).toBe(
+        false,
+      );
+      for (const dialect of [Dialect.Generic, Dialect.PostgreSQL]) {
+        expect(parse("SELECT 1 AS 'item count'", dialect).success).toBe(false);
+      }
+    });
+
+    it('should normalize DuckDB empty string projection aliases to unnamed outputs', () => {
+      for (const sql of ["SELECT 1 AS ''", "SELECT 'literal' AS ''"]) {
+        const parsed = parse(sql, Dialect.DuckDB);
+        expect(parsed.success, sql).toBe(true);
+        expect(sdk.ast.findByType(parsed.ast![0], 'alias'), sql).toHaveLength(
+          0,
+        );
+        const generated = generate(parsed.ast, Dialect.DuckDB);
+        expect(generated.success, sql).toBe(true);
+        expect(generated.sql, sql).toEqual([sql.replace(" AS ''", '')]);
+        const analysis = analyzeQuery(sql, { dialect: Dialect.DuckDB });
+        expect(analysis.success, sql).toBe(true);
+        expect(analysis.analysis?.projections[0].name, sql).toBeNull();
+      }
     });
 
     it('should handle malformed SQL gracefully', () => {
@@ -286,6 +442,162 @@ describe('Polyglot SDK', () => {
   });
 
   describe('data types', () => {
+    it.each([
+      ['UTINYINT', 'UINT8', 'uint8', 'UTINYINT'],
+      ['USMALLINT', 'UINT16', 'uint16', 'USMALLINT'],
+      ['UINTEGER', 'UINT32', 'uint32', 'UINTEGER'],
+      ['UBIGINT', 'UINT64', 'uint64', 'UBIGINT'],
+      ['UHUGEINT', 'UINT128', 'uint128', 'UINT128'],
+    ] as const)('should preserve unsigned %s types across parsing, generation and cloning', (native, alias, tag, output) => {
+      const expected: sdk.DataType = { data_type: tag };
+      for (const name of [native, alias]) {
+        expect(parseDataType(name, Dialect.DuckDB).dataType).toEqual(expected);
+        expect(generateDataType(expected, Dialect.DuckDB)).toMatchObject({
+          success: true,
+          sql: output,
+        });
+        const nested = parseDataType(
+          `STRUCT(x ${name}, xs ${name}[])`,
+          Dialect.DuckDB,
+        );
+        expect(nested.success).toBe(true);
+        expect(JSON.stringify(nested.dataType)).toContain(
+          `"data_type":"${tag}"`,
+        );
+        expect(JSON.stringify(nested.dataType)).not.toContain('"custom"');
+        const ast = parse(`SELECT CAST(x AS ${name}[]) FROM t`, Dialect.DuckDB)
+          .ast![0];
+        const cloned = sdk.ast.clone(ast);
+        expect(cloned).toEqual(ast);
+        expect(generate([cloned], Dialect.DuckDB).success).toBe(true);
+      }
+    });
+
+    it('should expose DuckDB unsigned coercion and SUM promotion through the shared engine', () => {
+      const schema = {
+        tables: [
+          {
+            name: 't',
+            columns: [
+              { name: 's', type: 'BIGINT' },
+              { name: 'u', type: 'UBIGINT' },
+              { name: 'h', type: 'UHUGEINT' },
+              { name: 'd', type: 'DECIMAL(10,2)' },
+              { name: 'b', type: 'BOOLEAN' },
+            ],
+          },
+        ],
+      };
+      const cases: [string, Partial<sdk.DataType>][] = [
+        ['u', { data_type: 'uint64' }],
+        ['h', { data_type: 'uint128' }],
+        ['s + u', { data_type: 'int128' }],
+        ['u + s', { data_type: 'int128' }],
+        ['COALESCE(u, s)', { data_type: 'int128' }],
+        ['SUM(s)', { data_type: 'int128' }],
+        ['SUM(u)', { data_type: 'int128' }],
+        ['SUM(b)', { data_type: 'int128' }],
+        ['SUM(h)', { data_type: 'double' }],
+        ['SUM(d)', { data_type: 'decimal', precision: 38, scale: 2 }],
+        ['SUM(DISTINCT u)', { data_type: 'int128' }],
+        ['SUM(u) FILTER (WHERE TRUE)', { data_type: 'int128' }],
+        ['SUM(u) OVER ()', { data_type: 'int128' }],
+      ];
+      for (const [projection, expected] of cases) {
+        const sql = `SELECT ${projection} AS result FROM t`;
+        const result = sdk.annotateTypes(sql, Dialect.DuckDB, schema);
+        expect(result.success, sql).toBe(true);
+        const alias = sdk.ast.findByType(result.ast![0], 'alias')[0];
+        expect(sdk.ast.getInferredType(alias), sql).toMatchObject(expected);
+        expect(sdk.ast.clone(result.ast![0])).toEqual(result.ast![0]);
+      }
+      for (const [projection, typeHint] of [
+        ['u', 'UBIGINT'],
+        ['h', 'UINT128'],
+        ['SUM(s)', 'INT128'],
+      ]) {
+        const analysis = analyzeQuery(`SELECT ${projection} AS result FROM t`, {
+          dialect: Dialect.DuckDB,
+          schema,
+        });
+        expect(analysis.success).toBe(true);
+        expect(analysis.analysis?.projections[0].typeHint).toBe(typeHint);
+      }
+    });
+
+    it.each([
+      [Dialect.DuckDB, 'HUGEINT', 'INT128'],
+      [Dialect.DuckDB, 'INT128', 'INT128'],
+      [Dialect.ClickHouse, 'Int128', 'Int128'],
+      [Dialect.StarRocks, 'LARGEINT', 'LARGEINT'],
+    ])('should expose a first-class signed 128-bit type for %s %s', (dialect, name, sql) => {
+      const expected: sdk.DataType = { data_type: 'int128' };
+      const parsed = parseDataType(name, dialect);
+      expect(parsed.success).toBe(true);
+      expect(parsed.dataType).toEqual(expected);
+      expect(generateDataType(expected, dialect)).toMatchObject({
+        success: true,
+        sql,
+      });
+    });
+
+    it('should preserve signed 128-bit types in nested positions and cloning', () => {
+      for (const name of ['HUGEINT[]', 'STRUCT(x HUGEINT, xs HUGEINT[])']) {
+        const parsed = parseDataType(name, Dialect.DuckDB);
+        expect(parsed.success).toBe(true);
+        expect(JSON.stringify(parsed.dataType)).toContain(
+          '"data_type":"int128"',
+        );
+        expect(JSON.stringify(parsed.dataType)).not.toContain('"custom"');
+        const generated = generateDataType(parsed.dataType!, Dialect.DuckDB);
+        expect(generated.success).toBe(true);
+        expect(parseDataType(generated.sql!, Dialect.DuckDB).dataType).toEqual(
+          parsed.dataType,
+        );
+
+        const ast = parse(
+          `SELECT CAST(value AS ${name}) FROM measurements`,
+          Dialect.DuckDB,
+        ).ast![0];
+        const cloned = sdk.ast.clone(ast);
+        expect(cloned).toEqual(ast);
+        expect(sdk.ast.findByType(cloned, 'data_type')).toEqual([]);
+        expect(generate([cloned], Dialect.DuckDB).success).toBe(true);
+      }
+    });
+
+    it('should infer signed 128-bit schema columns, casts and numeric widening', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'measurements',
+            columns: [
+              { name: 'wide', type: 'HUGEINT' },
+              { name: 'value', type: 'BIGINT' },
+            ],
+          },
+        ],
+      };
+      for (const projection of [
+        'wide',
+        'CAST(value AS HUGEINT)',
+        'wide + value',
+        'COALESCE(value, wide)',
+      ]) {
+        const result = sdk.annotateTypes(
+          `SELECT ${projection} AS widened FROM measurements`,
+          Dialect.DuckDB,
+          schema,
+        );
+        expect(result.success).toBe(true);
+        const alias = sdk.ast.findByType(result.ast![0], 'alias')[0];
+        expect(sdk.ast.getInferredType(alias)).toEqual({ data_type: 'int128' });
+        const cloned = sdk.ast.clone(result.ast![0]);
+        expect(cloned).toEqual(result.ast![0]);
+        expect(generate([cloned], Dialect.DuckDB).success).toBe(true);
+      }
+    });
+
     it('should parse a standalone data type', () => {
       const result = parseDataType('DECIMAL(10, 2)', Dialect.DuckDB);
 
@@ -497,6 +809,65 @@ describe('Polyglot SDK', () => {
   });
 
   describe('analyzeQuery', () => {
+    it('exposes scoped column uses and Unicode occurrence spans through both WASM transports', () => {
+      const sql =
+        "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1";
+      const result = analyzeQuery(sql, { dialect: 'duckdb' });
+      expect(result.success).toBe(true);
+      const uses = result.analysis?.columnUses;
+      expect(uses).toHaveLength(1);
+      const fact = uses?.[0];
+      expect(fact).toMatchObject({
+        context: 'filter',
+        scopePath: 'root',
+        expressionPath: 'where_clause.this',
+      });
+      expect(fact?.references).toHaveLength(2);
+      expect(fact?.references[0].span).not.toEqual(fact?.references[1].span);
+      for (const reference of fact?.references ?? []) {
+        expect(reference).toMatchObject({
+          sourceName: 'orders',
+          sourceAlias: 'o',
+          column: 'amount',
+          confidence: 'resolved',
+        });
+        expect(
+          Array.from(sql)
+            .slice(reference.span?.start, reference.span?.end)
+            .join(''),
+        ).toBe('o.amount');
+      }
+      const json = JSON.parse(
+        wasmModule.analyze_query(sql, JSON.stringify({ dialect: 'duckdb' })),
+      );
+      expect(json.analysis.columnUses).toEqual(uses);
+      expect(
+        result.analysis?.projections[1].upstream.map((ref) => ref.column),
+      ).toEqual(['id']);
+      expect(analyzeQuery('SELECT 1').analysis?.columnUses).toEqual([]);
+    });
+
+    it('keeps CTE predicates and set-operation filter inputs distinguishable', () => {
+      const result = analyzeQuery(
+        'WITH base AS (SELECT id, amount FROM orders) SELECT id FROM base WHERE amount > 0 EXCEPT SELECT id FROM blocked',
+        { dialect: 'duckdb' },
+      );
+      expect(result.success).toBe(true);
+      const uses = result.analysis?.columnUses ?? [];
+      expect(uses.find((fact) => fact.context === 'filter')).toMatchObject({
+        scopePath: 'root.branches[0]',
+        references: [
+          { table: 'orders', column: 'amount', confidence: 'resolved' },
+        ],
+      });
+      expect(
+        uses.find((fact) => fact.context === 'set_operation_filter'),
+      ).toMatchObject({
+        scopePath: 'root.branches[1]',
+        references: [{ table: 'blocked', column: 'id' }],
+      });
+    });
+
     it('should return compact projection facts', () => {
       const result = analyzeQuery('SELECT a FROM t');
 
@@ -519,6 +890,389 @@ describe('Polyglot SDK', () => {
       expect(
         result.analysis?.projections.map(({ transformKind }) => transformKind),
       ).toEqual(['aggregation', 'aggregation', 'aggregation']);
+    });
+
+    it('should expose the DuckDB MEDIAN result type with a schema', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'values_table',
+            columns: [{ name: 'x', type: 'DOUBLE' }],
+          },
+        ],
+      };
+      const sql = 'SELECT MEDIAN(x) AS median_x FROM values_table';
+
+      const analysis = analyzeQuery(sql, {
+        dialect: Dialect.DuckDB,
+        schema,
+      });
+      expect(analysis.success).toBe(true);
+      expect(analysis.analysis?.projections[0]).toMatchObject({
+        transformKind: 'aggregation',
+        typeHint: 'DOUBLE',
+      });
+
+      const annotated = sdk.annotateTypes(sql, Dialect.DuckDB, schema);
+      expect(annotated.success).toBe(true);
+      const median = sdk.ast.findByType(annotated.ast![0], 'median')[0];
+      expect(sdk.ast.getInferredType(median)).toMatchObject({
+        data_type: 'double',
+      });
+    });
+
+    it('should expose DuckDB TRIM node types with and without a schema', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'records',
+            columns: [
+              { name: 'name', type: 'VARCHAR' },
+              { name: 'chars', type: 'VARCHAR' },
+              { name: 'values_json', type: 'JSON' },
+            ],
+          },
+        ],
+      };
+      for (const functionSql of [
+        'TRIM(name)',
+        `TRIM(BOTH '"' FROM values_json->>0)`,
+        'TRIM(LEADING chars FROM name)',
+        'TRIM(TRAILING chars FROM name)',
+        'TRIM(LOWER(TRIM(name)), UPPER(chars))',
+        'TRIM(NULL)',
+      ]) {
+        const sql = `SELECT ${functionSql} AS normalized FROM records`;
+        for (const inputSchema of [schema, undefined]) {
+          const annotated = sdk.annotateTypes(sql, Dialect.DuckDB, inputSchema);
+          expect(annotated.success, sql).toBe(true);
+          const trims = sdk.ast.findByType(annotated.ast![0], 'trim');
+          expect(trims.length, sql).toBeGreaterThan(0);
+          for (const trim of trims) {
+            expect(sdk.ast.getInferredType(trim), sql).toMatchObject({
+              data_type: 'var_char',
+            });
+          }
+          const projection = sdk.ast.findByType(annotated.ast![0], 'alias')[0];
+          expect(sdk.ast.getInferredType(projection), sql).toMatchObject({
+            data_type: 'var_char',
+          });
+          for (const type of ['lower', 'upper', 'column'] as const) {
+            for (const child of sdk.ast.findByType(annotated.ast![0], type)) {
+              // JSON extraction has independent annotation gaps; here check
+              // the directly traversable string arguments and their children.
+              if (functionSql.includes('values_json')) continue;
+              const inferred = sdk.ast.getInferredType(child);
+              if (type === 'column' && !inputSchema) {
+                expect(inferred, sql).toBeUndefined();
+              } else {
+                expect(inferred, sql).toMatchObject({ data_type: 'var_char' });
+              }
+            }
+          }
+
+          const analysis = analyzeQuery(sql, {
+            dialect: Dialect.DuckDB,
+            schema: inputSchema,
+          });
+          expect(analysis.success, sql).toBe(true);
+          expect(analysis.analysis?.projections[0], sql).toMatchObject({
+            name: 'normalized',
+            typeHint: 'TEXT',
+          });
+        }
+      }
+    });
+
+    it('should infer DuckDB REGEXP_EXTRACT_ALL list and named-capture types', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'documents',
+            columns: [{ name: 'body', type: 'VARCHAR' }],
+          },
+        ],
+      };
+      const varchar = { data_type: 'var_char' };
+      const captures = {
+        data_type: 'struct',
+        fields: [
+          { name: 'letter', data_type: varchar },
+          { name: 'number', data_type: varchar },
+        ],
+      };
+      for (const [argumentsSql, elementType, typeHint] of [
+        ["body, '[0-9]+'", varchar, 'TEXT'],
+        ["NULL, '[0-9]+'", varchar, 'TEXT'],
+        ["body, '([a-z])([0-9]+)', 2, 'i'", varchar, 'TEXT'],
+        [
+          "body, '([a-z])([0-9]+)', ['letter', 'number']",
+          captures,
+          'STRUCT(letter TEXT, number TEXT)',
+        ],
+        [
+          "body, '([a-z])([0-9]+)', (['letter', 'number']), 'i'",
+          captures,
+          'STRUCT(letter TEXT, number TEXT)',
+        ],
+      ] as const) {
+        const arrayType = { data_type: 'array', element_type: elementType };
+        for (const unnest of [false, true]) {
+          const functionSql = `REGEXP_EXTRACT_ALL(${argumentsSql})`;
+          const sql = `SELECT ${unnest ? `UNNEST(${functionSql})` : functionSql} AS matches FROM documents`;
+          for (const inputSchema of [schema, undefined]) {
+            const annotated = sdk.annotateTypes(
+              sql,
+              Dialect.DuckDB,
+              inputSchema,
+            );
+            expect(annotated.success, sql).toBe(true);
+            const functions = sdk.ast.findByType(annotated.ast![0], 'function');
+            const extraction = functions.find(
+              (node) =>
+                sdk.ast.isFunction(node) &&
+                node.function.name === 'REGEXP_EXTRACT_ALL',
+            );
+            expect(extraction, sql).toBeDefined();
+            expect(sdk.ast.getInferredType(extraction!), sql).toMatchObject(
+              arrayType,
+            );
+            const projection = sdk.ast.findByType(
+              annotated.ast![0],
+              'alias',
+            )[0];
+            expect(sdk.ast.getInferredType(projection), sql).toMatchObject(
+              unnest ? elementType : arrayType,
+            );
+            const analysis = analyzeQuery(sql, {
+              dialect: Dialect.DuckDB,
+              schema: inputSchema,
+            });
+            expect(analysis.success, sql).toBe(true);
+            expect(analysis.analysis?.projections[0], sql).toMatchObject({
+              name: 'matches',
+              typeHint: unnest ? typeHint : `${typeHint}[]`,
+            });
+          }
+        }
+      }
+    });
+
+    it('should infer DuckDB MONTHNAME and DAYNAME results as strings', () => {
+      for (const type of ['DATE', 'TIMESTAMP', 'TIMESTAMPTZ']) {
+        const schema = {
+          tables: [
+            {
+              name: 'events',
+              columns: [{ name: 'created_at', type }],
+            },
+          ],
+        };
+        for (const functionName of ['MONTHNAME', 'DAYNAME']) {
+          const sql = `SELECT ${functionName}(created_at) AS label FROM events`;
+          for (const inputSchema of [schema, undefined]) {
+            const annotated = sdk.annotateTypes(
+              sql,
+              Dialect.DuckDB,
+              inputSchema,
+            );
+            expect(annotated.success, sql).toBe(true);
+            const projection = sdk.ast.findByType(
+              annotated.ast![0],
+              'alias',
+            )[0];
+            expect(projection, sql).toBeDefined();
+            const expression = sdk.ast.isAlias(projection)
+              ? projection.alias.this
+              : projection;
+            for (const node of [expression, projection]) {
+              expect(sdk.getInferredType(node), sql).toMatchObject({
+                data_type: 'var_char',
+              });
+            }
+            const analysis = analyzeQuery(sql, {
+              dialect: Dialect.DuckDB,
+              schema: inputSchema,
+            });
+            expect(analysis.success, sql).toBe(true);
+            expect(analysis.analysis?.projections[0], sql).toMatchObject({
+              name: 'label',
+              typeHint: 'TEXT',
+            });
+            if (inputSchema) {
+              expect(analysis.analysis?.projections[0].upstream, sql).toEqual(
+                expect.arrayContaining([
+                  expect.objectContaining({
+                    table: 'events',
+                    column: 'created_at',
+                  }),
+                ]),
+              );
+            }
+          }
+        }
+      }
+    });
+
+    it('should infer DuckDB ARRAY_TO_STRING results as scalar strings', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'events',
+            columns: [
+              { name: 'labels', type: 'VARCHAR[]' },
+              { name: 'label', type: 'VARCHAR' },
+            ],
+          },
+        ],
+      };
+      for (const functionSql of [
+        "ARRAY_TO_STRING(labels, ', ')",
+        "ARRAY_TO_STRING(ARRAY_AGG(label), ', ')",
+        'ARRAY_TO_STRING_COMMA_DEFAULT(labels)',
+        'ARRAY_TO_STRING_COMMA_DEFAULT(ARRAY_AGG(label))',
+      ]) {
+        const sql = `SELECT ${functionSql} AS label_text FROM events`;
+        for (const inputSchema of [schema, undefined]) {
+          const annotated = sdk.annotateTypes(sql, Dialect.DuckDB, inputSchema);
+          expect(annotated.success, sql).toBe(true);
+          const projection = sdk.ast.findByType(annotated.ast![0], 'alias')[0];
+          expect(projection, sql).toBeDefined();
+          expect(sdk.ast.getInferredType(projection), sql).toMatchObject({
+            data_type: 'var_char',
+          });
+          const expression = sdk.ast.isAlias(projection)
+            ? projection.alias.this
+            : projection;
+          expect(sdk.ast.getInferredType(expression), sql).toMatchObject({
+            data_type: 'var_char',
+          });
+
+          const analysis = analyzeQuery(sql, {
+            dialect: Dialect.DuckDB,
+            schema: inputSchema,
+          });
+          expect(analysis.success, sql).toBe(true);
+          expect(analysis.analysis?.projections[0], sql).toMatchObject({
+            name: 'label_text',
+            typeHint: 'TEXT',
+          });
+        }
+      }
+    });
+
+    it('should infer DuckDB ARRAY, CASE, and UNNEST result types', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'events',
+            columns: [
+              { name: 'created_at', type: 'TIMESTAMP' },
+              { name: 'closed_at', type: 'TIMESTAMP' },
+            ],
+          },
+        ],
+      };
+      const sql = `SELECT UNNEST(
+        CASE
+          WHEN closed_at IS NULL THEN ARRAY[created_at]
+          ELSE ARRAY[created_at, closed_at]
+        END
+      ) AS event_at
+      FROM events`;
+
+      const analysis = analyzeQuery(sql, {
+        dialect: Dialect.DuckDB,
+        schema,
+      });
+      expect(analysis.success).toBe(true);
+      expect(analysis.analysis?.projections[0]).toMatchObject({
+        name: 'event_at',
+        typeHint: 'TIMESTAMP',
+      });
+      expect(analysis.analysis?.projections[0].upstream).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ table: 'events', column: 'created_at' }),
+          expect.objectContaining({ table: 'events', column: 'closed_at' }),
+        ]),
+      );
+
+      const annotated = sdk.annotateTypes(sql, Dialect.DuckDB, schema);
+      expect(annotated.success).toBe(true);
+
+      const arrays = sdk.ast.findByType(annotated.ast![0], 'array_func');
+      expect(arrays).toHaveLength(2);
+      for (const array of arrays) {
+        expect(sdk.ast.getInferredType(array)).toMatchObject({
+          data_type: 'array',
+          element_type: { data_type: 'timestamp' },
+        });
+      }
+
+      const caseExpression = sdk.ast.findByType(annotated.ast![0], 'case')[0];
+      expect(sdk.ast.getInferredType(caseExpression)).toMatchObject({
+        data_type: 'array',
+        element_type: { data_type: 'timestamp' },
+      });
+
+      const unnest = sdk.ast.findByType(annotated.ast![0], 'function')[0];
+      expect(sdk.ast.getExprData(unnest).name).toBe('UNNEST');
+      expect(sdk.ast.getInferredType(unnest)).toMatchObject({
+        data_type: 'timestamp',
+      });
+    });
+
+    it('should preserve inferred types through transparent wrappers', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'flags',
+            columns: [{ name: 'flag', type: 'BOOLEAN' }],
+          },
+        ],
+      };
+      const sql =
+        "SELECT (CASE WHEN flag THEN 'yes' ELSE 'no' END) AS label FROM flags";
+
+      const analysis = analyzeQuery(sql, {
+        dialect: Dialect.DuckDB,
+        schema,
+      });
+      expect(analysis.success).toBe(true);
+      expect(analysis.analysis?.projections[0]).toMatchObject({
+        name: 'label',
+        typeHint: 'TEXT',
+      });
+
+      const annotated = sdk.annotateTypes(sql, Dialect.DuckDB, schema);
+      expect(annotated.success).toBe(true);
+      const paren = sdk.ast.findByType(annotated.ast![0], 'paren')[0];
+      const caseExpression = sdk.ast.findByType(annotated.ast![0], 'case')[0];
+      const column = sdk.ast.findByType(annotated.ast![0], 'column')[0];
+
+      expect(sdk.ast.getInferredType(paren)).toMatchObject({
+        data_type: 'var_char',
+      });
+      expect(sdk.ast.getInferredType(caseExpression)).toMatchObject({
+        data_type: 'var_char',
+      });
+      expect(sdk.ast.getInferredType(column)).toMatchObject({
+        data_type: 'boolean',
+      });
+
+      const withComment = sdk.annotateTypes(
+        "SELECT CASE WHEN flag THEN 'yes' ELSE 'no' END /*tail*/ FROM flags",
+        Dialect.DuckDB,
+        schema,
+      );
+      expect(withComment.success).toBe(true);
+      const commentWrapper = sdk.ast.findByType(
+        withComment.ast![0],
+        'annotated',
+      )[0];
+      expect(sdk.ast.getInferredType(commentWrapper)).toMatchObject({
+        data_type: 'var_char',
+      });
     });
 
     it('should classify DuckDB null-preserving arg extrema as aggregations', () => {

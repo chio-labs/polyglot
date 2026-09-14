@@ -123,6 +123,29 @@ if result:
     print("valid")
 ```
 
+Schema-aware validation uses the same Rust validator as the TypeScript SDK:
+
+```python
+sql = "SELECT o.order_id FROM orders o WHERE o.missing_column = TRUE"
+schema = {"tables": [{"name": "orders", "columns": [{"name": "order_id", "type": "INT"}]}]}
+result = polyglot_sql.validate_with_schema(
+    sql, schema, dialect="snowflake", check_types=True, check_references=True,
+)
+for error in result.errors:
+    print(error.code, error.message)
+    if error.start is not None and error.end is not None:
+        print(sql[error.start:error.end])
+```
+
+Unknown tables, columns and aliases are checked by default. `check_references`
+also checks ambiguous columns and foreign-key metadata; `check_types` enables
+type checks. `strict` overrides the schema's `strict` value, which defaults to
+`True`; `strict=False` reports reference/type findings as warnings. An empty
+column list or a `*` column denotes an open schema, so unknown columns are not
+rejected solely because their names are absent. Nonempty lists without `*`
+are treated as complete. Options use snake_case keyword arguments, not an
+`options` dictionary. Invalid schemas and unknown dialects raise `ValueError`.
+
 ```python
 options = {
     "producer": "https://github.com/tobilg/polyglot",
@@ -167,6 +190,26 @@ print(analysis["projections"][0]["nullability"])    # "non_null"
 print(analysis["baseTables"][0]["name"])            # "orders"
 print(analysis["baseTables"][0]["table"])           # "orders"
 ```
+
+Non-projection uses are available through the same shared Rust analysis:
+
+```python
+analysis = polyglot_sql.analyze_query(
+    "SELECT o.id FROM orders o WHERE o.amount > 0", dialect="duckdb"
+)
+use = analysis["columnUses"][0]
+print(use["context"])                          # "filter"
+print(use["references"][0]["column"])          # "amount"
+print(use["scopePath"])                        # "root"
+```
+
+`columnUses` groups references by clause expression without changing projection
+lineage. It covers joins, filters, grouping, HAVING/QUALIFY, window keys/frames,
+ordering and set-operation filter inputs. `scopePath`/`expressionPath` identify
+the scope and expression; `expressionSql` is dialect-rendered SQL. Optional
+`span` objects use half-open Unicode-character offsets in the original input.
+Reference spans locate uses, not upstream definitions. Unknown or ambiguous
+sources remain conservative; whole-expression spans are omitted when unavailable.
 
 `analysis["relations"]` reports sources visible in the analyzed scope.
 `analysis["baseTables"]` reports deduplicated physical table dependencies across
@@ -232,6 +275,7 @@ All functions are exported from `polyglot_sql`.
 - `format_sql(sql: str, dialect: str = "generic", *, max_input_bytes: int | None = None, max_tokens: int | None = None, max_ast_nodes: int | None = None, max_set_op_chain: int | None = None) -> str`
 - `format(sql: str, dialect: str = "generic", *, max_input_bytes: int | None = None, max_tokens: int | None = None, max_ast_nodes: int | None = None, max_set_op_chain: int | None = None) -> str` (alias of `format_sql`)
 - `validate(sql: str, dialect: str = "generic", *, strict_syntax: bool = False, semantic: bool = False) -> ValidationResult`
+- `validate_with_schema(sql: str, schema: dict, dialect: str = "generic", *, check_types: bool = False, check_references: bool = False, strict: bool | None = None, semantic: bool = False, strict_syntax: bool = False) -> ValidationResult`
 - `optimize(sql: str, dialect: str = "generic") -> str`
 - `lineage(column: str, sql: str, dialect: str = "generic") -> dict`
 - `lineage_at(ordinal: int, sql: str, dialect: str = "generic") -> dict`
@@ -267,7 +311,8 @@ Exception hierarchy:
 
 Unknown dialect names raise built-in `ValueError`.
 
-`validate(...)` returns `ValidationResult`:
+`validate(...)` and `validate_with_schema(...)` return `ValidationResult`:
+
 - `result.valid: bool`
 - `result.errors: list[ValidationErrorInfo]`
 - `bool(result)` works (`True` when valid)
@@ -278,11 +323,19 @@ clause boundaries. `semantic=True` adds warning diagnostics W001-W004 for
 `LIMIT` without `ORDER BY`; warnings do not make the result invalid.
 
 Each `ValidationErrorInfo` has:
+
 - `message: str`
 - `line: int`
 - `col: int`
 - `code: str`
 - `severity: str`
+- `start: int | None` (zero-based Unicode character offset)
+- `end: int | None` (exclusive Unicode character offset)
+
+Source ranges refer to the original SQL and support Python string slicing.
+Reference diagnostics point to the offending identifier when available;
+synthetic or schema-only findings have no source range. Existing `line` and
+`col` fields remain integers and use `0` when unavailable.
 
 ## Performance Note
 

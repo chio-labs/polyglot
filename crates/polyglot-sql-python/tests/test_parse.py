@@ -5,6 +5,34 @@ import pytest
 import polyglot_sql
 
 
+@pytest.mark.parametrize(
+    "dialect", ["snowflake", "duckdb", "postgres", "mysql", "tsql", "bigquery"]
+)
+def test_parse_preserves_identifier_and_column_spans(dialect):
+    sql = "SELECT customer_id FROM orders"
+    token = next(
+        t for t in polyglot_sql.tokenize(sql, dialect=dialect)
+        if t["text"] == "customer_id"
+    )
+    ast = polyglot_sql.parse_one(sql, dialect=dialect).to_dict()
+    column = ast["select"]["expressions"][0]["column"]
+    assert column["span"] == token["span"] == {
+        "start": 7, "end": 18, "line": 1, "column": 19
+    }
+    assert column["name"]["span"] == token["span"]
+    assert "span" in ast["select"]["from"]["expressions"][0]["table"]["name"]
+
+
+def test_parse_spans_use_unicode_character_offsets_and_do_not_affect_equality():
+    sql = 'SELECT "é😀", "a"."b" FROM "t"'
+    ast = polyglot_sql.parse_one(sql, dialect="snowflake").to_dict()
+    column = ast["select"]["expressions"][1]["column"]
+    span = column["span"]
+    assert sql[span["start"] : span["end"]] == '"a"."b"'
+    assert polyglot_sql.parse_one("x") == polyglot_sql.parse_one("   x")
+    assert "span" not in polyglot_sql.column("x").to_dict()["column"]["name"]
+
+
 def test_parse_single_select_returns_list_of_expressions():
     ast_list = polyglot_sql.parse("SELECT 1", dialect="postgres")
     assert isinstance(ast_list, list)
@@ -125,6 +153,48 @@ def test_parse_data_type_returns_data_type_expression():
 
     assert isinstance(data_type, polyglot_sql.DataType)
     assert data_type.sql("duckdb") == "DECIMAL(10, 2)"
+
+
+@pytest.mark.parametrize(
+    "dialect,name,expected_sql",
+    [
+        ("duckdb", "HUGEINT", "INT128"),
+        ("duckdb", "INT128", "INT128"),
+        ("clickhouse", "Int128", "Int128"),
+        ("starrocks", "LARGEINT", "LARGEINT"),
+    ],
+)
+def test_parse_data_type_int128(dialect, name, expected_sql):
+    data_type = polyglot_sql.parse_data_type(name, dialect=dialect)
+    assert isinstance(data_type, polyglot_sql.DataType)
+    assert data_type.to_dict() == {"data_type": {"data_type": "int128"}}
+    assert data_type.sql(dialect) == expected_sql
+
+
+def test_parse_data_type_nested_int128():
+    data_type = polyglot_sql.parse_data_type("HUGEINT[]", dialect="duckdb")
+    assert data_type.to_dict()["data_type"]["element_type"] == {"data_type": "int128"}
+    assert data_type.sql("duckdb") == "INT128[]"
+
+
+@pytest.mark.parametrize(
+    "native,alias,tag,output",
+    [
+        ("UTINYINT", "UINT8", "uint8", "UTINYINT"),
+        ("USMALLINT", "UINT16", "uint16", "USMALLINT"),
+        ("UINTEGER", "UINT32", "uint32", "UINTEGER"),
+        ("UBIGINT", "UINT64", "uint64", "UBIGINT"),
+        ("UHUGEINT", "UINT128", "uint128", "UINT128"),
+    ],
+)
+def test_parse_data_type_unsigned(native, alias, tag, output):
+    for name in (native, alias):
+        data_type = polyglot_sql.parse_data_type(name, dialect="duckdb")
+        assert data_type.to_dict() == {"data_type": {"data_type": tag}}
+        assert data_type.sql("duckdb") == output
+        nested = polyglot_sql.parse_data_type(f"{name}[]", dialect="duckdb")
+        assert nested.to_dict()["data_type"]["element_type"] == {"data_type": tag}
+        assert nested.sql("duckdb") == f"{output}[]"
 
 
 def test_parse_one_into_data_type_matches_sqlglot_compatibility_path():

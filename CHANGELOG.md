@@ -4,6 +4,108 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.10.0] - Unreleased
+
+### Added
+
+- Query analysis now reports scoped, non-projection `columnUses` across Rust,
+  Python, C FFI, Go, WASM, and TypeScript. Uses cover joins, filters, grouping,
+  HAVING/QUALIFY, window partition/order/frame expressions, ordering,
+  aggregate-local filters and ordering, and set-operation filter inputs without
+  changing projection lineage. Facts include expression SQL, deterministic
+  scope/expression paths, upstream references, confidence, and optional original
+  source ranges, preserving repeated occurrences and conservative resolution.
+- Schema-aware validation is now exposed in Python through
+  `validate_with_schema`, C through `polyglot_validate_with_schema`, and Go
+  through client and package-level `ValidateWithSchema` APIs. These use the same
+  Rust validator as the existing WASM/TypeScript APIs and support optional type,
+  reference, strict-syntax, and semantic checks. Python validation findings now
+  also expose optional `start`/`end` source offsets.
+- First-class signed 128-bit and unsigned 8-, 16-, 32-, 64-, and 128-bit integer
+  types now work through parsing, nested type descriptors, builders, generation,
+  annotation, validation, and serialized SDK ASTs. Supported dialect spellings
+  include DuckDB `HUGEINT` and unsigned aliases, ClickHouse `Int128`/`UInt*`, and
+  StarRocks `LARGEINT`.
+- Regression coverage in existing Rust and SDK test files now exercises the
+  new APIs and fixes, including the exact nested-scope, correlated-subquery,
+  chained-CTE, and window-ordering validation examples from #441 and #442.
+
+### Changed
+
+- Rust callers using exhaustive `DataType` matches must handle `Int128` and
+  `UInt8` through `UInt128`. Struct literals for `Array`, `ArrayConstructor`, and
+  `TrimFunc` must initialize the new optional `inferred_type` field; `QueryAnalysis`
+  literals must initialize `column_uses`. Older serialized payloads remain
+  readable through defaults for the new fields.
+- Schema-validation JSON options accept both snake_case and camelCase names for
+  compound fields and reject unknown names instead of silently ignoring them.
+- Source-range documentation now consistently identifies `start`/`end` as
+  half-open Unicode-character offsets, not UTF-8 bytes or JavaScript UTF-16 code
+  units. Token `line`/`column` coordinates retain their existing end-of-token
+  cursor semantics.
+- Rust feature-gate verification and CI now check each capability independently,
+  plus representative dialect combinations, so Cargo feature unification cannot
+  hide missing dependencies.
+
+### Fixed
+
+- DuckDB `MEDIAN` type inference now handles dedicated aggregate nodes and
+  promotes integer inputs to `DOUBLE` and `DATE` inputs to `TIMESTAMP`, while
+  retaining supported input types for other overloads.
+- Array literals and `ARRAY`/`LIST` constructors now retain inferred element
+  types. Array elements and all `CASE` result branches contribute to common-type
+  inference, including nested arrays, so `UNNEST` can recover the correct element
+  type. Parenthesized and comment-annotated expressions preserve their inner
+  type in Rust and TypeScript helpers.
+- `TRIM` nodes now retain inferred string types and annotate both their input
+  and trim-character expressions, including nested calls.
+- DuckDB `REGEXP_EXTRACT_ALL` now infers string-list or named-capture struct-list
+  results from the selected overload, allowing `UNNEST` to expose the element
+  type while leaving indeterminate overloads unresolved.
+- DuckDB `EXTRACT` now reports `BIGINT` for integral date parts and `DOUBLE` for
+  `epoch` and `julian`. `MONTHNAME`, `DAYNAME`, `ARRAY_TO_STRING`, and
+  `ARRAY_TO_STRING_COMMA_DEFAULT` now infer string results without requiring
+  schema metadata, with rules scoped to DuckDB.
+- DuckDB `SUM` now uses its aggregate promotion rules: boolean and integer
+  inputs through signed 128-bit and unsigned 64-bit produce `INT128`, unsigned
+  128-bit and floating inputs produce `DOUBLE`, and decimal inputs widen to
+  precision 38 while retaining scale. Signed/unsigned arithmetic and
+  common-type coercion now distinguish overload binding from combination
+  casting, including unsigned division and builder-created function nodes.
+- DuckDB accepts supported unquoted keyword relation aliases such as `top`,
+  `first`, `last`, `begin`, and `type` consistently across FROM/JOIN sources,
+  derived tables, table functions, and VALUES, without consuming clause
+  boundaries or changing T-SQL/Fabric `TOP` parsing.
+- DuckDB projection aliases accept single-quoted strings after explicit `AS`
+  and generate the target dialect's identifier quoting. Escaped names and
+  comments are preserved; `AS ''` is treated as no effective alias, and implicit
+  single-quoted aliases remain rejected.
+- TypeScript AST walking and transformation no longer mistake data-type
+  descriptors for expression nodes. Transform, clone, and remove operations
+  preserve inferred-type metadata and scalar or null variant payloads.
+- Parsed identifiers and column references now retain their original source
+  spans, including quoted and qualified names, across serialized APIs.
+  Identifier/column structural equality and optimizer identity keys ignore
+  source locations, preserving simplification and subquery deduplication.
+- Schema-aware validation now resolves references in their lexical scopes,
+  including prior CTE outputs, alias shadowing, correlated subqueries, and
+  window expressions, without leaking CTE declarations or non-lateral sources.
+  Empty and wildcard column schemas remain open; complete schemas still reject
+  unknown columns. Reference diagnostics identify the offending source token,
+  preserve separate occurrences, and respect ambiguity and severity options.
+- Query analysis now returns conservative facts for incomplete schemas and
+  unresolved references instead of failing solely on qualification errors.
+  Shared scope traversal covers scalar subqueries in join predicates, ordering,
+  and QUALIFY while respecting relation boundaries.
+- Rust `ast-tools` and `semantic` builds no longer depend implicitly on the
+  `builder` or `generate` features. AST transforms and builders reuse a shared
+  internal mutation module while public builder APIs remain feature-gated.
+- Go native bindings retain typed pointers instead of converting stored
+  `uintptr` values back to `unsafe.Pointer`, removing the vet warning while
+  preserving C ABI layouts. Schema validation normalizes nil table/column
+  slices without mutating caller data and requires the matching native library
+  exporting `polyglot_validate_with_schema`.
+
 ## [0.9.2] - 2026-08-18
 
 ### Fixed

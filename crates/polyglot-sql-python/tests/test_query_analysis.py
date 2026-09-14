@@ -3,6 +3,45 @@ import pytest
 import polyglot_sql
 
 
+def test_analyze_query_column_uses_preserve_occurrences_and_projection_lineage():
+    sql = "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1"
+    analysis = polyglot_sql.analyze_query(sql, dialect="duckdb")
+    uses = analysis["columnUses"]
+    assert len(uses) == 1
+    fact = uses[0]
+    assert fact["context"] == "filter"
+    assert fact["scopePath"] == "root"
+    assert fact["expressionPath"] == "where_clause.this"
+    assert "span" not in fact  # No fabricated whole-expression range.
+    assert len(fact["references"]) == 2
+    assert fact["references"][0]["span"] != fact["references"][1]["span"]
+    for reference in fact["references"]:
+        assert reference["sourceName"] == "orders"
+        assert reference["sourceAlias"] == "o"
+        assert reference["column"] == "amount"
+        assert reference["confidence"] == "resolved"
+        span = reference["span"]
+        assert sql[span["start"]:span["end"]] == "o.amount"
+    assert [ref["column"] for ref in analysis["projections"][1]["upstream"]] == ["id"]
+    assert polyglot_sql.analyze_query("SELECT 1")["columnUses"] == []
+
+
+def test_analyze_query_column_uses_resolve_ctes_and_keep_filter_branches():
+    analysis = polyglot_sql.analyze_query(
+        "WITH base AS (SELECT id, amount FROM orders) "
+        "SELECT id FROM base WHERE amount > 0 EXCEPT SELECT id FROM blocked",
+        dialect="duckdb",
+    )
+    uses = analysis["columnUses"]
+    predicate = next(fact for fact in uses if fact["context"] == "filter")
+    assert predicate["scopePath"] == "root.branches[0]"
+    assert predicate["references"][0]["table"] == "orders"
+    assert predicate["references"][0]["column"] == "amount"
+    branch = next(fact for fact in uses if fact["context"] == "set_operation_filter")
+    assert branch["scopePath"] == "root.branches[1]"
+    assert branch["references"][0]["table"] == "blocked"
+
+
 def test_analyze_query_returns_projection_facts():
     result = polyglot_sql.analyze_query("SELECT a FROM t")
 

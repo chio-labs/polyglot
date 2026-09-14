@@ -19,6 +19,8 @@ use crate::{parse_one, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+mod column_uses;
+
 /// Options for [`analyze_query`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -41,6 +43,60 @@ pub struct QueryAnalysis {
     pub base_tables: Vec<RelationFact>,
     pub star_projections: Vec<StarProjectionFact>,
     pub set_operations: Vec<SetOperationFact>,
+    /// Clause-specific uses, separate from output projection lineage.
+    #[serde(default)]
+    pub column_uses: Vec<ColumnUseFact>,
+}
+
+/// A half-open range in the original SQL, measured in Unicode characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuerySourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The syntactic role of a column-containing expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnUseContext {
+    Join,
+    Filter,
+    Group,
+    Having,
+    Qualify,
+    WindowPartition,
+    WindowOrder,
+    WindowFrame,
+    Order,
+    AggregateOrder,
+    SetOperationFilter,
+}
+
+/// One resolved dependency of an original column occurrence. Several terminal
+/// dependencies can share a span (for example, a reference to a computed CTE
+/// column). Spans identify the use, not the upstream column's definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnUseReferenceFact {
+    #[serde(flatten)]
+    pub reference: ColumnReferenceFact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<QuerySourceSpan>,
+}
+
+/// One containing expression, with references in occurrence order. Paths are
+/// deterministic within an analysis, not persistent IDs across SQL edits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnUseFact {
+    pub context: ColumnUseContext,
+    pub scope_path: String,
+    pub expression_path: String,
+    /// Dialect-rendered SQL; not necessarily the original source substring.
+    pub expression_sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<QuerySourceSpan>,
+    pub references: Vec<ColumnUseReferenceFact>,
 }
 
 /// Top-level query shape.
@@ -200,8 +256,27 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     );
 
     if let Some(schema) = mapping_schema.as_ref() {
-        expression = qualify_schema_aware_expression(expression, schema, Some(options.dialect))
-            .map_err(|e| Error::internal(format!("query analysis qualification failed: {e}")))?;
+        use crate::optimizer::qualify_columns::QualifyColumnsError;
+        expression = match qualify_schema_aware_expression(
+            expression.clone(),
+            schema,
+            Some(options.dialect),
+        ) {
+            Ok(qualified) => qualified,
+            // Analysis is not validation. Incomplete schemas and unresolved
+            // lexical references must still yield conservative usage facts.
+            Err(
+                QualifyColumnsError::UnknownTable(_)
+                | QualifyColumnsError::UnknownColumn(_)
+                | QualifyColumnsError::AmbiguousColumn(_)
+                | QualifyColumnsError::ColumnNotResolved { .. },
+            ) => expression,
+            Err(error) => {
+                return Err(Error::internal(format!(
+                    "query analysis qualification failed: {error}"
+                )))
+            }
+        };
     }
 
     annotate_types(
@@ -239,6 +314,12 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         base_tables: base_table_facts(&scope, mapping_schema.as_ref(), options.dialect),
         star_projections,
         set_operations: set_operation_facts(&expression, &scope, options.dialect),
+        column_uses: column_uses::collect(
+            &original_expression,
+            &scope,
+            mapping_schema.as_ref(),
+            options.dialect,
+        ),
     })
 }
 

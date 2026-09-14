@@ -4,6 +4,505 @@ use polyglot_sql::{
 };
 use serde_json::json;
 
+fn column_use_analysis(sql: &str, with_schema: bool) -> polyglot_sql::QueryAnalysis {
+    analyze_query(
+        sql,
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: with_schema.then(schema),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn analyze_query_reports_filter_uses_without_changing_projection_lineage() {
+    use polyglot_sql::ColumnUseContext;
+    for with_schema in [false, true] {
+        let sql = "SELECT o.id FROM orders AS o WHERE o.amount > 10";
+        let analysis = column_use_analysis(sql, with_schema);
+        assert_eq!(analysis.projections[0].upstream.len(), 1);
+        assert_eq!(analysis.projections[0].upstream[0].column, "id");
+        assert_eq!(analysis.column_uses.len(), 1);
+        let fact = &analysis.column_uses[0];
+        assert_eq!(fact.context, ColumnUseContext::Filter);
+        assert_eq!(fact.scope_path, "root");
+        assert_eq!(fact.expression_path, "where_clause.this");
+        assert_eq!(fact.expression_sql, "o.amount > 10");
+        assert!(fact.span.is_none());
+        let reference = &fact.references[0];
+        assert_eq!(reference.reference.source_name.as_deref(), Some("orders"));
+        assert_eq!(reference.reference.source_alias.as_deref(), Some("o"));
+        assert_eq!(reference.reference.column, "amount");
+        assert_eq!(
+            reference.reference.confidence,
+            ReferenceConfidence::Resolved
+        );
+        let span = reference.span.unwrap();
+        assert_eq!(
+            sql.chars()
+                .skip(span.start)
+                .take(span.end - span.start)
+                .collect::<String>(),
+            "o.amount"
+        );
+    }
+    assert!(column_use_analysis("SELECT 1", false)
+        .column_uses
+        .is_empty());
+}
+
+#[test]
+fn analyze_query_column_uses_group_conditions_and_keep_occurrence_spans() {
+    use polyglot_sql::ColumnUseContext;
+    let sql = "SELECT '😀', o.id FROM orders o JOIN customers c ON o.customer_id = c.id AND o.amount > 0 WHERE o.amount > 1 OR o.amount < 0";
+    let analysis = column_use_analysis(sql, true);
+    let join = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == ColumnUseContext::Join)
+        .unwrap();
+    assert_eq!(join.expression_path, "joins[0].on");
+    assert_eq!(join.references.len(), 3);
+    let filter = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == ColumnUseContext::Filter)
+        .unwrap();
+    assert_eq!(filter.references.len(), 2);
+    assert_ne!(filter.references[0].span, filter.references[1].span);
+    for reference in &filter.references {
+        let span = reference.span.unwrap();
+        assert_eq!(
+            sql.chars()
+                .skip(span.start)
+                .take(span.end - span.start)
+                .collect::<String>(),
+            "o.amount"
+        );
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_cover_group_having_order_aliases_and_ordinals() {
+    use polyglot_sql::ColumnUseContext;
+    let analysis = column_use_analysis("SELECT o.customer_id AS customer, SUM(o.amount) AS amount_sum FROM orders o GROUP BY 1 HAVING amount_sum > 10 ORDER BY amount_sum, 1", true);
+    for (context, expected) in [
+        (ColumnUseContext::Group, "customer_id"),
+        (ColumnUseContext::Having, "amount"),
+    ] {
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == context)
+            .unwrap();
+        assert_eq!(fact.references[0].reference.column, expected, "{fact:?}");
+    }
+    let order: Vec<_> = analysis
+        .column_uses
+        .iter()
+        .filter(|fact| fact.context == ColumnUseContext::Order)
+        .collect();
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0].references[0].reference.column, "amount");
+    assert_eq!(order[1].references[0].reference.column, "customer_id");
+    assert!(order[1].references[0].span.is_none());
+}
+
+#[test]
+fn analyze_query_column_uses_cover_windows_qualify_and_aggregate_filters() {
+    use polyglot_sql::ColumnUseContext;
+    let analysis = column_use_analysis("SELECT o.id, ROW_NUMBER() OVER w AS rn, SUM(o.amount) FILTER (WHERE o.amount > 0) OVER (PARTITION BY o.customer_id ORDER BY o.id) AS total FROM orders o WINDOW w AS (PARTITION BY o.customer_id ORDER BY o.id) QUALIFY rn = 1 ORDER BY o.id", true);
+    for context in [
+        ColumnUseContext::WindowPartition,
+        ColumnUseContext::WindowOrder,
+        ColumnUseContext::Qualify,
+        ColumnUseContext::Filter,
+        ColumnUseContext::Order,
+    ] {
+        let facts: Vec<_> = analysis
+            .column_uses
+            .iter()
+            .filter(|fact| fact.context == context)
+            .collect();
+        assert!(
+            !facts.is_empty(),
+            "missing {context:?}: {:?}",
+            analysis.column_uses
+        );
+        assert!(
+            facts.iter().all(|fact| !fact.references.is_empty()),
+            "{facts:?}"
+        );
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_resolve_chained_ctes_and_correlated_scopes() {
+    use polyglot_sql::ColumnUseContext;
+    let sql = "WITH base AS (SELECT id, amount FROM orders), paid AS (SELECT id, amount * 2 AS amount FROM base WHERE amount > 0) SELECT p.id FROM paid p WHERE p.amount > 10 AND EXISTS (SELECT 1 FROM customers c WHERE c.id = p.id)";
+    for with_schema in [false, true] {
+        let analysis = column_use_analysis(sql, with_schema);
+        let root = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.scope_path == "root" && fact.context == ColumnUseContext::Filter)
+            .unwrap();
+        assert_eq!(
+            root.references.len(),
+            1,
+            "subquery references belong to their own scope"
+        );
+        assert_eq!(
+            root.references[0].reference.table.as_deref(),
+            Some("orders"),
+            "{root:?}"
+        );
+        assert_eq!(root.references[0].reference.column, "amount");
+        let correlated = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.scope_path == "root.subqueries[0]")
+            .unwrap();
+        assert_eq!(correlated.references.len(), 2);
+        assert_eq!(
+            correlated.references[1].reference.table.as_deref(),
+            Some("orders"),
+            "{correlated:?}"
+        );
+        assert!(analysis
+            .column_uses
+            .iter()
+            .any(|fact| fact.scope_path == "root.ctes[1]"));
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_do_not_leak_ctes_or_non_lateral_sources() {
+    let analysis = column_use_analysis("SELECT o.id FROM orders o WHERE EXISTS (WITH local AS (SELECT id FROM customers) SELECT 1 FROM local WHERE local.id = o.id) AND EXISTS (SELECT 1 FROM local WHERE local.id = 1)", true);
+    let leaked = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.scope_path == "root.subqueries[1]")
+        .unwrap();
+    assert_ne!(
+        leaked.references[0].reference.table.as_deref(),
+        Some("customers")
+    );
+    let analysis = column_use_analysis("SELECT o.id FROM orders o JOIN (SELECT id FROM customers WHERE id = o.id) c ON o.id = c.id", false);
+    let derived = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.scope_path == "root.derived[0]")
+        .unwrap();
+    assert_eq!(
+        derived.references[1].reference.confidence,
+        ReferenceConfidence::Unknown
+    );
+}
+
+#[test]
+fn analyze_query_column_uses_conservatively_resolve_partial_and_ambiguous_schemas() {
+    for (sql, with_schema, expected) in [
+        (
+            "SELECT 1 FROM orders o JOIN customers c ON TRUE WHERE id > 0",
+            true,
+            ReferenceConfidence::Ambiguous,
+        ),
+        (
+            "SELECT 1 FROM orders o JOIN missing m ON TRUE WHERE id > 0",
+            true,
+            ReferenceConfidence::Unknown,
+        ),
+        (
+            "SELECT 1 FROM orders o JOIN customers c ON TRUE WHERE id > 0",
+            false,
+            ReferenceConfidence::Unknown,
+        ),
+        (
+            "SELECT 1 FROM orders o WHERE bogus.id > 0",
+            true,
+            ReferenceConfidence::Unknown,
+        ),
+        (
+            "SELECT 1 FROM orders o WHERE o.missing > 0",
+            true,
+            ReferenceConfidence::Unknown,
+        ),
+    ] {
+        let analysis = column_use_analysis(sql, with_schema);
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == polyglot_sql::ColumnUseContext::Filter)
+            .unwrap();
+        assert_eq!(
+            fact.references[0].reference.confidence, expected,
+            "{sql}: {fact:?}"
+        );
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_cover_using_and_natural_joins() {
+    for sql in [
+        "SELECT 1 FROM orders JOIN customers USING (id)",
+        "SELECT 1 FROM orders NATURAL JOIN customers",
+    ] {
+        let analysis = column_use_analysis(sql, true);
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == polyglot_sql::ColumnUseContext::Join)
+            .unwrap();
+        assert_eq!(fact.references.len(), 2, "{fact:?}");
+        assert!(fact
+            .references
+            .iter()
+            .all(|reference| reference.reference.column == "id"
+                && reference.reference.confidence == ReferenceConfidence::Resolved));
+    }
+    let unknown = column_use_analysis("SELECT 1 FROM orders NATURAL JOIN customers", false);
+    assert_eq!(
+        unknown.column_uses[0].references[0].reference.confidence,
+        ReferenceConfidence::Unknown
+    );
+}
+
+#[test]
+fn analyze_query_column_uses_identify_nested_filter_branches_and_set_order() {
+    use polyglot_sql::ColumnUseContext;
+    let sql = "SELECT id FROM orders EXCEPT (SELECT id FROM customers WHERE id > 0 UNION ALL SELECT id FROM users) ORDER BY id";
+    let analysis = column_use_analysis(sql, true);
+    let filter_branches: Vec<_> = analysis
+        .column_uses
+        .iter()
+        .filter(|fact| fact.context == ColumnUseContext::SetOperationFilter)
+        .collect();
+    assert_eq!(filter_branches.len(), 2, "{:?}", analysis.column_uses);
+    assert!(filter_branches
+        .iter()
+        .all(|fact| fact.scope_path.starts_with("root.branches[1].branches[")));
+    let order = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == ColumnUseContext::Order)
+        .unwrap();
+    assert!(!order.references.is_empty());
+    assert!(
+        analysis.projections[0]
+            .upstream
+            .iter()
+            .any(|reference| reference.table.as_deref() == Some("customers")),
+        "existing lineage must remain unchanged"
+    );
+}
+
+#[test]
+fn analyze_query_column_uses_are_json_additive_and_deterministic() {
+    let sql =
+        "SELECT o.id FROM orders o JOIN customers c USING(id) WHERE o.amount > 0 ORDER BY o.id";
+    let value = serde_json::to_value(column_use_analysis(sql, true)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::to_value(column_use_analysis(sql, true)).unwrap()
+    );
+    assert!(value["columnUses"][0]["references"][0]
+        .get("reference")
+        .is_none());
+    let mut legacy = value;
+    legacy.as_object_mut().unwrap().remove("columnUses");
+    let decoded: polyglot_sql::QueryAnalysis = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.column_uses.is_empty());
+}
+
+#[test]
+fn analyze_query_column_uses_include_scalar_predicate_inputs_but_not_exists_outputs() {
+    for predicate in [
+        "o.id = (SELECT MAX(c.id) FROM customers c)",
+        "o.id IN (SELECT c.id FROM customers c)",
+    ] {
+        let analysis =
+            column_use_analysis(&format!("SELECT 1 FROM orders o WHERE {predicate}"), true);
+        let root = &analysis.column_uses[0];
+        assert_eq!(root.references.len(), 2, "{root:?}");
+        assert!(root
+            .references
+            .iter()
+            .any(|usage| usage.reference.table.as_deref() == Some("customers")));
+    }
+    let analysis = column_use_analysis(
+        "SELECT 1 FROM orders o WHERE EXISTS (SELECT c.name FROM customers c WHERE c.id = o.id)",
+        true,
+    );
+    assert!(analysis.column_uses[0].references.is_empty());
+    assert_eq!(analysis.column_uses[1].references.len(), 2);
+    assert!(analysis
+        .column_uses
+        .iter()
+        .flat_map(|fact| &fact.references)
+        .all(|usage| usage.reference.column != "name"));
+}
+
+#[test]
+fn analyze_query_column_uses_handle_cte_alias_columns_and_unknown_transitive_references() {
+    let analysis = column_use_analysis(
+        "WITH renamed(key) AS (SELECT id FROM orders) SELECT 1 FROM renamed WHERE key > 0",
+        true,
+    );
+    assert_eq!(analysis.column_uses[0].references[0].reference.column, "id");
+    assert_eq!(
+        analysis.column_uses[0].references[0]
+            .reference
+            .table
+            .as_deref(),
+        Some("orders")
+    );
+    for sql in [
+        "WITH invalid AS (SELECT bogus.id AS key FROM orders) SELECT 1 FROM invalid WHERE key > 0",
+        "WITH invalid AS (SELECT o.missing AS key FROM orders o) SELECT 1 FROM invalid WHERE key > 0",
+    ] {
+        let analysis = column_use_analysis(sql, true);
+        assert_eq!(analysis.column_uses[0].references[0].reference.confidence, ReferenceConfidence::Unknown, "{analysis:?}");
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_expand_star_filter_inputs_with_schema() {
+    let analysis = column_use_analysis("SELECT * FROM customers EXCEPT SELECT * FROM users", true);
+    let fact = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == polyglot_sql::ColumnUseContext::SetOperationFilter)
+        .unwrap();
+    assert_eq!(fact.references.len(), 2, "{fact:?}");
+    assert_eq!(fact.references[0].reference.column, "id");
+    assert_eq!(fact.references[1].reference.column, "name");
+}
+
+#[test]
+fn analyze_query_column_uses_resolve_output_aliases_after_star_expansion() {
+    let analysis = column_use_analysis(
+        "SELECT o.*, o.amount * 2 AS doubled FROM orders o ORDER BY doubled",
+        true,
+    );
+    let reference = &analysis.column_uses[0].references[0].reference;
+    assert_eq!(reference.column, "amount");
+    assert_eq!(reference.table.as_deref(), Some("orders"));
+}
+
+#[test]
+fn analyze_query_column_uses_reuse_struct_field_resolution() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables":[{"name":"events","columns":[{"name":"payload","type":"STRUCT(active BOOLEAN)"}]}]})).unwrap();
+    let analysis = analyze_query(
+        "SELECT 1 FROM events WHERE payload.active = TRUE",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(schema),
+        },
+    )
+    .unwrap();
+    let reference = &analysis.column_uses[0].references[0].reference;
+    assert_eq!(reference.column, "payload");
+    assert_eq!(reference.table.as_deref(), Some("events"));
+    assert_eq!(reference.confidence, ReferenceConfidence::Resolved);
+}
+
+#[test]
+fn analyze_query_column_uses_preserve_transitive_partial_schema_uncertainty() {
+    let analysis = column_use_analysis(
+        "WITH c AS (SELECT id FROM orders o JOIN missing m ON TRUE) SELECT 1 FROM c WHERE c.id > 0",
+        true,
+    );
+    let fact = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == polyglot_sql::ColumnUseContext::Filter)
+        .unwrap();
+    assert!(
+        fact.references
+            .iter()
+            .all(|usage| usage.reference.confidence == ReferenceConfidence::Unknown),
+        "{fact:?}"
+    );
+}
+
+#[test]
+fn analyze_query_column_uses_cover_supported_qualify_dialects_and_filter_operators() {
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::BigQuery,
+        DialectType::Snowflake,
+    ] {
+        let analysis = analyze_query("SELECT o.id, ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.id) AS rn FROM orders o QUALIFY rn = 1", AnalyzeQueryOptions { dialect, schema: Some(schema()) }).unwrap();
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == polyglot_sql::ColumnUseContext::Qualify)
+            .unwrap();
+        assert!(!fact.references.is_empty(), "{dialect:?}: {fact:?}");
+        assert!(
+            fact.references
+                .iter()
+                .all(|usage| usage.reference.confidence == ReferenceConfidence::Resolved),
+            "{dialect:?}: {fact:?}"
+        );
+    }
+    for operator in ["EXCEPT", "INTERSECT"] {
+        let analysis = column_use_analysis(
+            &format!("SELECT id FROM orders {operator} SELECT id FROM customers"),
+            true,
+        );
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == polyglot_sql::ColumnUseContext::SetOperationFilter)
+            .unwrap();
+        assert_eq!(fact.scope_path, "root.branches[1]");
+        assert_eq!(
+            fact.references[0].reference.table.as_deref(),
+            Some("customers")
+        );
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_cover_aggregate_order_and_window_frame_inputs() {
+    let analysis = column_use_analysis("SELECT ARRAY_AGG(o.amount ORDER BY o.id), SUM(o.amount) OVER (ORDER BY o.id ROWS BETWEEN o.customer_id PRECEDING AND CURRENT ROW) FROM orders o", false);
+    for (context, column) in [
+        (polyglot_sql::ColumnUseContext::AggregateOrder, "id"),
+        (polyglot_sql::ColumnUseContext::WindowFrame, "customer_id"),
+    ] {
+        let fact = analysis
+            .column_uses
+            .iter()
+            .find(|fact| fact.context == context)
+            .unwrap_or_else(|| panic!("missing {context:?}: {:?}", analysis.column_uses));
+        assert_eq!(fact.references[0].reference.column, column);
+    }
+}
+
+#[test]
+fn analyze_query_column_uses_do_not_resolve_forward_join_aliases() {
+    let analysis = column_use_analysis(
+        "SELECT o.id FROM orders o JOIN customers c ON c.id = u.id JOIN users u ON u.id = o.id",
+        false,
+    );
+    let joins: Vec<_> = analysis
+        .column_uses
+        .iter()
+        .filter(|fact| fact.context == polyglot_sql::ColumnUseContext::Join)
+        .collect();
+    assert_eq!(
+        joins[0].references[1].reference.confidence,
+        ReferenceConfidence::Unknown
+    );
+    assert_eq!(
+        joins[1].references[0].reference.confidence,
+        ReferenceConfidence::Resolved
+    );
+}
+
 fn schema() -> ValidationSchema {
     serde_json::from_value(json!({
         "tables": [
@@ -93,6 +592,253 @@ fn analyze_query_reports_projection_relations_and_types() {
             && reference.column == "total"
             && reference.confidence == ReferenceConfidence::Resolved
     }));
+}
+
+#[test]
+fn analyze_query_duckdb_extract_date_part_types() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "events",
+            "columns": [{"name": "created_at", "type": "TIMESTAMP"}]
+        }]
+    }))
+    .unwrap();
+
+    for (date_part, expected_type) in [
+        ("'year'", "BIGINT"),
+        ("'month'", "BIGINT"),
+        ("'day'", "BIGINT"),
+        ("YEAR", "BIGINT"),
+        ("'second'", "BIGINT"),
+        ("'milliseconds'", "BIGINT"),
+        ("'microseconds'", "BIGINT"),
+        ("'yearweek'", "BIGINT"),
+        ("'epoch'", "DOUBLE"),
+        ("EPOCH", "DOUBLE"),
+        ("'EpOcH'", "DOUBLE"),
+        ("'julian'", "DOUBLE"),
+        ("JULIAN", "DOUBLE"),
+        ("'JuLiAn'", "DOUBLE"),
+    ] {
+        let sql = format!("SELECT EXTRACT({date_part} FROM created_at) AS extracted FROM events");
+        let analysis = analyze_query(
+            &sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(schema.clone()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+
+        assert_eq!(analysis.projections[0].name.as_deref(), Some("extracted"));
+        assert_eq!(
+            analysis.projections[0].type_hint.as_deref(),
+            Some(expected_type),
+            "unexpected output type for {sql:?}"
+        );
+        assert!(analysis.projections[0].upstream.iter().any(|reference| {
+            reference.table.as_deref() == Some("events") && reference.column == "created_at"
+        }));
+    }
+}
+
+#[test]
+fn analyze_query_duckdb_trim_types_and_lineage() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "records",
+            "columns": [
+                {"name": "name", "type": "VARCHAR"},
+                {"name": "chars", "type": "VARCHAR"},
+                {"name": "values_json", "type": "JSON"}
+            ]
+        }]
+    }))
+    .unwrap();
+
+    for (function, columns) in [
+        ("TRIM(name)", vec!["name"]),
+        (
+            r#"TRIM(BOTH '"' FROM values_json->>0)"#,
+            vec!["values_json"],
+        ),
+        (
+            "TRIM(LOWER(TRIM(name)), UPPER(chars))",
+            vec!["name", "chars"],
+        ),
+    ] {
+        let sql = format!("SELECT {function} AS normalized FROM records");
+        for schema in [None, Some(schema.clone())] {
+            let has_schema = schema.is_some();
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::DuckDB,
+                    schema,
+                },
+            )
+            .unwrap();
+            assert_eq!(analysis.projections.len(), 1, "{sql}");
+            let projection = &analysis.projections[0];
+            assert_eq!(projection.name.as_deref(), Some("normalized"), "{sql}");
+            assert_eq!(projection.type_hint.as_deref(), Some("TEXT"), "{sql}");
+            if has_schema {
+                assert_eq!(projection.upstream.len(), columns.len(), "{sql}");
+                for column in &columns {
+                    assert!(
+                        projection.upstream.iter().any(|reference| {
+                            reference.table.as_deref() == Some("records")
+                                && reference.column == *column
+                                && reference.confidence == ReferenceConfidence::Resolved
+                        }),
+                        "{sql}: {column}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn analyze_query_duckdb_regexp_extract_all_types() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "documents",
+            "columns": [{"name": "body", "type": "VARCHAR"}]
+        }]
+    }))
+    .unwrap();
+    for (function, type_hint) in [
+        ("REGEXP_EXTRACT_ALL(body, '[0-9]+')", "TEXT[]"),
+        (
+            "REGEXP_EXTRACT_ALL(body, '([a-z])([0-9]+)', 2, 'i')",
+            "TEXT[]",
+        ),
+        (
+            "REGEXP_EXTRACT_ALL(body, '([a-z])([0-9]+)', ['letter', 'number'])",
+            "STRUCT(letter TEXT, number TEXT)[]",
+        ),
+        ("UNNEST(REGEXP_EXTRACT_ALL(body, '[0-9]+'))", "TEXT"),
+        (
+            "UNNEST(REGEXP_EXTRACT_ALL(body, '([a-z])([0-9]+)', ['letter', 'number'], 'i'))",
+            "STRUCT(letter TEXT, number TEXT)",
+        ),
+    ] {
+        let sql = format!("SELECT {function} AS matches FROM documents");
+        for schema in [None, Some(schema.clone())] {
+            let has_schema = schema.is_some();
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::DuckDB,
+                    schema,
+                },
+            )
+            .unwrap();
+            assert_eq!(analysis.projections.len(), 1, "{sql}");
+            let projection = &analysis.projections[0];
+            assert_eq!(projection.name.as_deref(), Some("matches"), "{sql}");
+            assert_eq!(projection.type_hint.as_deref(), Some(type_hint), "{sql}");
+            if has_schema {
+                assert!(
+                    projection.upstream.iter().any(|reference| {
+                        reference.table.as_deref() == Some("documents")
+                            && reference.column == "body"
+                            && reference.confidence == ReferenceConfidence::Resolved
+                    }),
+                    "{sql}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn analyze_query_duckdb_date_name_types() {
+    for input_type in ["DATE", "TIMESTAMP", "TIMESTAMPTZ"] {
+        let schema: ValidationSchema = serde_json::from_value(json!({
+            "tables": [{
+                "name": "events",
+                "columns": [{"name": "created_at", "type": input_type}]
+            }]
+        }))
+        .unwrap();
+        for function in ["MONTHNAME", "DAYNAME"] {
+            let sql = format!("SELECT {function}(created_at) AS label FROM events");
+            for schema in [None, Some(schema.clone())] {
+                let has_schema = schema.is_some();
+                let analysis = analyze_query(
+                    &sql,
+                    AnalyzeQueryOptions {
+                        dialect: DialectType::DuckDB,
+                        schema,
+                    },
+                )
+                .unwrap();
+                assert_eq!(analysis.projections.len(), 1, "{sql}");
+                let projection = &analysis.projections[0];
+                assert_eq!(projection.name.as_deref(), Some("label"), "{sql}");
+                assert_eq!(projection.type_hint.as_deref(), Some("TEXT"), "{sql}");
+                assert!(
+                    projection.upstream.iter().any(|reference| {
+                        reference.column == "created_at"
+                            && (!has_schema
+                                || (reference.table.as_deref() == Some("events")
+                                    && reference.confidence == ReferenceConfidence::Resolved))
+                    }),
+                    "{sql}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn analyze_query_duckdb_array_to_string_types() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "events",
+            "columns": [
+                {"name": "labels", "type": "VARCHAR[]"},
+                {"name": "label", "type": "VARCHAR"}
+            ]
+        }]
+    }))
+    .unwrap();
+
+    for (function, column) in [
+        ("ARRAY_TO_STRING(labels, ', ')", "labels"),
+        ("ARRAY_TO_STRING(ARRAY_AGG(label), ', ')", "label"),
+        ("ARRAY_TO_STRING_COMMA_DEFAULT(labels)", "labels"),
+        ("ARRAY_TO_STRING_COMMA_DEFAULT(ARRAY_AGG(label))", "label"),
+    ] {
+        let sql = format!("SELECT {function} AS label_text FROM events");
+        for schema in [None, Some(schema.clone())] {
+            let has_schema = schema.is_some();
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::DuckDB,
+                    schema,
+                },
+            )
+            .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+            assert_eq!(analysis.projections.len(), 1, "{sql}");
+            let projection = &analysis.projections[0];
+            assert_eq!(projection.name.as_deref(), Some("label_text"), "{sql}");
+            assert_eq!(projection.type_hint.as_deref(), Some("TEXT"), "{sql}");
+            if has_schema {
+                assert!(
+                    projection.upstream.iter().any(|reference| {
+                        reference.table.as_deref() == Some("events")
+                            && reference.column == column
+                            && reference.confidence == ReferenceConfidence::Resolved
+                    }),
+                    "{sql}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -629,6 +1375,33 @@ fn analyze_query_classifies_typed_aggregates() {
 }
 
 #[test]
+fn analyze_query_infers_duckdb_median_type_issue_425() {
+    let median_schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "values_table",
+            "columns": [{"name": "x", "type": "DOUBLE"}]
+        }]
+    }))
+    .unwrap();
+
+    let analysis = analyze_query(
+        "SELECT MEDIAN(x) AS median_x FROM values_table",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(median_schema),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.projections.len(), 1);
+    assert_eq!(
+        analysis.projections[0].transform_kind,
+        TransformKind::Aggregation
+    );
+    assert_eq!(analysis.projections[0].type_hint.as_deref(), Some("DOUBLE"));
+}
+
+#[test]
 fn analyze_query_reports_projection_nullability() {
     let analysis = analyze_query(
         "SELECT \
@@ -1041,6 +1814,76 @@ fn analyze_query_propagates_unnest_element_types_through_query_scopes() {
             Some("TEXT"),
             "unexpected output type for {sql:?}"
         );
+    }
+}
+
+#[test]
+fn analyze_query_infers_unnest_type_from_case_array_constructor() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "events",
+            "columns": [
+                {"name": "created_at", "type": "TIMESTAMP"},
+                {"name": "closed_at", "type": "TIMESTAMP"}
+            ]
+        }]
+    }))
+    .unwrap();
+    let analysis = analyze_query(
+        "SELECT UNNEST(CASE WHEN closed_at IS NULL THEN ARRAY[created_at] \
+         ELSE ARRAY[created_at, closed_at] END) AS event_at FROM events",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(schema),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.projections[0].name.as_deref(), Some("event_at"));
+    assert_eq!(
+        analysis.projections[0].type_hint.as_deref(),
+        Some("TIMESTAMP")
+    );
+    assert!(analysis.projections[0].upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("events") && reference.column == "created_at"
+    }));
+    assert!(analysis.projections[0].upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("events") && reference.column == "closed_at"
+    }));
+}
+
+#[test]
+fn analyze_query_preserves_type_through_parenthesized_case() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "flags",
+            "columns": [{"name": "flag", "type": "BOOLEAN"}]
+        }]
+    }))
+    .unwrap();
+
+    for sql in [
+        "SELECT CASE WHEN flag THEN 'yes' ELSE 'no' END AS label FROM flags",
+        "SELECT (CASE WHEN flag THEN 'yes' ELSE 'no' END) AS label FROM flags",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(schema.clone()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+
+        assert_eq!(analysis.projections[0].name.as_deref(), Some("label"));
+        assert_eq!(
+            analysis.projections[0].type_hint.as_deref(),
+            Some("TEXT"),
+            "unexpected output type for {sql:?}"
+        );
+        assert!(analysis.projections[0].upstream.iter().any(|reference| {
+            reference.table.as_deref() == Some("flags") && reference.column == "flag"
+        }));
     }
 }
 

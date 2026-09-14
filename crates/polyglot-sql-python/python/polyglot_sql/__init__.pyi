@@ -48,6 +48,16 @@ class ValidationErrorInfo:
         ...
 
     @property
+    def start(self) -> int | None:
+        """Zero-based Unicode character offset, or None when unavailable."""
+        ...
+
+    @property
+    def end(self) -> int | None:
+        """Exclusive Unicode character offset, or None when unavailable."""
+        ...
+
+    @property
     def code(self) -> str:
         """Machine-readable error code (e.g. ``"E001"``)."""
         ...
@@ -59,11 +69,11 @@ class ValidationErrorInfo:
 
 
 class ValidationResult:
-    """Result returned by :func:`validate`."""
+    """Result returned by validate and validate_with_schema."""
 
     @property
     def valid(self) -> bool:
-        """``True`` when the SQL is syntactically valid."""
+        """True when no errors were found; warnings do not invalidate SQL."""
         ...
 
     @property
@@ -1683,6 +1693,32 @@ def validate(
     ...
 
 
+def validate_with_schema(
+    sql: str,
+    schema: dict[str, TypingAny],
+    dialect: str = "generic",
+    *,
+    check_types: bool = False,
+    check_references: bool = False,
+    strict: bool | None = None,
+    semantic: bool = False,
+    strict_syntax: bool = False,
+) -> ValidationResult:
+    """Validate SQL against a shared ValidationSchema dictionary using Rust.
+
+    Unknown tables, columns and aliases are checked by default. check_types
+    enables type checks; check_references enables ambiguity and foreign-key
+    checks. strict overrides schema['strict'], which otherwise defaults to
+    True. Non-strict reference/type findings are warnings. Empty column lists
+    and '*' columns represent open schemas, not known-empty tables.
+
+    semantic and strict_syntax behave as in validate. Syntax errors take
+    precedence. Invalid SQL returns findings; invalid schemas or dialect names
+    raise ValueError. Options are snake_case keyword arguments, not a dictionary.
+    """
+    ...
+
+
 def optimize(sql: str, dialect: str | None = None, *, read: str | None = None) -> str:
     """Apply basic SQL optimizations (predicate simplification, etc.).
 
@@ -1795,6 +1831,10 @@ def analyze_query(
     The returned dict includes ``relations``, transitive ``baseTables``,
     top-level ``cteFacts``, original ``starProjections``, and projection
     ``nullability`` values of ``"non_null"``, ``"nullable"``, or ``"unknown"``.
+    ``columnUses`` groups non-projection references by clause, with ``context``,
+    ``scopePath``, ``expressionPath``, dialect-rendered ``expressionSql`` and
+    ``references``. Optional ``span`` objects use half-open Unicode-character
+    offsets into the original SQL. Reference spans locate uses, not definitions.
     """
     ...
 
