@@ -845,6 +845,10 @@ pub enum TokenType {
     Restart,
 
     // Special
+    /// Never produced by [`Tokenizer`]: the token stream is not terminated, and the
+    /// parser detects the end of input from the stream length instead. A caller can
+    /// still put one at the end of a stream it builds itself and hands to
+    /// `Parser::new`, which the parser honours; see `explicit_eof_token_tests`.
     Eof,
 }
 
