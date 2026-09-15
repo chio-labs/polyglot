@@ -19,7 +19,12 @@ import {
   ast_node_count,
 } from '../../../wasm/polyglot_sql_wasm.js';
 import type { Expression } from '../../generated/Expression';
-import { type ExpressionType, getExprType } from '../helpers';
+import {
+  type ExpressionBySingleKey,
+  type ExpressionType,
+  getExprType,
+  type SingleExpressionType,
+} from '../helpers';
 import {
   collectExpressionChildren,
   visitExpressionChildren,
@@ -129,9 +134,17 @@ export function findAll(
  * const columns = findByType(ast, 'column');
  * ```
  */
-export function findByType<T extends ExpressionType>(
+export function findByType<const T extends ExpressionType>(
   node: Expression,
-  type: T,
+  type: SingleExpressionType<T>,
+): ExpressionBySingleKey<T>[];
+export function findByType(
+  node: Expression,
+  type: ExpressionType,
+): Expression[];
+export function findByType(
+  node: Expression,
+  type: ExpressionType,
 ): Expression[] {
   return findAll(node, (n) => getExprType(n) === type);
 }
@@ -184,7 +197,7 @@ export function some(node: Expression, predicate: NodePredicate): boolean {
  * ```typescript
  * const allColumnsQualified = every(
  *   ast,
- *   (node) => getExprType(node) !== 'column' || getExprData(node).table !== null
+ *   (node) => !isExpressionType(node, 'column') || getExprData(node).table !== null
  * );
  * ```
  */
