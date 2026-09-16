@@ -16621,22 +16621,7 @@ impl Generator {
             } else {
                 quote_style
             };
-            // Escape any quote characters within the identifier
-            let escaped_name = if quote_style.start == quote_style.end {
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            } else {
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            };
-            self.write(&format!(
-                "{}{}{}",
-                quote_style.start, escaped_name, quote_style.end
-            ));
+            self.write_quoted_identifier(&output_name, *quote_style);
         } else {
             self.write(&output_name);
         }
@@ -16746,24 +16731,8 @@ impl Generator {
         };
 
         if needs_quoting {
-            // Escape any quote characters within the identifier
-            let escaped_name = if quote_style.start == quote_style.end {
-                // Same start/end char (e.g., " or `) - double the quote char
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            } else {
-                // Different start/end (e.g., [ and ]) - escape only the end char
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            };
-            self.write(&format!(
-                "{}{}{}{}",
-                quote_style.start, escaped_name, quote_style.end, suffix
-            ));
+            self.write_quoted_identifier(&output_name, *quote_style);
+            self.write(&suffix);
         } else {
             self.write(&output_name);
         }
@@ -16774,6 +16743,78 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         Ok(())
+    }
+
+    /// Write an identifier using the target dialect's delimiters and escape rules.
+    fn write_quoted_identifier(&mut self, name: &str, quote_style: IdentifierQuoteStyle) {
+        let backslash_escapes = matches!(
+            self.config.dialect,
+            Some(DialectType::BigQuery | DialectType::ClickHouse)
+        );
+        self.output.push(quote_style.start);
+        for c in name.chars() {
+            if backslash_escapes {
+                let escape = match c {
+                    '\\' => Some("\\\\"),
+                    '\n' => Some("\\n"),
+                    '\r' => Some("\\r"),
+                    '\t' => Some("\\t"),
+                    '\0' => Some("\\x00"),
+                    _ => None,
+                };
+                if let Some(escape) = escape {
+                    self.write(escape);
+                    continue;
+                }
+                if c == quote_style.end && self.config.dialect == Some(DialectType::BigQuery) {
+                    self.output.push('\\');
+                    self.output.push(c);
+                    continue;
+                }
+            }
+            self.output.push(c);
+            if c == quote_style.end {
+                self.output.push(c);
+            }
+        }
+        self.output.push(quote_style.end);
+    }
+
+    /// Named type fields are single identifiers, never SQL fragments or index columns.
+    /// Keep the public string shape while accepting legacy delimited field names.
+    fn generate_type_field_name(&mut self, field_name: &str) {
+        let mut name = Cow::Borrowed(field_name);
+        let mut quoted = false;
+        for (start, end) in [('"', '"'), ('`', '`'), ('[', ']')] {
+            if let Some(inner) = field_name
+                .strip_prefix(start)
+                .and_then(|s| s.strip_suffix(end))
+            {
+                name = Cow::Owned(inner.replace(&format!("{end}{end}"), &end.to_string()));
+                quoted = true;
+                break;
+            }
+        }
+
+        let needs_quoting = quoted
+            || !Self::is_safe_unquoted_identifier(&name)
+            || self.is_reserved_keyword(&name)
+            || self.config.always_quote_identifiers;
+        if self.config.normalize_identifiers && !quoted {
+            name = Cow::Owned(name.to_ascii_lowercase());
+        }
+        if !needs_quoting {
+            self.write(&name);
+            return;
+        }
+
+        let quote_style =
+            if self.config.dialect == Some(DialectType::Athena) && self.athena_hive_context {
+                IdentifierQuoteStyle::BACKTICK
+            } else {
+                self.config.identifier_quote_style
+            };
+        self.write_quoted_identifier(&name, quote_style);
     }
 
     fn generate_column(&mut self, col: &Column) -> Result<()> {
@@ -26846,7 +26887,7 @@ impl Generator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.write(name);
+                    self.generate_type_field_name(name);
                     self.write(" ");
                     self.generate_data_type(dt)?;
                     if *not_null {
@@ -26870,7 +26911,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26885,7 +26926,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26900,7 +26941,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26915,7 +26956,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26930,7 +26971,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26938,12 +26979,14 @@ impl Generator {
                         self.write(")");
                     }
                     _ => {
-                        // Hive/Spark always use angle bracket syntax: STRUCT<name: TYPE>
+                        // BigQuery and Hive/Spark use angle brackets even for types
+                        // parsed from a parenthesized source dialect.
                         let force_angle_brackets = matches!(
                             self.config.dialect,
                             Some(DialectType::Hive)
                                 | Some(DialectType::Spark)
                                 | Some(DialectType::Databricks)
+                                | Some(DialectType::BigQuery)
                         );
                         if *nested && !force_angle_brackets {
                             self.write_keyword("STRUCT(");
@@ -26952,7 +26995,7 @@ impl Generator {
                                     self.write(", ");
                                 }
                                 if !field.name.is_empty() {
-                                    self.write(&field.name);
+                                    self.generate_type_field_name(&field.name);
                                     self.write(" ");
                                 }
                                 self.generate_data_type(&field.data_type)?;
@@ -26966,7 +27009,7 @@ impl Generator {
                                 }
                                 if !field.name.is_empty() {
                                     // Named field: name TYPE (with configurable separator for Hive)
-                                    self.write(&field.name);
+                                    self.generate_type_field_name(&field.name);
                                     self.write(self.config.struct_field_sep);
                                 }
                                 // For anonymous fields, just output the type
@@ -27034,7 +27077,7 @@ impl Generator {
                         self.write(", ");
                     }
                     if !name.is_empty() {
-                        self.write(name);
+                        self.generate_type_field_name(name);
                         self.write(" ");
                     }
                     self.generate_data_type(dt)?;
@@ -33275,7 +33318,7 @@ impl Generator {
                 if key.is_empty() {
                     // Bracket notation at start of segment (e.g., already formatted)
                     self.write(segment);
-                } else if Self::is_safe_json_path_key(key) {
+                } else if Self::is_safe_unquoted_identifier(key) {
                     self.write(key);
                     self.write(subscript);
                 } else {
@@ -33284,7 +33327,7 @@ impl Generator {
                     self.write("\"]");
                     self.write(subscript);
                 }
-            } else if Self::is_safe_json_path_key(segment) {
+            } else if Self::is_safe_unquoted_identifier(segment) {
                 self.write(segment);
             } else {
                 self.write("[\"");
@@ -33294,9 +33337,9 @@ impl Generator {
         }
     }
 
-    /// Check if a JSON path key is a safe identifier that doesn't need bracket quoting.
+    /// Check if a name can be emitted as a conservative unquoted identifier.
     /// Matches Python sqlglot's SAFE_IDENTIFIER_RE: ^[_a-zA-Z]\w*$
-    fn is_safe_json_path_key(key: &str) -> bool {
+    fn is_safe_unquoted_identifier(key: &str) -> bool {
         if key.is_empty() {
             return false;
         }

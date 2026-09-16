@@ -68,6 +68,8 @@ export interface TranspileOptions {
 }
 
 export interface ComplexityGuardOptions {
+  /** Logical parser nesting limit (WASM default 32). Raising it or using null can permit stack exhaustion. */
+  maxParserDepth?: number | null;
   /** Maximum SQL input size in bytes */
   maxInputBytes?: number | null;
   /** Maximum token count after tokenization */

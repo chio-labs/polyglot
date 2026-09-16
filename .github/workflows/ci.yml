@@ -77,6 +77,9 @@ jobs:
       - name: Lib unit tests
         run: cargo test --lib -p polyglot-sql
 
+      - name: Deep nesting regressions
+        run: cargo test -p polyglot-sql --test deep_nesting_regression
+
       - name: Compile standalone Rust example
         run: cargo check --manifest-path examples/rust/Cargo.toml
 

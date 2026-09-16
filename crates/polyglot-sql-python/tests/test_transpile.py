@@ -5,6 +5,42 @@ import pytest
 import polyglot_sql
 
 
+def test_parser_depth_options():
+    sql = "SELECT " + "~ " * 12 + "1"
+    for limit in (0, 8):
+        with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_PARSER_DEPTH_EXCEEDED"):
+            polyglot_sql.transpile(sql, complexity_guard={"maxParserDepth": limit})
+    for options in (None, {}, {"maxParserDepth": 64}, {"maxParserDepth": None}):
+        assert polyglot_sql.transpile(sql, complexity_guard=options)
+    for value in (-1, 1.0, 1.5, float("nan"), float("inf"), -float("inf"), True, False, "10", 2**100):
+        with pytest.raises((TypeError, ValueError)):
+            polyglot_sql.transpile(sql, complexity_guard={"maxParserDepth": value})
+    with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_INPUT_TOO_LARGE"):
+        polyglot_sql.transpile(sql, complexity_guard={"maxParserDepth": None, "maxInputBytes": 1})
+    assert polyglot_sql.transpile("SELECT 1") == ["SELECT 1"]
+
+
+def test_default_parser_depth_is_recoverable_in_subprocess():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import polyglot_sql
+for prefix in ('', 'SELECT '):
+    try:
+        polyglot_sql.parse(prefix + 'IF~' * 4000 + 'I?{')
+    except polyglot_sql.ParseError as error:
+        assert 'E_GUARD_PARSER_DEPTH_EXCEEDED' in str(error), error
+    else:
+        raise AssertionError('depth guard did not reject')
+    assert polyglot_sql.transpile('SELECT 1') == ['SELECT 1']
+"""],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_mysql_to_postgres_transpile():
     out = polyglot_sql.transpile(
         "SELECT IFNULL(a, b) FROM t",

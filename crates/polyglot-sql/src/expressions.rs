@@ -3373,6 +3373,16 @@ impl Identifier {
         self.name.is_empty()
     }
 
+    /// Preserve quoting in the legacy string representation of named type fields.
+    /// Always use SQL-standard delimiters internally, independent of the source dialect.
+    pub(crate) fn to_type_field_name(&self) -> String {
+        if self.quoted {
+            format!("\"{}\"", self.name.replace('"', "\"\""))
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// Set the source span on this identifier
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
@@ -5740,6 +5750,9 @@ pub enum WindowFrameBound {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct StructField {
+    /// A raw field name, or a delimited identifier for compatibility with parsed ASTs.
+    /// Parsed quoted names use double quotes with doubled internal quotes. An empty
+    /// string denotes an anonymous field. Generation selects the target dialect's quotes.
     pub name: String,
     pub data_type: DataType,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -83,6 +83,26 @@ polyglot_sql.generate(ast)
 # ["SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id LIMIT 100 OFFSET 10"]
 ```
 
+### Complexity Guard Options
+
+`transpile` also accepts `complexity_guard`, a `ComplexityGuardOptions` typed dictionary
+using the shared camelCase keys: `maxParserDepth`, `maxInputBytes`, `maxTokens`,
+`maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, and `maxFunctionCallDepth`.
+Omit the argument, pass `None`, or omit a key to use its default. A field-level `None`
+disables that check; a nonnegative integer overrides it. For example:
+
+```python
+polyglot_sql.transpile(sql, complexity_guard={"maxParserDepth": 128})
+```
+
+Parser depth defaults to 1024 logical levels on native targets (32 on WASM) and is
+checked during parsing, before an AST exists. Zero rejects parsing descents.
+Other checks remain independent.
+Raising or disabling limits can permit stack exhaustion and process termination,
+even for trusted generated SQL. Increasing a limit does not increase stack space;
+these limits are not general time/memory budgets. Application owners should control
+overrides. Parsing APIs without guard options inherit the default protection.
+
 ### Format Guard Behavior
 
 `format_sql` uses Rust core formatting guards with default limits:

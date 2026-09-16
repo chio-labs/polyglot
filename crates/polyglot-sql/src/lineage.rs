@@ -476,8 +476,8 @@ fn normalize_cte_name(ident: &Identifier) -> String {
 }
 
 /// Expand SELECT * in CTEs by walking CTE definitions in order and propagating
-/// resolved column lists. This handles nested CTEs (e.g., cte2 AS (SELECT * FROM cte1))
-/// which qualify_columns cannot resolve because it processes each SELECT independently.
+/// resolved column lists. This also handles chained CTEs in schema-free lineage
+/// and analysis paths, where full column qualification is not performed.
 ///
 /// When `schema` is provided, stars from external tables (not CTEs) are also resolved
 /// by looking up column names in the schema. This enables correct expansion of patterns
@@ -1211,14 +1211,26 @@ fn to_node_inner(
     // 0. Unwrap CTE scope — CTE scope expressions are Expression::Cte(...)
     //    but we need the inner query (SELECT/UNION) for column lookup.
     let effective_expr = effective_scope_expression(scope_expr);
+    // A CTE's explicit output names replace its projection names by ordinal.
+    // Resolve that boundary before unwrapping, including unnamed expressions.
+    let alias_ordinal = match (scope_expr, &column) {
+        (Expression::Cte(cte), ColumnRef::Name(name)) if !cte.columns.is_empty() => {
+            cte.columns.iter().position(|alias| {
+                normalize_column_name(&alias.name, dialect) == normalize_column_name(name, dialect)
+            })
+        }
+        _ => None,
+    };
+    let lookup_column = alias_ordinal.map(ColumnRef::Index);
+    let lookup_column = lookup_column.as_ref().unwrap_or(&column);
 
     // 1. Set operations (UNION / INTERSECT / EXCEPT)
     if matches!(
         effective_expr,
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
     ) {
-        return handle_set_operation(
-            &column,
+        let mut node = handle_set_operation(
+            lookup_column,
             context,
             scope_id,
             effective_expr,
@@ -1230,11 +1242,17 @@ fn to_node_inner(
             trim_selects,
             &descendant_cte_scopes,
             depth,
-        );
+        )?;
+        if alias_ordinal.is_some() {
+            if let ColumnRef::Name(name) = &column {
+                node.name = (*name).to_string();
+            }
+        }
+        return Ok(node);
     }
 
     // 2. Find the select expression for this column
-    let select_expr = find_select_expr(effective_expr, &column, dialect)?;
+    let select_expr = find_select_expr(effective_expr, lookup_column, dialect)?;
     let column_name = resolve_column_name(&column, &select_expr);
 
     // 3. Trim source if requested

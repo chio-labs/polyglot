@@ -97,6 +97,8 @@ impl DialectImpl for DuckDBDialect {
         let mut config = TokenizerConfig::default();
         // DuckDB uses double quotes for identifiers
         config.identifiers.insert('"', '"');
+        // A leading escaped double quote belongs to the identifier, not a triple-quoted string.
+        config.quotes.remove("\"\"\"");
         // DuckDB supports nested comments
         config.nested_comments = true;
         // DuckDB allows underscores as digit separators in numeric literals

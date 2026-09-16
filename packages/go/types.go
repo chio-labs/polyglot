@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.10.0"
+const sdkVersion = "0.11.0"
 
 func Version() string {
 	return sdkVersion
@@ -16,12 +16,69 @@ type TranspileOptions struct {
 }
 
 type ComplexityGuardOptions struct {
-	MaxInputBytes        *int `json:"maxInputBytes,omitempty"`
-	MaxTokens            *int `json:"maxTokens,omitempty"`
-	MaxASTNodes          *int `json:"maxAstNodes,omitempty"`
-	MaxASTDepth          *int `json:"maxAstDepth,omitempty"`
-	MaxParenthesisDepth  *int `json:"maxParenthesisDepth,omitempty"`
-	MaxFunctionCallDepth *int `json:"maxFunctionCallDepth,omitempty"`
+	MaxParserDepth       GuardLimit `json:"-"`
+	MaxInputBytes        *int       `json:"maxInputBytes,omitempty"`
+	MaxTokens            *int       `json:"maxTokens,omitempty"`
+	MaxASTNodes          *int       `json:"maxAstNodes,omitempty"`
+	MaxASTDepth          *int       `json:"maxAstDepth,omitempty"`
+	MaxParenthesisDepth  *int       `json:"maxParenthesisDepth,omitempty"`
+	MaxFunctionCallDepth *int       `json:"maxFunctionCallDepth,omitempty"`
+}
+
+// GuardLimit distinguishes an omitted limit from a number (including zero) and
+// explicit disabling. Raising or disabling a parser limit can permit stack exhaustion.
+type GuardLimit struct {
+	value *uint64
+	set   bool
+}
+
+// NewGuardLimit supplies an explicit, nonnegative resource limit.
+func NewGuardLimit(value uint64) GuardLimit { return GuardLimit{value: &value, set: true} }
+
+// DisabledGuardLimit disables this check only; other guards remain active.
+func DisabledGuardLimit() GuardLimit { return GuardLimit{set: true} }
+
+func (limit GuardLimit) MarshalJSON() ([]byte, error) { return json.Marshal(limit.value) }
+
+func (limit *GuardLimit) UnmarshalJSON(data []byte) error {
+	var value *uint64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*limit = GuardLimit{value: value, set: true}
+	return nil
+}
+
+// Custom omission is needed on Go 1.22: omitempty does not omit a value struct.
+func (options ComplexityGuardOptions) MarshalJSON() ([]byte, error) {
+	type fields ComplexityGuardOptions
+	var depth *GuardLimit
+	if options.MaxParserDepth.set {
+		depth = &options.MaxParserDepth
+	}
+	return json.Marshal(struct {
+		fields
+		MaxParserDepth *GuardLimit `json:"maxParserDepth,omitempty"`
+	}{fields: fields(options), MaxParserDepth: depth})
+}
+
+func (options *ComplexityGuardOptions) UnmarshalJSON(data []byte) error {
+	type fields ComplexityGuardOptions
+	var decoded struct {
+		fields
+		MaxParserDepth json.RawMessage `json:"maxParserDepth"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	result := ComplexityGuardOptions(decoded.fields)
+	if decoded.MaxParserDepth != nil {
+		if err := json.Unmarshal(decoded.MaxParserDepth, &result.MaxParserDepth); err != nil {
+			return err
+		}
+	}
+	*options = result
+	return nil
 }
 
 type UnsupportedLevel string

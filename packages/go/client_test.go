@@ -231,6 +231,37 @@ func TestTranspileOptionsComplexityGuardJSON(t *testing.T) {
 	}
 }
 
+func TestParserDepthGuardJSON(t *testing.T) {
+	for _, tc := range []struct {
+		limit GuardLimit
+		want  string
+	}{
+		{GuardLimit{}, `{}`},
+		{NewGuardLimit(0), `{"maxParserDepth":0}`},
+		{NewGuardLimit(64), `{"maxParserDepth":64}`},
+		{DisabledGuardLimit(), `{"maxParserDepth":null}`},
+	} {
+		data, err := json.Marshal(ComplexityGuardOptions{MaxParserDepth: tc.limit})
+		if err != nil || string(data) != tc.want {
+			t.Fatalf("JSON = %s, %v; want %s", data, err, tc.want)
+		}
+		var decoded ComplexityGuardOptions
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		data, err = json.Marshal(decoded)
+		if err != nil || string(data) != tc.want {
+			t.Fatalf("round trip = %s, %v", data, err)
+		}
+	}
+	for _, data := range []string{`{"maxParserDepth":-1}`, `{"maxParserDepth":1.5}`, `{"maxParserDepth":true}`} {
+		var decoded ComplexityGuardOptions
+		if err := json.Unmarshal([]byte(data), &decoded); err == nil {
+			t.Fatalf("accepted %s", data)
+		}
+	}
+}
+
 func TestFormatOptionsJSON(t *testing.T) {
 	limit := 128
 	payload, err := marshalOptions(FormatOptions{MaxSetOpChain: &limit})

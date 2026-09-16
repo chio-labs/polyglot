@@ -122,7 +122,7 @@ help:
 	@echo "  make lint-rust           - Run strict Clippy on wrapper/catalog crates"
 	@echo "  make lint-sdk            - Run Biome checks for the TypeScript SDK"
 	@echo "  make check-consistency   - Check versions, dialect metadata, and active docs"
-	@echo "  make docs-check          - Check metadata, Rust example, and Python docs"
+	@echo "  make docs-check          - Validate metadata, Rust example, and Python docs (no version updates)"
 	@echo "  make dev                 - Run quick development checks"
 	@echo "  make validate            - Run validation before commit"
 	@echo ""
@@ -259,6 +259,7 @@ test-rust-all:
 test-rust-verify:
 	@echo "=== Lib unit tests ==="
 	@cargo test --lib -p polyglot-sql
+	@cargo test -p polyglot-sql --test deep_nesting_regression
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture
@@ -636,8 +637,7 @@ endif
 	@echo "Bumping version to $(V)..."
 	cargo set-version $(V)
 	pnpm -r exec pnpm version $(V) --no-git-tag-version
-	perl -0pi -e 's/const sdkVersion = "[^"]+"/const sdkVersion = "$(V)"/' packages/go/types.go
-	perl -0pi -e 's/(polyglot-sql = \{ version = ")[^"]+"/$${1}$(V)"/g' README.md crates/polyglot-sql/README.md examples/rust/Cargo.toml
+	python3 scripts/check_project_consistency.py --sync-version-references
 	cargo update --manifest-path examples/rust/Cargo.toml -p polyglot-sql
 	$(MAKE) check-consistency
 	@echo "Version bumped to $(V) in all crates and packages."

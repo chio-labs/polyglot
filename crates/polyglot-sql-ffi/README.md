@@ -152,6 +152,20 @@ typedef struct {
 - `polyglot_free_result()`
 - `polyglot_free_validation_result()`
 
+### Parser Depth Guard
+
+Native parsing defaults to 1024 logical levels in the shared Rust core; WASM uses
+a separate default of 32. `polyglot_transpile_with_options` accepts
+`{"complexityGuard":{"maxParserDepth":128}}` to override this limit. Omit the
+field for the target's default, use `null` to disable only this check, or use `0`
+to reject parsing descents. Exhaustion returns a nonzero status and an error
+containing `E_GUARD_PARSER_DEPTH_EXCEEDED`.
+
+Other complexity guards remain independent. Raising or disabling limits does not
+increase stack space and can permit stack exhaustion and process termination.
+The parser guard does not cover arbitrary AST construction or later generation
+and traversal stages. APIs without an options argument retain the default.
+
 ### Formatting Guard Behavior
 
 `polyglot_format` uses Rust core formatting guards with default limits:

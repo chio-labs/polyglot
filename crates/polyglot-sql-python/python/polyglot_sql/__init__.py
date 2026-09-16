@@ -1,5 +1,7 @@
 """Polyglot SQL — Rust-powered SQL transpiler for more than 30 SQL dialects."""
 
+from typing import Optional, TypedDict
+
 from polyglot_sql._polyglot_sql import (
     Expression,
     ColumnResolutionError,
@@ -63,6 +65,21 @@ from polyglot_sql._polyglot_sql import (
     validate_with_schema,
     version as _version,
 )
+
+
+class ComplexityGuardOptions(TypedDict, total=False):
+    """Shared Rust limits. Omit a key for its default; None disables that check.
+
+    Raising or disabling limits can permit stack exhaustion and process termination.
+    """
+
+    maxParserDepth: Optional[int]
+    maxInputBytes: Optional[int]
+    maxTokens: Optional[int]
+    maxAstNodes: Optional[int]
+    maxAstDepth: Optional[int]
+    maxParenthesisDepth: Optional[int]
+    maxFunctionCallDepth: Optional[int]
 
 
 def _builtin(name, *args):
@@ -1157,6 +1174,7 @@ format = format_sql
 __version__ = _version()
 
 __all__ = [
+    "ComplexityGuardOptions",
     "transpile",
     "parse",
     "parse_one",

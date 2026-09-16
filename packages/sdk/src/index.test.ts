@@ -443,6 +443,53 @@ describe('Polyglot SDK', () => {
 
   describe('data types', () => {
     it.each([
+      ['field name', '"field name"'],
+      ['a"b', '"a""b"'],
+      ['select', '"select"'],
+      ['a INT, b', '"a INT, b"'],
+      ['a(16)', '"a(16)"'],
+    ])('should quote constructed struct field %s without changing its name or field count', (name, identifier) => {
+      const dataType: sdk.DataType = {
+        data_type: 'struct',
+        nested: false,
+        fields: [{ name, data_type: { data_type: 'var_char', length: null } }],
+      };
+      const generated = generateDataType(dataType, Dialect.DuckDB);
+      expect(generated).toMatchObject({
+        success: true,
+        sql: `STRUCT(${identifier} TEXT)`,
+      });
+      const parsed = parseDataType(generated.sql!, Dialect.DuckDB);
+      expect(parsed).toMatchObject({
+        success: true,
+        dataType: {
+          data_type: 'struct',
+          fields: [{ name: identifier, data_type: { data_type: 'text' } }],
+        },
+      });
+      expect(generateDataType(parsed.dataType!, Dialect.DuckDB).sql).toBe(
+        generated.sql,
+      );
+    });
+
+    it('should preserve parsed struct field escapes and translate identifier delimiters', () => {
+      const parsed = parseDataType(
+        'STRUCT("a""b" INT, "field name" INT)',
+        Dialect.DuckDB,
+      );
+      expect(parsed.success).toBe(true);
+      expect(generateDataType(parsed.dataType!, Dialect.DuckDB).sql).toBe(
+        'STRUCT("a""b" INT, "field name" INT)',
+      );
+      const spark = generateDataType(parsed.dataType!, Dialect.Spark);
+      expect(spark.sql).toBe('STRUCT<`a"b`: INT, `field name`: INT>');
+      expect(parseDataType(spark.sql!, Dialect.Spark).dataType).toEqual({
+        ...parsed.dataType,
+        nested: false,
+      });
+    });
+
+    it.each([
       ['UTINYINT', 'UINT8', 'uint8', 'UTINYINT'],
       ['USMALLINT', 'UINT16', 'uint16', 'USMALLINT'],
       ['UINTEGER', 'UINT32', 'uint32', 'UINTEGER'],
@@ -809,6 +856,41 @@ describe('Polyglot SDK', () => {
   });
 
   describe('analyzeQuery', () => {
+    it.each([
+      false,
+      true,
+    ])('preserves CTE cast types (schema=%s)', (withSchema) => {
+      const sql =
+        'WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final';
+      const options = {
+        dialect: Dialect.Snowflake,
+        ...(withSchema
+          ? {
+              schema: {
+                tables: [
+                  {
+                    name: 'raw_orders',
+                    columns: [{ name: 'amount', type: 'VARCHAR' }],
+                  },
+                ],
+              },
+            }
+          : {}),
+      };
+      const result = analyzeQuery(sql, options);
+      expect(result.success).toBe(true);
+      expect(result.analysis?.projections[0]).toMatchObject({
+        name: 'amount',
+        transformKind: 'direct',
+        castType: null,
+        typeHint: 'INT',
+      });
+      const json = JSON.parse(
+        wasmModule.analyze_query(sql, JSON.stringify(options)),
+      );
+      expect(json.analysis.projections).toEqual(result.analysis?.projections);
+    });
+
     it('exposes scoped column uses and Unicode occurrence spans through both WASM transports', () => {
       const sql =
         "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1";
@@ -1516,6 +1598,96 @@ describe('Polyglot SDK', () => {
   });
 
   describe('transpile', () => {
+    it('shares configurable parser depth and remains usable after rejection', () => {
+      const sql = `SELECT ${'~ '.repeat(12)}1`;
+      for (const maxParserDepth of [0, 8]) {
+        const result = transpile(sql, Dialect.Generic, Dialect.Generic, {
+          complexityGuard: { maxParserDepth },
+        });
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('E_GUARD_PARSER_DEPTH_EXCEEDED');
+      }
+      for (const maxParserDepth of [undefined, 64, null]) {
+        expect(
+          transpile(sql, Dialect.Generic, Dialect.Generic, {
+            complexityGuard: { maxParserDepth },
+          }).success,
+        ).toBe(true);
+      }
+      for (const maxParserDepth of [-1, 1.5, NaN, Infinity, -Infinity]) {
+        const result = transpile('SELECT 1', Dialect.Generic, Dialect.Generic, {
+          complexityGuard: { maxParserDepth },
+        });
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Invalid transpile options');
+      }
+      const longUnary = `SELECT ${'+ '.repeat(2000)}1`;
+      for (const complexityGuard of [{}, { maxParserDepth: undefined }]) {
+        const result = transpile(longUnary, Dialect.Generic, Dialect.Generic, {
+          complexityGuard,
+        });
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('E_GUARD_PARSER_DEPTH_EXCEEDED');
+      }
+      for (const maxParserDepth of [null, 2048]) {
+        expect(
+          transpile(longUnary, Dialect.Generic, Dialect.Generic, {
+            complexityGuard: { maxParserDepth },
+          }).success,
+        ).toBe(true);
+      }
+      for (const prefix of ['', 'SELECT ']) {
+        const result = parse(
+          `${prefix}${'IF~'.repeat(4000)}I?{`,
+          Dialect.Generic,
+        );
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('E_GUARD_PARSER_DEPTH_EXCEEDED');
+      }
+      expect(
+        transpile('SELECT 1', Dialect.Generic, Dialect.Generic).success,
+      ).toBe(true);
+    });
+
+    it('uses a conservative WASM default without capping explicit overrides', () => {
+      const sql = `SELECT ${'+ '.repeat(48)}1`;
+      const rejected = transpile(sql, Dialect.Generic, Dialect.Generic);
+      expect(rejected.success).toBe(false);
+      expect(rejected.error).toContain('configured limit 32');
+      expect(
+        transpile(sql, Dialect.Generic, Dialect.Generic, {
+          complexityGuard: { maxParserDepth: 64 },
+        }).sql,
+      ).toEqual(['SELECT 1']);
+    });
+
+    it('rejects recursive WASM grammar paths before exhausting its stack', () => {
+      const cases: [string, Dialect][] = [
+        [
+          `SELECT ${'CASE WHEN 1 THEN '.repeat(200)}1${' END'.repeat(200)}`,
+          Dialect.Generic,
+        ],
+        [`${'SELECT ('.repeat(200)}1${')'.repeat(200)}`, Dialect.Generic],
+        [
+          `${'BEGIN TRY '.repeat(200)}SELECT 1${' END TRY BEGIN CATCH SELECT 2 END CATCH'.repeat(200)}`,
+          Dialect.TSQL,
+        ],
+        ...['ARRAY<', 'MAP<INT,', 'STRUCT<x '].map(
+          (prefix): [string, Dialect] => [
+            `SELECT CAST(x AS ${prefix.repeat(2000)}INT${'>'.repeat(2000)})`,
+            Dialect.BigQuery,
+          ],
+        ),
+      ];
+      for (const [sql, dialect] of cases) {
+        const result = transpile(sql, dialect, dialect);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('E_GUARD_PARSER_DEPTH_EXCEEDED');
+        expect(result.error).toContain('configured limit 32');
+        expect(transpile('SELECT 1', dialect, dialect).success).toBe(true);
+      }
+    });
+
     it('should transpile SQL from one dialect to another', () => {
       const result = transpile('SELECT 1', Dialect.Generic, Dialect.PostgreSQL);
       expect(result.success).toBe(true);

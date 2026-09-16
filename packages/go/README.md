@@ -21,7 +21,7 @@ go get github.com/tobilg/polyglot/packages/go
 ```
 
 Go module releases use nested tags that match the root Polyglot release, for
-example `packages/go/v0.5.0`.
+example `packages/go/v0.11.0`.
 
 ## Native Library Setup
 
@@ -434,10 +434,19 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 
 ### Options and Result Types
 
+Parser nesting is limited to 1024 logical levels by default in the native Rust core
+(WASM uses a separate default of 32).
+Set `TranspileOptions.ComplexityGuard.MaxParserDepth` with `NewGuardLimit(n)` to override
+it, or `DisabledGuardLimit()` to disable that check. The zero-value `GuardLimit` omits
+the option; `NewGuardLimit(0)` rejects parsing descents. This is separate from AST depth.
+Raising/disabling limits can permit stack exhaustion and process termination; it does
+not increase available stack or provide a general time/memory budget. Only application
+owners should control overrides. Other guard fields keep their existing types and meanings.
+
 | Type | Fields |
 | --- | --- |
 | `TranspileOptions` | `Pretty`, `UnsupportedLevel`, `MaxUnsupported`, `ComplexityGuard` |
-| `ComplexityGuardOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxASTDepth`, `MaxParenthesisDepth`, `MaxFunctionCallDepth` |
+| `ComplexityGuardOptions` | `MaxParserDepth`, `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxASTDepth`, `MaxParenthesisDepth`, `MaxFunctionCallDepth` |
 | `UnsupportedLevel` | `UnsupportedIgnore`, `UnsupportedWarn`, `UnsupportedRaise`, `UnsupportedImmediate` |
 | `FormatOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxSetOpChain` |
 | `OptimizeOptions` | Reserved for future optimizer options. |

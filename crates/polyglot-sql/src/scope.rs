@@ -650,7 +650,16 @@ fn collect_columns(expr: &Expression, columns: &mut Vec<ColumnRef>) {
 /// This traverses the expression tree and builds a hierarchy of Scope objects
 /// that track sources and column references at each level.
 pub fn build_scope(expression: &Expression) -> Scope {
+    build_scope_with_ctes(expression, &HashMap::new())
+}
+
+/// Build a query scope with CTE definitions inherited from its lexical parent.
+pub(crate) fn build_scope_with_ctes(
+    expression: &Expression,
+    ctes: &HashMap<String, SourceInfo>,
+) -> Scope {
     let mut root = Scope::new(expression.clone());
+    root.cte_sources = ctes.clone();
     build_scope_impl(expression, &mut root);
     root
 }

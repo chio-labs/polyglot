@@ -83,6 +83,14 @@ if (parsed.success) {
 }
 ```
 
+`generateDataType` also accepts programmatically constructed data types. Named
+`STRUCT`, `UNION`, and structured `OBJECT` fields are rendered as identifiers:
+names such as `field name` or `a"b` are quoted and escaped for the target dialect.
+Existing delimited name strings remain supported. Parsed quoted field names use
+double-quote delimiters with doubled internal quotes in the AST; generation
+translates those delimiters to the target dialect. An empty struct field name
+continues to represent an anonymous field.
+
 ### Format
 
 ```typescript
@@ -686,6 +694,11 @@ projection `typeHint` values. `cteFacts` reports top-level CTE definitions,
 `starProjections` records original star projections and schema-expanded
 columns, and each projection includes conservative `nullability`: `'non_null'`,
 `'nullable'`, or `'unknown'`.
+Types propagate through CTE and derived-table outputs. `transformKind` and
+`castType` describe the current projection, not transformations earlier in its
+lineage: a passthrough of a cast column is still `direct`, with the cast's result
+type in `typeHint`. Compact `upstream` references identify base dependencies;
+use the full lineage API to inspect intermediate CTEs and expressions.
 Each `setOperations[].branches[]` entry has a `role`: both `UNION` branches are
 `'value'`, while the right branch of `EXCEPT` and `INTERSECT` is `'filter'`.
 For physical relation facts, `name` remains the qualified display name while
@@ -877,7 +890,7 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `parse(sql, dialect?)` | Parse SQL into AST |
 | `generate(ast, dialect?)` | Generate SQL from AST |
 | `parseDataType(sql, dialect?)` | Parse one standalone SQL data type |
-| `generateDataType(dataType, dialect?)` | Generate SQL from a parsed data type |
+| `generateDataType(dataType, dialect?)` | Generate SQL from a parsed or constructed data type |
 | `format(sql, dialect?)` | Pretty-print SQL |
 | `formatWithOptions(sql, dialect?, options?)` | Pretty-print SQL with guard overrides |
 | `tokenize(sql, dialect?)` | Tokenize SQL into a token stream with source spans |
@@ -886,7 +899,13 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `getDialects()` | List supported dialect names |
 | `getVersion()` | Get library version |
 
-`transpile` accepts `TranspileOptions` with `pretty`, `unsupportedLevel`, `maxUnsupported`, and optional `complexityGuard` limits (`maxInputBytes`, `maxTokens`, `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, `maxFunctionCallDepth`) for recursion-heavy inputs.
+`transpile` accepts `TranspileOptions` with `pretty`, `unsupportedLevel`, `maxUnsupported`, and optional `complexityGuard` limits (`maxParserDepth`, `maxInputBytes`, `maxTokens`, `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, `maxFunctionCallDepth`) for recursion-heavy inputs.
+
+`maxParserDepth` bounds logical nesting during parsing, before an AST exists. The shared Rust core uses a conservative default of 32 on WASM and 1024 on native targets because their available stacks differ. Omit it for the target's default, supply a nonnegative integer to override it, or use `null` to disable only that check. Zero rejects parsing descents. Other limits remain independent; `maxAstDepth` checks the constructed AST instead.
+
+Raising or disabling this limit can permit resource exhaustion and native process termination or WASM traps. It does not increase stack space or establish a general time/memory budget. Overrides should be controlled by the application owner, not arbitrary SQL submitters. Parsing APIs without an options argument inherit the default protection.
+
+This limit covers recursive parsing, not arbitrary programmatic AST construction or the stack use of later generation and traversal stages.
 
 ### Analysis Functions
 

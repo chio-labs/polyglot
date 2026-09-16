@@ -1,4 +1,14 @@
-from typing import Any as TypingAny, overload
+from typing import Any as TypingAny, TypedDict, overload
+
+
+class ComplexityGuardOptions(TypedDict, total=False):
+    maxParserDepth: int | None
+    maxInputBytes: int | None
+    maxTokens: int | None
+    maxAstNodes: int | None
+    maxAstDepth: int | None
+    maxParenthesisDepth: int | None
+    maxFunctionCallDepth: int | None
 
 
 class PolyglotError(Exception):
@@ -1425,7 +1435,10 @@ def transpile(
     *,
     identity: bool = True,
     error_level: str | None = None,
+    unsupported_level: str | None = None,
     pretty: bool = False,
+    max_unsupported: int | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> list[str]:
     """Transpile SQL from one dialect to another.
 

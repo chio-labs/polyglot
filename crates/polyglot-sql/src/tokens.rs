@@ -1490,6 +1490,8 @@ pub struct TokenizerConfig {
     pub quotes: HashMap<String, String>,
     /// Identifier quote characters (start -> end)
     pub identifiers: HashMap<char, char>,
+    /// Whether quoted identifiers use string-style backslash escapes (BigQuery/ClickHouse).
+    pub identifier_backslash_escapes: bool,
     /// Comment definitions (start -> optional end)
     pub comments: HashMap<String, Option<String>>,
     /// String escape characters
@@ -1558,6 +1560,7 @@ impl Default for TokenizerConfig {
             single_tokens: DEFAULT_SINGLE_TOKENS.clone(),
             quotes: DEFAULT_QUOTES.clone(),
             identifiers: DEFAULT_IDENTIFIERS.clone(),
+            identifier_backslash_escapes: false,
             comments: DEFAULT_COMMENTS.clone(),
             // Standard SQL: only '' (doubled quote) escapes a quote
             // Backslash escapes are dialect-specific (MySQL, etc.)
@@ -2933,11 +2936,13 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                     self.current,
                 ));
             }
-            if end_quote == '`' && self.peek() == '\\' && self.peek_next() == end_quote {
-                // ClickHouse allows escaped backticks inside backtick-quoted identifiers.
-                value.push(end_quote);
-                self.advance(); // skip backslash
-                self.advance(); // skip escaped quote
+            if self.config.identifier_backslash_escapes && self.peek() == '\\' {
+                if self.peek_next() == end_quote {
+                    value.push(end_quote);
+                    self.advance_count(2);
+                } else {
+                    self.scan_backslash_escape(&mut value);
+                }
                 continue;
             }
             if self.peek() == end_quote {

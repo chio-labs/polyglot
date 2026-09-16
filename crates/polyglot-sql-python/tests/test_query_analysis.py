@@ -3,6 +3,29 @@ import pytest
 import polyglot_sql
 
 
+@pytest.mark.parametrize("with_schema", [False, True])
+def test_analyze_query_preserves_cast_type_through_cte_passthroughs(with_schema):
+    sql = """
+    WITH transformed AS (
+      SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders
+    ), final AS (
+      SELECT amount FROM transformed
+    ) SELECT amount FROM final
+    """
+    options = {"dialect": "snowflake"}
+    if with_schema:
+        options["schema"] = {
+            "tables": [{"name": "raw_orders", "columns": [{"name": "amount", "type": "VARCHAR"}]}]
+        }
+    projection = polyglot_sql.analyze_query(sql, options)["projections"][0]
+    assert projection["typeHint"] == "INT"
+    assert projection["transformKind"] == "direct"
+    assert projection["castType"] is None
+    assert [(ref["table"].lower(), ref["column"].lower()) for ref in projection["upstream"]] == [
+        ("raw_orders", "amount")
+    ]
+
+
 def test_analyze_query_column_uses_preserve_occurrences_and_projection_lineage():
     sql = "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1"
     analysis = polyglot_sql.analyze_query(sql, dialect="duckdb")

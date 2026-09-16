@@ -4,6 +4,112 @@ use polyglot_sql::{
 };
 use serde_json::json;
 
+#[test]
+fn analyze_query_preserves_cast_types_through_cte_chains() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{"name": "raw_orders", "columns": [{"name": "amount", "type": "VARCHAR"}]}]
+    }))
+    .unwrap();
+    for (dialect, expected) in [
+        (DialectType::Snowflake, "INT"),
+        (DialectType::DuckDB, "INT"),
+        (DialectType::PostgreSQL, "INT"),
+        (DialectType::BigQuery, "INT64"),
+    ] {
+        for sql in [
+            "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final",
+            "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS n FROM raw_orders), final AS (SELECT n FROM transformed) SELECT n FROM final",
+            "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT transformed.amount FROM transformed) SELECT final.amount FROM final",
+            "WITH transformed(n) AS (SELECT CAST(amount AS INTEGER) FROM raw_orders), final(m) AS (SELECT n FROM transformed) SELECT m FROM final",
+            "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT * FROM transformed) SELECT * FROM final",
+            "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders) SELECT amount FROM (SELECT amount FROM transformed) AS final",
+            "WITH unused AS (SELECT CAST(amount AS DATE) AS amount FROM raw_orders), transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders) SELECT amount FROM transformed",
+        ] {
+            for with_schema in [false, true] {
+                let analysis = analyze_query(sql, AnalyzeQueryOptions {
+                    dialect,
+                    schema: with_schema.then(|| schema.clone()),
+                }).unwrap();
+                let fact = &analysis.projections[0];
+                assert_eq!(fact.type_hint.as_deref(), Some(expected), "{dialect:?}, schema={with_schema}: {sql}");
+                assert_eq!(fact.transform_kind, TransformKind::Direct, "{sql}");
+                assert_eq!(fact.cast_type, None, "{sql}");
+                assert!(fact.upstream.iter().any(|reference| {
+                    reference.table.as_deref().is_some_and(|table| table.eq_ignore_ascii_case("raw_orders"))
+                        && reference.column.eq_ignore_ascii_case("amount")
+                }), "{sql}: {:?}", fact.upstream);
+            }
+        }
+    }
+}
+
+#[test]
+fn analyze_query_keeps_scalar_subquery_types_in_their_own_scope() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"name":"t1", "columns":[{"name":"id","type":"INT"}]},
+        {"name":"t2", "columns":[{"name":"id","type":"INT"},{"name":"val","type":"DOUBLE"}]}
+    ]}))
+    .unwrap();
+    for (sql, expected) in [
+        ("SELECT (SELECT val FROM t2 WHERE t2.id = t1.id) AS v FROM t1", "DOUBLE"),
+        ("SELECT (SELECT id) AS v FROM t1", "INT"),
+        ("SELECT (SELECT (SELECT id)) AS v FROM t1", "INT"),
+        ("SELECT (WITH c AS (SELECT id AS n) SELECT n FROM c) AS v FROM t1", "INT"),
+        ("SELECT (WITH c AS (SELECT CAST(val AS VARCHAR) AS n FROM t2) SELECT n FROM c) AS v FROM t1", "TEXT"),
+        ("SELECT b.val FROM t1 JOIN LATERAL (SELECT val FROM t2 WHERE t2.id = t1.id) AS b ON TRUE", "DOUBLE"),
+        ("SELECT b.id FROM t1, LATERAL (SELECT id) AS b", "INT"),
+        ("WITH unused AS (SELECT 1 AS n) SELECT (SELECT n) AS v FROM t1", "UNKNOWN"),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB, schema: Some(schema.clone()),
+        }).unwrap();
+        assert_eq!(analysis.projections[0].type_hint.as_deref(), Some(expected), "{sql}");
+    }
+}
+
+#[test]
+fn analyze_query_infers_the_selected_expression_not_an_arbitrary_upstream_cast() {
+    for (sql, expected) in [
+        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT CAST(n AS VARCHAR) AS n FROM a) SELECT n FROM b", "TEXT"),
+        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n + 0.5 AS n FROM a) SELECT n FROM b", "DOUBLE"),
+        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (WITH a AS (SELECT CAST('2024-01-01' AS DATE) AS n) SELECT n FROM a) SELECT n FROM b", "DATE"),
+        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n FROM a UNION ALL SELECT n FROM a) SELECT n FROM b", "INT"),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(analysis.projections[0].type_hint.as_deref(), Some(expected), "{sql}");
+    }
+}
+
+#[test]
+fn schema_aware_lineage_preserves_cte_cast_nodes() {
+    use polyglot_sql::traversal::ExpressionWalk;
+    let sql = "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final";
+    let expression = polyglot_sql::parse_one(sql, DialectType::Snowflake).unwrap();
+    let schema = polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+        &serde_json::from_value(json!({"tables": [{"name": "raw_orders", "columns": [{"name": "amount", "type": "VARCHAR"}]}]})).unwrap(),
+        DialectType::Snowflake,
+    );
+    let node = polyglot_sql::lineage::lineage_with_schema(
+        "amount",
+        &expression,
+        Some(&schema),
+        Some(DialectType::Snowflake),
+        false,
+    )
+    .unwrap();
+    let nodes: Vec<_> = node.walk().collect();
+    assert_eq!(nodes.len(), 4);
+    assert!(nodes.iter().any(|node| node
+        .expression
+        .contains(|e| matches!(e, polyglot_sql::Expression::Cast(_)))));
+    assert_eq!(nodes[1].source_kind, SourceKind::Cte);
+    assert_eq!(nodes[2].source_kind, SourceKind::Cte);
+    assert_eq!(nodes[3].source_kind, SourceKind::Table);
+}
+
 fn column_use_analysis(sql: &str, with_schema: bool) -> polyglot_sql::QueryAnalysis {
     analyze_query(
         sql,

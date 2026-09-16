@@ -4,6 +4,76 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.11.0] - 2026-09-16
+
+### Added
+
+- Default-enabled, configurable parser-depth protection in the shared Rust core,
+  exposed as `maxParserDepth` through TypeScript/WASM, FFI, Go, and Python's new
+  `transpile(..., complexity_guard=...)` argument. Defaults are target-specific:
+  1024 logical levels on native targets and 32 on WASM. Explicit overrides can
+  raise or disable this check; other complexity limits remain independent.
+  Raising or disabling the limit can permit stack exhaustion.
+- Go's `GuardLimit`, `NewGuardLimit`, and `DisabledGuardLimit` distinguish an
+  omitted parser-depth limit from an explicit value, including zero, or disabling
+  the check. TypeScript/WASM preserves the same distinction between omitted or
+  `undefined` limits and explicit `null` through both value and JSON transports.
+- TypeScript AST utilities now expose `isExpressionType`, `ExpressionData`, and
+  `ExpressionTypeOf` for variant-aware narrowing and payload access.
+
+### Changed
+
+- TypeScript `ParseResult` is now a discriminated success/failure union, with
+  `Expression[]` on successful parses instead of `any`. `getExprType`,
+  `getExprData`, and literal-tag `findByType` calls preserve concrete variant
+  types; `ExpressionByKey` and `ExpressionInner` support unions of variant keys.
+  `getExprData` returns `unknown` for an unnarrowed `Expression`, so callers must
+  narrow before accessing payload fields. Dynamic or union-valued tags do not
+  produce unsound type-guard narrowing.
+- Rust callers constructing exhaustive `ComplexityGuardOptions` literals must
+  include `max_parser_depth`; exhaustive `TokenizerConfig` literals must include
+  `identifier_backslash_escapes`. Using `..Default::default()` preserves defaults.
+- Deep-nesting integration tests now run in routine Rust verification and CI.
+  Existing Rust and SDK test files cover the parser-depth options, quoted type
+  fields, CTE type propagation, and TypeScript compile-time narrowing contracts.
+
+### Fixed
+
+- Parser loops now recognize explicit end-of-input consistently, preventing
+  hangs on truncated SQL and unterminated delimiter-based constructs. The parser
+  no longer repeatedly reparses the same prefix when distinguishing scalar and
+  procedural `IF` forms, avoiding exponential backtracking on nested inputs.
+- Long IF/unary chains now return a depth-guard error with default limits.
+  Nested ARRAY type constructors are parsed iteratively while retaining their
+  logical depth budget. Guard exhaustion cannot be hidden by speculative fallbacks.
+- A trailing explicit EOF token no longer adds whitespace to raw multi-word
+  `ALTER TABLE ... UNSET` clauses.
+- Named data-type fields are generated as individual identifiers rather than raw
+  SQL. STRUCT/ROW/Tuple/RECORD, UNION, and OBJECT fields now quote reserved words,
+  whitespace, punctuation, and embedded delimiters using the target dialect's
+  rules, including nested types and programmatically constructed ASTs. Parsed
+  quoted names retain their escapes without changing the public string-based
+  field representation; BigQuery always generates angle-bracket STRUCT syntax.
+- Quoted-identifier backslash handling is now dialect-specific for BigQuery and
+  ClickHouse, while Hive/Spark retain literal backslashes. DuckDB identifiers
+  beginning with escaped double quotes are no longer mistaken for triple-quoted
+  strings.
+- Query analysis preserves cast-result types through chained CTEs and derived
+  tables, with or without schema metadata, including renamed outputs, explicit
+  CTE column lists, and star passthroughs. Qualification and type annotation use
+  selected sources and genuine outer scopes instead of unrelated schema tables
+  or unused CTE definitions, while retaining correlated scalar and lateral
+  subquery resolution.
+- Full lineage retains intermediate CTE and cast nodes and resolves explicit CTE
+  column aliases by ordinal. Compact upstream references still identify base
+  dependencies; a passthrough projection remains `direct` with no local
+  `castType`, while `typeHint` reflects its resolved output type.
+- Version consistency checks and `make bump-version` now share matching rules
+  for single-line, multiline, reordered, and shorthand Rust dependency examples,
+  plus the function-catalog README and Go release-tag example. Active references
+  are synchronized to the workspace version without rewriting historical
+  changelogs, benchmark versions, or unrelated dependency versions.
+
 ## [0.10.0] - 2026-09-14
 
 ### Added

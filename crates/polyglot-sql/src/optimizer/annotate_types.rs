@@ -74,6 +74,9 @@ impl TypeCoercionClass {
 pub struct TypeAnnotator<'a> {
     /// Schema for looking up column types
     _schema: Option<&'a dyn Schema>,
+    /// Catalogue and visible CTE definitions used to bind nested query inputs.
+    /// This is separate from the selected bindings used for column lookup.
+    query_schema: Option<&'a dyn Schema>,
     /// Dialect for dialect-specific type rules
     _dialect: Option<DialectType>,
     /// Whether to annotate types for all expressions
@@ -87,6 +90,7 @@ impl<'a> TypeAnnotator<'a> {
     pub fn new(schema: Option<&'a dyn Schema>, dialect: Option<DialectType>) -> Self {
         let mut annotator = Self {
             _schema: schema,
+            query_schema: schema,
             _dialect: dialect,
             annotate_aggregates: true,
             function_return_types: HashMap::new(),
@@ -505,17 +509,17 @@ impl<'a> TypeAnnotator<'a> {
             Expression::TryCast(cast) => Some(cast.to.clone()),
 
             // Subqueries - type is the type of the first SELECT expression
-            Expression::Subquery(subq) => {
-                if let Expression::Select(select) = &subq.this {
-                    if let Some(first) = select.expressions.first() {
-                        self.annotate(first)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            Expression::Subquery(subq) => subq.inferred_type.clone().or_else(|| {
+                let mut query = subq.this.clone();
+                annotate_scoped_expression_with_outer(
+                    &mut query,
+                    self.query_schema,
+                    self._dialect,
+                    self._schema,
+                )
+                .first()
+                .map(|(_, data_type)| data_type.clone())
+            }),
 
             // CASE expression - common type of all result branches
             Expression::Case(case) => self.coerce_expression_types(
@@ -994,7 +998,13 @@ impl<'a> TypeAnnotator<'a> {
 
             // Subquery
             Expression::Subquery(s) => {
-                self.annotate_in_place(&mut s.this);
+                let columns = annotate_scoped_expression_with_outer(
+                    &mut s.this,
+                    self.query_schema,
+                    self._dialect,
+                    self._schema,
+                );
+                s.inferred_type = columns.first().map(|(_, data_type)| data_type.clone());
             }
 
             Expression::Trim(f) => {
@@ -1917,13 +1927,19 @@ fn duckdb_unsigned_integer_coercion(
 }
 
 /// A schema layer whose entries are visible only while annotating one query
-/// scope. The parent contains physical tables and any correlated outer scope;
-/// CTE, derived-table, table-alias, and table-valued-function outputs stay in
-/// this layer and therefore cannot leak into sibling scopes.
+/// scope. Catalogue/CTE definitions, selected relations, and correlated outer
+/// bindings are kept separate so merely declaring a CTE or supplying a table
+/// schema does not make its columns visible to a query.
 struct ScopedSchema<'a> {
     parent: Option<&'a dyn Schema>,
     tables: HashMap<String, HashMap<String, DataType>>,
     dialect: Option<DialectType>,
+    /// Catalogue/CTE layers may delegate lookups; a SELECT's binding layer
+    /// must only resolve columns from its selected relations.
+    lookup_parent_columns: bool,
+    /// Selected bindings of a genuinely enclosing correlated query, separate
+    /// from the catalogue and available CTE definitions in `parent`.
+    outer: Option<&'a dyn Schema>,
 }
 
 impl<'a> ScopedSchema<'a> {
@@ -1932,6 +1948,8 @@ impl<'a> ScopedSchema<'a> {
             parent,
             tables: HashMap::new(),
             dialect,
+            lookup_parent_columns: true,
+            outer: None,
         }
     }
 
@@ -1972,6 +1990,7 @@ impl Schema for ScopedSchema<'_> {
         let table = self.normalized(table, true);
         let columns = columns
             .iter()
+            .filter(|(name, _)| !name.is_empty())
             .map(|(name, data_type)| (self.normalized(name, false), data_type.clone()))
             .collect();
         self.tables.insert(table, columns);
@@ -1993,8 +2012,15 @@ impl Schema for ScopedSchema<'_> {
             let local_tables = self.local_tables_for_column(column);
             return match local_tables.as_slice() {
                 [local_table] => self.get_column_type(local_table, column),
-                [] => self
+                [] if self.lookup_parent_columns => self
                     .parent
+                    .ok_or_else(|| SchemaError::ColumnNotFound {
+                        table: String::new(),
+                        column: column.to_string(),
+                    })?
+                    .get_column_type(table, column),
+                [] => self
+                    .outer
                     .ok_or_else(|| SchemaError::ColumnNotFound {
                         table: String::new(),
                         column: column.to_string(),
@@ -2017,6 +2043,15 @@ impl Schema for ScopedSchema<'_> {
             });
         }
 
+        if !self.lookup_parent_columns {
+            return self
+                .outer
+                .ok_or_else(|| SchemaError::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                })?
+                .get_column_type(table, column);
+        }
         self.parent
             .ok_or_else(|| SchemaError::ColumnNotFound {
                 table: table.to_string(),
@@ -2113,8 +2148,13 @@ fn projection_type(expression: &Expression) -> DataType {
 fn query_outputs(expressions: &[Expression]) -> OutputColumns {
     expressions
         .iter()
-        .filter_map(|expression| {
-            projection_name(expression).map(|name| (name, projection_type(expression)))
+        .map(|expression| {
+            // Keep unnamed slots until CTE/derived-table column aliases have
+            // been applied by ordinal. They are not registered as named columns.
+            (
+                projection_name(expression).unwrap_or_default(),
+                projection_type(expression),
+            )
         })
         .collect()
 }
@@ -2179,6 +2219,25 @@ fn virtual_output_columns(
     }
 }
 
+fn annotate_derived_query(
+    subquery: &mut crate::expressions::Subquery,
+    schema: &ScopedSchema<'_>,
+    dialect: Option<DialectType>,
+) -> OutputColumns {
+    // LATERAL sees preceding selected sources, not every table/CTE available
+    // in the catalogue used to bind its own FROM clause.
+    let mut selected = ScopedSchema::new(None, dialect);
+    selected.tables = schema.tables.clone();
+    selected.lookup_parent_columns = false;
+    selected.outer = schema.outer;
+    let outer = if subquery.lateral {
+        Some(&selected as &dyn Schema)
+    } else {
+        schema.outer
+    };
+    annotate_scoped_expression_with_outer(&mut subquery.this, schema.parent, dialect, outer)
+}
+
 fn annotate_relation_source(
     expression: &mut Expression,
     schema: &mut ScopedSchema<'_>,
@@ -2197,7 +2256,7 @@ fn annotate_relation_source(
             let _ = schema.add_table(visible_name, &columns, dialect);
         }
         Expression::Subquery(subquery) => {
-            let mut columns = annotate_scoped_expression(&mut subquery.this, Some(schema), dialect);
+            let mut columns = annotate_derived_query(subquery, schema, dialect);
             columns = apply_column_aliases(columns, &subquery.column_aliases);
             if let Some((_, first_type)) = columns.first() {
                 subquery.inferred_type = Some(first_type.clone());
@@ -2209,8 +2268,7 @@ fn annotate_relation_source(
         Expression::Alias(alias) => {
             match &mut alias.this {
                 Expression::Subquery(subquery) => {
-                    let columns =
-                        annotate_scoped_expression(&mut subquery.this, Some(schema), dialect);
+                    let columns = annotate_derived_query(subquery, schema, dialect);
                     let columns = apply_column_aliases(columns, &alias.column_aliases);
                     let _ = schema.add_table(&alias.alias.name, &columns, dialect);
                     return;
@@ -2268,10 +2326,12 @@ fn annotate_with(
     with: &mut Option<crate::expressions::With>,
     schema: &mut ScopedSchema<'_>,
     dialect: Option<DialectType>,
+    outer: Option<&dyn Schema>,
 ) {
     if let Some(with) = with {
         for cte in &mut with.ctes {
-            let columns = annotate_scoped_expression(&mut cte.this, Some(schema), dialect);
+            let columns =
+                annotate_scoped_expression_with_outer(&mut cte.this, Some(schema), dialect, outer);
             let columns = apply_column_aliases(columns, &cte.columns);
             let _ = schema.add_table(&cte.alias.name, &columns, dialect);
         }
@@ -2282,9 +2342,12 @@ fn annotate_select(
     select: &mut crate::expressions::Select,
     parent: Option<&dyn Schema>,
     dialect: Option<DialectType>,
+    outer: Option<&dyn Schema>,
 ) -> OutputColumns {
-    let mut schema = ScopedSchema::new(parent, dialect);
-    annotate_with(&mut select.with, &mut schema, dialect);
+    let mut ctes = ScopedSchema::new(parent, dialect);
+    annotate_with(&mut select.with, &mut ctes, dialect, outer);
+    let mut schema = ScopedSchema::new(Some(&ctes), dialect);
+    schema.outer = outer;
 
     if let Some(from) = &mut select.from {
         for source in &mut from.expressions {
@@ -2295,7 +2358,9 @@ fn annotate_select(
         annotate_relation_source(&mut join.this, &mut schema, dialect);
     }
 
+    schema.lookup_parent_columns = false;
     let mut annotator = TypeAnnotator::new(Some(&schema), dialect);
+    annotator.query_schema = Some(&ctes);
     for expression in &mut select.expressions {
         annotator.annotate_in_place(expression);
     }
@@ -2307,36 +2372,70 @@ fn annotate_scoped_expression(
     parent: Option<&dyn Schema>,
     dialect: Option<DialectType>,
 ) -> OutputColumns {
+    annotate_scoped_expression_with_outer(expression, parent, dialect, None)
+}
+
+fn annotate_scoped_expression_with_outer(
+    expression: &mut Expression,
+    parent: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+    outer: Option<&dyn Schema>,
+) -> OutputColumns {
     match expression {
-        Expression::Select(select) => annotate_select(select, parent, dialect),
+        Expression::Select(select) => annotate_select(select, parent, dialect, outer),
         Expression::Subquery(subquery) => {
-            let columns = annotate_scoped_expression(&mut subquery.this, parent, dialect);
+            let columns =
+                annotate_scoped_expression_with_outer(&mut subquery.this, parent, dialect, outer);
             if let Some((_, first_type)) = columns.first() {
                 subquery.inferred_type = Some(first_type.clone());
             }
             columns
         }
-        Expression::Cte(cte) => annotate_scoped_expression(&mut cte.this, parent, dialect),
-        Expression::Paren(paren) => annotate_scoped_expression(&mut paren.this, parent, dialect),
+        Expression::Cte(cte) => {
+            annotate_scoped_expression_with_outer(&mut cte.this, parent, dialect, outer)
+        }
+        Expression::Paren(paren) => {
+            annotate_scoped_expression_with_outer(&mut paren.this, parent, dialect, outer)
+        }
         Expression::Union(union) => {
             let mut schema = ScopedSchema::new(parent, dialect);
-            annotate_with(&mut union.with, &mut schema, dialect);
-            let columns = annotate_scoped_expression(&mut union.left, Some(&schema), dialect);
-            annotate_scoped_expression(&mut union.right, Some(&schema), dialect);
+            annotate_with(&mut union.with, &mut schema, dialect, outer);
+            let columns = annotate_scoped_expression_with_outer(
+                &mut union.left,
+                Some(&schema),
+                dialect,
+                outer,
+            );
+            annotate_scoped_expression_with_outer(&mut union.right, Some(&schema), dialect, outer);
             columns
         }
         Expression::Intersect(intersect) => {
             let mut schema = ScopedSchema::new(parent, dialect);
-            annotate_with(&mut intersect.with, &mut schema, dialect);
-            let columns = annotate_scoped_expression(&mut intersect.left, Some(&schema), dialect);
-            annotate_scoped_expression(&mut intersect.right, Some(&schema), dialect);
+            annotate_with(&mut intersect.with, &mut schema, dialect, outer);
+            let columns = annotate_scoped_expression_with_outer(
+                &mut intersect.left,
+                Some(&schema),
+                dialect,
+                outer,
+            );
+            annotate_scoped_expression_with_outer(
+                &mut intersect.right,
+                Some(&schema),
+                dialect,
+                outer,
+            );
             columns
         }
         Expression::Except(except) => {
             let mut schema = ScopedSchema::new(parent, dialect);
-            annotate_with(&mut except.with, &mut schema, dialect);
-            let columns = annotate_scoped_expression(&mut except.left, Some(&schema), dialect);
-            annotate_scoped_expression(&mut except.right, Some(&schema), dialect);
+            annotate_with(&mut except.with, &mut schema, dialect, outer);
+            let columns = annotate_scoped_expression_with_outer(
+                &mut except.left,
+                Some(&schema),
+                dialect,
+                outer,
+            );
+            annotate_scoped_expression_with_outer(&mut except.right, Some(&schema), dialect, outer);
             columns
         }
         _ => {
@@ -2380,6 +2479,41 @@ mod tests {
 
     fn make_bool_literal(val: bool) -> Expression {
         Expression::Boolean(BooleanLiteral { value: val })
+    }
+
+    #[test]
+    fn test_annotate_cte_bindings_exclude_unselected_definitions() {
+        for sql in [
+            "WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n FROM a) SELECT n FROM b",
+            "WITH unused AS (SELECT CAST('x' AS TEXT) AS n), a AS (SELECT CAST('1' AS INT) AS n) SELECT n FROM a",
+            "WITH a(n) AS (SELECT CAST('1' AS INT)), b(m) AS (SELECT n FROM a) SELECT m FROM b",
+        ] {
+            let mut expression = parse_one(sql, DialectType::DuckDB).unwrap();
+            annotate_types(&mut expression, None, Some(DialectType::DuckDB));
+            let Expression::Select(select) = expression else { panic!("select") };
+            assert!(matches!(select.expressions[0].inferred_type(), Some(DataType::Int { .. })), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_annotate_does_not_resolve_unselected_or_ambiguous_columns() {
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table("unrelated", &[("n".into(), DataType::Text)], None)
+            .unwrap();
+        for sql in [
+            "SELECT n FROM missing",
+            "SELECT unrelated.n FROM missing",
+            "WITH a AS (SELECT 1 AS n), b AS (SELECT 2 AS n) SELECT n FROM a CROSS JOIN b",
+            "WITH unused AS (SELECT 1 AS n) SELECT n FROM missing",
+        ] {
+            let mut expression = parse_one(sql, DialectType::DuckDB).unwrap();
+            annotate_types(&mut expression, Some(&schema), Some(DialectType::DuckDB));
+            let Expression::Select(select) = expression else {
+                panic!("select")
+            };
+            assert!(select.expressions[0].inferred_type().is_none(), "{sql}");
+        }
     }
 
     #[test]

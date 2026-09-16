@@ -238,8 +238,22 @@ pub fn transpile_with_options_value(
 ) -> JsValue {
     set_panic_hook();
 
+    // serde-wasm-bindgen maps both undefined and null to Option::None. For this
+    // optional limit, undefined must behave like JSON omission, not disabling.
+    let parser_depth_undefined =
+        js_sys::Reflect::get(&options, &JsValue::from_str("complexityGuard"))
+            .and_then(|guard| js_sys::Reflect::get(&guard, &JsValue::from_str("maxParserDepth")))
+            .map(|value| value.is_undefined())
+            .unwrap_or(false);
     let result = match serde_wasm_bindgen::from_value::<TranspileOptions>(options) {
-        Ok(options) => transpile_internal_with_options(sql, read_dialect, write_dialect, options),
+        Ok(mut options) => {
+            if parser_depth_undefined {
+                options.complexity_guard.max_parser_depth = TranspileOptions::default()
+                    .complexity_guard
+                    .max_parser_depth;
+            }
+            transpile_internal_with_options(sql, read_dialect, write_dialect, options)
+        }
         Err(e) => TranspileResult {
             success: false,
             sql: None,
@@ -2835,6 +2849,28 @@ mod tests {
 
         assert_eq!(generated["success"], true);
         assert_eq!(generated["sql"], "VARCHAR(255)");
+    }
+
+    #[test]
+    fn test_generate_data_type_quotes_constructed_field_names() {
+        let data_type = serde_json::json!({
+            "data_type": "struct", "nested": false,
+            "fields": [{"name": "a\"b", "data_type": {"data_type": "text"}}]
+        });
+        let generated: serde_json::Value =
+            serde_json::from_str(&generate_data_type(&data_type.to_string(), "duckdb")).unwrap();
+        assert_eq!(generated["success"], true);
+        assert_eq!(generated["sql"], "STRUCT(\"a\"\"b\" TEXT)");
+        let parsed: serde_json::Value = serde_json::from_str(&parse_data_type(
+            generated["sql"].as_str().unwrap(),
+            "duckdb",
+        ))
+        .unwrap();
+        assert_eq!(parsed["success"], true);
+        let data_type: serde_json::Value =
+            serde_json::from_str(parsed["dataType"].as_str().unwrap()).unwrap();
+        assert_eq!(data_type["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(data_type["fields"][0]["name"], "\"a\"\"b\"");
     }
 
     #[test]

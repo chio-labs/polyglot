@@ -279,14 +279,14 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         };
     }
 
+    crate::lineage::expand_cte_stars(
+        &mut expression,
+        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
+    );
     annotate_types(
         &mut expression,
         mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
         Some(options.dialect),
-    );
-    crate::lineage::expand_cte_stars(
-        &mut expression,
-        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
     );
 
     let scope = build_scope(&expression);

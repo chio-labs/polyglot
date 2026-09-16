@@ -276,6 +276,56 @@ fn test_transpile_with_options_invalid_json() {
 }
 
 #[test]
+fn test_parser_depth_guard_options() {
+    let dialect = c("generic");
+    let sql = c(&format!("SELECT {}1", "~ ".repeat(12)));
+    for (value, fails) in [("0", true), ("8", true), ("64", false), ("null", false)] {
+        let options = c(&format!(
+            "{{\"complexityGuard\":{{\"maxParserDepth\":{value}}}}}"
+        ));
+        let (status, _, error) = consume_result(polyglot_transpile_with_options(
+            sql.as_ptr(),
+            dialect.as_ptr(),
+            dialect.as_ptr(),
+            options.as_ptr(),
+        ));
+        if fails {
+            assert_ne!(status, 0);
+            assert!(error.unwrap().contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+        } else {
+            assert_eq!(status, 0, "{error:?}");
+        }
+    }
+    for value in ["-1", "1.5", "true"] {
+        let options = c(&format!(
+            "{{\"complexityGuard\":{{\"maxParserDepth\":{value}}}}}"
+        ));
+        let (status, _, _) = consume_result(polyglot_transpile_with_options(
+            sql.as_ptr(),
+            dialect.as_ptr(),
+            dialect.as_ptr(),
+            options.as_ptr(),
+        ));
+        assert_eq!(status, 6);
+    }
+    let deep = c(&format!("SELECT {}1", "~ ".repeat(4000)));
+    let (status, _, error) = consume_result(polyglot_transpile(
+        deep.as_ptr(),
+        dialect.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_ne!(status, 0);
+    assert!(error.unwrap().contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+    let good = c("SELECT 1");
+    let (status, _, error) = consume_result(polyglot_transpile(
+        good.as_ptr(),
+        dialect.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "{error:?}");
+}
+
+#[test]
 fn test_transpile_with_options_null_options() {
     let sql = c("SELECT 1");
     let from = c("postgres");
@@ -451,6 +501,36 @@ fn test_generate_data_type_renders_sql() {
     ));
     assert_eq!(gen_status, 0, "gen_error={gen_error:?}");
     assert_eq!(gen_data.expect("missing generated type"), "VARCHAR(255)");
+}
+
+#[test]
+fn test_generate_named_type_fields_quotes_and_preserves_names() {
+    let dialect = c("duckdb");
+    for (name, identifier) in [
+        ("field name", r#""field name""#),
+        ("a\"b", r#""a""b""#),
+        ("a INT, b", r#""a INT, b""#),
+    ] {
+        let input = c(&serde_json::json!({
+            "data_type": "struct", "nested": false,
+            "fields": [{"name": name, "data_type": {"data_type": "var_char", "length": null}}]
+        })
+        .to_string());
+        let (status, data, error) = consume_result(polyglot_generate_data_type(
+            input.as_ptr(),
+            dialect.as_ptr(),
+        ));
+        assert_eq!(status, 0, "{error:?}");
+        let sql = data.unwrap();
+        assert_eq!(sql, format!("STRUCT({identifier} TEXT)"));
+        let sql = c(&sql);
+        let (status, data, error) =
+            consume_result(polyglot_parse_data_type(sql.as_ptr(), dialect.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let parsed: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        assert_eq!(parsed["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["fields"][0]["name"], identifier);
+    }
 }
 
 #[test]
@@ -1267,6 +1347,25 @@ fn test_source_tables_postgres_prepare_body() {
             .any(|table| table.eq_ignore_ascii_case("sensitive_table")),
         "tables={tables:?}"
     );
+}
+
+#[test]
+fn test_analyze_query_cte_cast_type() {
+    let sql = c("WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final");
+    for options in [
+        r#"{"dialect":"snowflake"}"#,
+        r#"{"dialect":"snowflake","schema":{"tables":[{"name":"raw_orders","columns":[{"name":"amount","type":"VARCHAR"}]}]}}"#,
+    ] {
+        let options = c(options);
+        let (status, data, error) =
+            consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let analysis: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        let projection = &analysis["projections"][0];
+        assert_eq!(projection["typeHint"], "INT");
+        assert_eq!(projection["transformKind"], "direct");
+        assert!(projection["castType"].is_null());
+    }
 }
 
 #[test]

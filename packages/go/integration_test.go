@@ -26,6 +26,54 @@ func integrationClient(t *testing.T) *Client {
 	return client
 }
 
+func TestIntegrationParserDepthGuard(t *testing.T) {
+	client := integrationClient(t)
+	sql := "SELECT " + strings.Repeat("~ ", 12) + "1"
+	for _, tc := range []struct {
+		limit GuardLimit
+		fails bool
+	}{
+		{GuardLimit{}, false}, {NewGuardLimit(0), true}, {NewGuardLimit(8), true},
+		{NewGuardLimit(64), false}, {DisabledGuardLimit(), false},
+	} {
+		_, err := client.Transpile(sql, "generic", "generic", TranspileOptions{
+			ComplexityGuard: &ComplexityGuardOptions{MaxParserDepth: tc.limit},
+		})
+		if tc.fails {
+			if err == nil || !strings.Contains(err.Error(), "E_GUARD_PARSER_DEPTH_EXCEEDED") {
+				t.Fatalf("expected depth error, got %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Transpile("SELECT "+strings.Repeat("~ ", 4000)+"1", "generic", "generic"); err == nil || !strings.Contains(err.Error(), "E_GUARD_PARSER_DEPTH_EXCEEDED") {
+		t.Fatalf("default guard: %v", err)
+	}
+	if _, err := client.Parse("SELECT 1", "generic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationAnalyzeQueryCTECastType(t *testing.T) {
+	client := integrationClient(t)
+	sql := "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final"
+	schema := &ValidationSchema{Tables: []SchemaTable{{Name: "raw_orders", Columns: []SchemaColumn{{Name: "amount", Type: "VARCHAR"}}}}}
+	for _, inputSchema := range []*ValidationSchema{nil, schema} {
+		analysis, err := client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "snowflake", Schema: inputSchema})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(analysis.Projections) != 1 {
+			t.Fatalf("unexpected projections: %#v", analysis.Projections)
+		}
+		projection := analysis.Projections[0]
+		if projection.TypeHint == nil || *projection.TypeHint != "INT" || projection.TransformKind != "direct" || projection.CastType != nil {
+			t.Fatalf("unexpected CTE projection: %#v", projection)
+		}
+	}
+}
+
 func TestIntegrationAnalyzeQueryColumnUses(t *testing.T) {
 	client := integrationClient(t)
 	sql := "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1"
@@ -257,6 +305,43 @@ func TestIntegrationIntegerDataTypes(t *testing.T) {
 			}
 			if sql != tc.output {
 				t.Fatalf("generated %q, want %q", sql, tc.output)
+			}
+		})
+	}
+}
+
+func TestIntegrationGenerateDataTypeQuotedFieldNames(t *testing.T) {
+	client := integrationClient(t)
+	for _, tc := range []struct{ name, identifier string }{
+		{"field name", `"field name"`},
+		{`a"b`, `"a""b"`},
+		{"a INT, b", `"a INT, b"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, err := json.Marshal(map[string]any{
+				"data_type": "struct", "nested": false,
+				"fields": []any{map[string]any{"name": tc.name, "data_type": map[string]any{"data_type": "text"}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sql, err := client.GenerateDataType(input, "duckdb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sql != "STRUCT("+tc.identifier+" TEXT)" {
+				t.Fatalf("unexpected SQL: %s", sql)
+			}
+			parsed, err := client.ParseDataType(sql, "duckdb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var value struct{ Fields []struct{ Name string } }
+			if err := json.Unmarshal(parsed, &value); err != nil {
+				t.Fatal(err)
+			}
+			if len(value.Fields) != 1 || value.Fields[0].Name != tc.identifier {
+				t.Fatalf("field changed: %s", parsed)
 			}
 		})
 	}

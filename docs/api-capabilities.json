@@ -28,7 +28,7 @@
     },
     {
       "id": "transpile",
-      "description": "SQL transpilation with options",
+      "description": "SQL transpilation with options, including shared configurable parser-depth protection (native default 1024, WASM default 32; explicit null disables the check)",
       "layers": {
         "rust": { "status": "supported", "symbols": ["transpile"] },
         "python": { "status": "supported", "symbols": ["transpile"] },
