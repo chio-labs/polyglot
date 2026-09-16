@@ -456,7 +456,7 @@ fn format_with_dialect(
 
     expressions
         .iter()
-        .map(|expr| dialect.generate_pretty(expr))
+        .map(|expr| dialect.generate_pretty_for_format(expr))
         .collect()
 }
 
@@ -1030,6 +1030,16 @@ mod format_tests {
         let result = format("SELECT a,b FROM t", DialectType::Generic).expect("format failed");
         assert_eq!(result.len(), 1);
         assert!(result[0].contains('\n'));
+    }
+
+    #[test]
+    fn format_preserves_explicit_null_ordering() {
+        let sql =
+            "SELECT * FROM products ORDER BY category NULLS LAST, created_at DESC NULLS FIRST";
+        let result = format(sql, DialectType::Snowflake).expect("format failed");
+
+        assert!(result[0].contains("category NULLS LAST"));
+        assert!(result[0].contains("created_at DESC NULLS FIRST"));
     }
 
     #[test]
