@@ -81,6 +81,7 @@ fn many_numbers() -> String {
 
 fn disabled_guards() -> ComplexityGuardOptions {
     ComplexityGuardOptions {
+        max_parser_depth: None,
         max_input_bytes: None,
         max_tokens: None,
         max_ast_nodes: None,

@@ -52,7 +52,7 @@ help:
 	@echo "  make test-rust-lib       - Run lib unit tests"
 	@echo "  make test-rust-feature-gates - Check optional Cargo feature combinations"
 	@echo "  make test-rust-check     - Compile Rust test targets without running them"
-	@echo "  make test-rust-verify    - Run full Rust verification suite incl. FFI"
+	@echo "  make test-rust-verify    - Check benchmarks and run full Rust verification incl. FFI"
 	@echo ""
 	@echo "  SQLGlot Fixture Tests:"
 	@echo "  make test-rust-identity         - Generic identity tests"
@@ -255,8 +255,11 @@ test-rust-all:
 		--test sqlglot_transpilation --test sqlglot_pretty \
 		--test sqlglot_transpile --test sqlglot_parser -- --nocapture
 
-# Run lib + fixture suites + custom dialects + clickhouse + FFI tests (full verification)
+# Compile benchmarks and run lib + fixtures + custom dialects + ClickHouse + FFI tests.
 test-rust-verify:
+	@echo "=== Compile performance benchmarks ==="
+	@cargo check -p polyglot-sql --benches
+	@echo ""
 	@echo "=== Lib unit tests ==="
 	@cargo test --lib -p polyglot-sql
 	@cargo test -p polyglot-sql --test deep_nesting_regression
