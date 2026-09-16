@@ -3047,6 +3047,16 @@ impl Dialect {
         generator.generate(expr)
     }
 
+    /// Generate pretty SQL while preserving optional syntax explicitly authored by the user.
+    #[cfg(feature = "generate")]
+    pub(crate) fn generate_pretty_for_format(&self, expr: &Expression) -> Result<String> {
+        let mut config = self.get_config_for_expr(expr);
+        config.pretty = true;
+        config.preserve_explicit_null_ordering = true;
+        let mut generator = Generator::with_config(config);
+        generator.generate(expr)
+    }
+
     /// Generate SQL from an expression with source dialect info (for transpilation)
     #[cfg(feature = "generate")]
     pub fn generate_with_source(&self, expr: &Expression, source: DialectType) -> Result<String> {

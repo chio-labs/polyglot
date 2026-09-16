@@ -284,6 +284,8 @@ pub struct GeneratorConfig {
     /// Whether null ordering (NULLS FIRST/LAST) is supported in ORDER BY
     /// True: Full Support, false: No support
     pub null_ordering_supported: bool,
+    /// Preserve explicit NULLS FIRST/LAST clauses even when they match the dialect default.
+    pub preserve_explicit_null_ordering: bool,
     /// Whether ignore nulls is inside the agg or outside
     /// FIRST(x IGNORE NULLS) OVER vs FIRST(x) IGNORE NULLS OVER
     pub ignore_nulls_in_func: bool,
@@ -581,6 +583,7 @@ impl Default for GeneratorConfig {
 
             // ===== Null handling =====
             null_ordering_supported: true,
+            preserve_explicit_null_ordering: false,
             ignore_nulls_in_func: false,
             nvl2_supported: true,
 
@@ -25272,7 +25275,7 @@ impl Generator {
                     false
                 };
 
-                if !is_default_nulls {
+                if self.config.preserve_explicit_null_ordering || !is_default_nulls {
                     self.write_space();
                     self.write_keyword("NULLS");
                     self.write_space();
