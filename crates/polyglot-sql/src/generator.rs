@@ -19115,10 +19115,23 @@ impl Generator {
         // Input: FUNC(args) WITH ORDINALITY
         // Stored as: name="FUNC WITH ORDINALITY", args=[...]
         // Output must be: FUNC(args) WITH ORDINALITY
-        let has_ordinality = func.name.len() >= 16
-            && func.name[func.name.len() - 16..].eq_ignore_ascii_case(" WITH ORDINALITY");
+        const ORDINALITY_SUFFIX: &str = " WITH ORDINALITY";
+        // Compared as bytes rather than by slicing the name. `len()` counts bytes, so
+        // `name[len - 16..]` panics when that index lands inside a multi-byte character,
+        // and a non-ASCII function name puts it there: `SELECT "a\u{e9}xxxxxxxxxxxxxxx"(1)`
+        // is 18 bytes with a two-byte character across bytes 1..3, so byte 2 is mid-character.
+        // A byte comparison against an ASCII suffix cannot panic, and it stays correct: a byte
+        // that ASCII-case-insensitively equals an ASCII byte is itself ASCII, so whenever the
+        // suffix matches, the slice below starts on a character boundary.
+        let has_ordinality = func
+            .name
+            .len()
+            .checked_sub(ORDINALITY_SUFFIX.len())
+            .is_some_and(|start| {
+                func.name.as_bytes()[start..].eq_ignore_ascii_case(ORDINALITY_SUFFIX.as_bytes())
+            });
         let output_name = if has_ordinality {
-            let base_name = &func.name[..func.name.len() - " WITH ORDINALITY".len()];
+            let base_name = &func.name[..func.name.len() - ORDINALITY_SUFFIX.len()];
             self.normalize_func_name(base_name)
         } else {
             normalized_name.clone()
@@ -42242,5 +42255,99 @@ mod tests {
 
         let sql = Generator::sql(&expr).expect("deep OR chain should generate");
         assert!(sql.contains("c2499 = 2499"), "{}", sql);
+    }
+
+    /// A non-ASCII function name must not panic the generator.
+    ///
+    /// `WITH ORDINALITY` is carried on the function name and detected from the name's last
+    /// 16 bytes. `len()` counts bytes, so that detection used to slice the name at
+    /// `len - 16`, which panics when the index lands inside a multi-byte character. The
+    /// name here is 18 bytes with a two-byte character across bytes 1..3, so the index is
+    /// byte 2 -- mid-character. Reachable from ordinary SQL, quoted or bare.
+    #[test]
+    fn test_non_ascii_function_name_does_not_panic() {
+        let name = format!("a\u{e9}{}", "x".repeat(15));
+        assert_eq!(name.len(), 18, "the repro depends on this byte length");
+        assert!(
+            !name.is_char_boundary(name.len() - " WITH ORDINALITY".len()),
+            "the repro depends on that index being mid-character"
+        );
+
+        assert_eq!(
+            roundtrip(&format!("SELECT \"{name}\"(1)")),
+            "SELECT A\u{e9}XXXXXXXXXXXXXXX(1)"
+        );
+        assert_eq!(
+            roundtrip(&format!("SELECT {name}(1)")),
+            "SELECT A\u{e9}XXXXXXXXXXXXXXX(1)"
+        );
+        // A name whose last byte is multi-byte: the index is a boundary here, so this was
+        // always fine, and is kept so the two sides of the comparison stay covered.
+        let trailing = format!("{}\u{e9}", "x".repeat(16));
+        assert_eq!(
+            roundtrip(&format!("SELECT \"{trailing}\"(1)")),
+            "SELECT XXXXXXXXXXXXXXXX\u{e9}(1)"
+        );
+    }
+
+    /// The suffix detection the fix rewrote, still detecting the suffix.
+    ///
+    /// The `UNNEST` statements are the shipped fixtures that use the syntax, and they are
+    /// here so the fix cannot break them -- but they parse to typed `Unnest` nodes, which
+    /// the generator renders by another path, so they do not reach the rewritten comparison.
+    /// The table-valued calls below do: their suffix is carried on a function name, which is
+    /// the only thing that comparison looks at.
+    #[test]
+    fn test_with_ordinality_survives_the_byte_comparison() {
+        for sql in [
+            "SELECT student, score FROM tests CROSS JOIN UNNEST(scores) WITH ORDINALITY AS t(a, b)",
+            "SELECT * FROM UNNEST(x) WITH ORDINALITY UNION ALL SELECT * FROM UNNEST(y) WITH ORDINALITY",
+            "SELECT * FROM FOO(x) WITH ORDINALITY",
+        ] {
+            assert_eq!(roundtrip(sql), sql);
+        }
+
+        // A non-ASCII name carrying the suffix: the case the fix is for, on the path that
+        // actually reads it. Slicing the name at `len - 16` panicked here.
+        assert_eq!(
+            roundtrip("SELECT * FROM a\u{e9}(x) WITH ORDINALITY"),
+            "SELECT * FROM A\u{e9}(x) WITH ORDINALITY"
+        );
+
+        // The comparison is case-insensitive, and a byte comparison is where that could
+        // quietly have been lost. The suffix is built by alternating case rather than
+        // written out, so the test cannot accidentally agree with the implementation.
+        let mixed: String = " WITH ORDINALITY"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        assert_ne!(mixed, " WITH ORDINALITY", "the suffix should be mixed case");
+        for name in ["FOO", "a\u{e9}"] {
+            let generated = roundtrip(&format!("SELECT * FROM {name}(x){mixed}"));
+            assert!(
+                generated.ends_with("WITH ORDINALITY"),
+                "a mixed-case suffix should still be recognised: {generated}"
+            );
+        }
+    }
+
+    /// The input that found this, kept as recorded: raw bytes through a lossy decode, which
+    /// is how the fuzz harness that produced it delivers them. The four `0xff` bytes become
+    /// replacement characters, one of which lands 16 bytes from the end of a function name.
+    /// The generated SQL is not asserted -- the input is malformed and what it parses to is
+    /// not the point. Returning at all is.
+    #[test]
+    fn test_recorded_non_ascii_crash_input_does_not_panic() {
+        let recorded: &[u8] = b"TUNm(MS~\"mrrNU\xff\xff\xff\xff(^_eur\"(DIInCTIST_subs63atue))";
+        let sql = format!("SELECT {}", String::from_utf8_lossy(recorded));
+        let ast = Parser::parse_sql(&sql).expect("the recorded input parses");
+        Generator::sql(&ast[0]).expect("and generates without panicking");
     }
 }
