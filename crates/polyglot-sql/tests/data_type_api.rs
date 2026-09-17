@@ -249,3 +249,104 @@ fn parse_standalone_data_type_rejects_trailing_sql() {
         .to_string()
         .contains("Unexpected token after data type"));
 }
+
+/// A caller-supplied `TokenType::Eof` is end of input for the standalone type parser too.
+///
+/// `parse_data_type` above goes through a string, so it cannot carry the variant; this uses
+/// the token-stream entry point, which is what a caller reaching `Parser::new` has. The
+/// terminator itself is not input, so `INT` with one appended is `INT` — and tokens *after*
+/// a terminator are refused rather than silently dropped, which is the case that regressed
+/// when the end-of-input check recognised the variant but the trailing-token check did not.
+#[test]
+fn parse_standalone_data_type_treats_an_eof_token_as_end_of_input() {
+    use polyglot_sql::tokens::Span;
+    use polyglot_sql::{Parser, Token, TokenType, Tokenizer};
+
+    let stream = |parts: &[&str]| {
+        let mut out: Vec<Token> = Vec::new();
+        for part in parts {
+            if *part == "<EOF>" {
+                out.push(Token::new(TokenType::Eof, "", Span::default()));
+            } else {
+                out.extend(Tokenizer::default().tokenize(part).expect("tokenizing"));
+            }
+        }
+        out
+    };
+
+    // A trailing terminator is not a trailing token.
+    assert_eq!(
+        Parser::new(stream(&["INT", "<EOF>"]))
+            .parse_standalone_data_type()
+            .expect("a trailing terminator is end of input"),
+        int_type()
+    );
+    assert_eq!(
+        Parser::new(stream(&["INT"]))
+            .parse_standalone_data_type()
+            .expect("and so is the end of the stream"),
+        int_type()
+    );
+
+    // Tokens after one are a stream built wrongly. Refused, not dropped: the parse used to
+    // stop at the terminator and return `Ok(Int)` with `SELECT 2` ignored.
+    let error = Parser::new(stream(&["INT", "<EOF>", "SELECT 2"]))
+        .parse_standalone_data_type()
+        .expect_err("tokens after the terminator should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("Unexpected token after end of input"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A terminator at the *front* leaves the standalone type parser nothing to read.
+///
+/// Normalizing the stream in the constructor truncates at the terminator, so these are all
+/// empty by the time the parse begins. They panicked with `Token list should not be empty`
+/// before the empty case was handled; `Parser::new(Vec::new())` panicked the same way even
+/// before the terminator was normalized at all.
+#[test]
+fn parse_standalone_data_type_errors_on_an_empty_or_eof_first_stream() {
+    use polyglot_sql::tokens::Span;
+    use polyglot_sql::{Parser, Token, TokenType, Tokenizer};
+
+    let eof = || Token::new(TokenType::Eof, "", Span::default());
+
+    // Nothing to read: end of input, not a panic and not a type.
+    for tokens in [vec![eof()], Vec::new()] {
+        let error = Parser::new(tokens)
+            .parse_standalone_data_type()
+            .expect_err("an empty stream is not a data type");
+        assert!(
+            error.to_string().contains("Unexpected end of input"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // A terminator with a type after it is a stream built wrongly, and the error names the
+    // token that followed rather than the empty remainder.
+    let mut leading = vec![eof()];
+    leading.extend(Tokenizer::default().tokenize("INT").expect("tokenizing"));
+    let error = Parser::new(leading)
+        .parse_standalone_data_type()
+        .expect_err("a type after the terminator should not be read");
+    assert!(
+        error
+            .to_string()
+            .contains("Unexpected token after end of input"),
+        "unexpected error: {error}"
+    );
+
+    // Two terminators: the second is a token after the first.
+    let error = Parser::new(vec![eof(), eof()])
+        .parse_standalone_data_type()
+        .expect_err("a second terminator is a token after the first");
+    assert!(
+        error
+            .to_string()
+            .contains("Unexpected token after end of input"),
+        "unexpected error: {error}"
+    );
+}

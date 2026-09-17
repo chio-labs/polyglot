@@ -559,6 +559,13 @@ pub struct Parser {
     guards_checked: bool,
     /// Token statistics collected during the internal zero-copy tokenization path.
     token_guard_stats: Option<TokenGuardStats>,
+    /// The token that followed a caller-supplied `TokenType::Eof`, if one did: its type for
+    /// the message, its span so the error points at the offending token rather than at
+    /// whatever is left of the stream after normalizing it.
+    ///
+    /// Recorded by the constructors, which cannot fail, and refused by
+    /// `ensure_complexity_guards` before any grammar runs. See `split_terminator`.
+    eof_followed_by: Option<(TokenType, Span)>,
     /// Token positions where `IF` has already been tried, and rejected, as the start of
     /// an if-expression. Without this the retry is repeated on every path that reaches
     /// the position, and a chain of `IF`s costs 2^k.
@@ -681,8 +688,10 @@ impl Parser {
     ///
     /// Prefer [`Parser::parse_sql`] if you are starting from a raw SQL string.
     pub fn new(tokens: Vec<Token>) -> Self {
+        let (tokens, eof_followed_by) = Self::split_terminator(tokens);
         Self {
-            tokens: tokens.into_iter().map(ParserToken::from).collect(),
+            tokens,
+            eof_followed_by,
             current: 0,
             config: ParserConfig::default(),
             source: None,
@@ -696,8 +705,10 @@ impl Parser {
 
     /// Create a parser from a pre-tokenized token stream with a custom [`ParserConfig`].
     pub fn with_config(tokens: Vec<Token>, config: ParserConfig) -> Self {
+        let (tokens, eof_followed_by) = Self::split_terminator(tokens);
         Self {
-            tokens: tokens.into_iter().map(ParserToken::from).collect(),
+            tokens,
+            eof_followed_by,
             current: 0,
             config,
             source: None,
@@ -714,8 +725,10 @@ impl Parser {
     /// The original SQL text is stored so that `Command` expressions (unparsed
     /// dialect-specific statements) can preserve the exact source verbatim.
     pub fn with_source(tokens: Vec<Token>, config: ParserConfig, source: String) -> Self {
+        let (tokens, eof_followed_by) = Self::split_terminator(tokens);
         Self {
-            tokens: tokens.into_iter().map(ParserToken::from).collect(),
+            tokens,
+            eof_followed_by,
             current: 0,
             config,
             source: Some(Arc::from(source)),
@@ -733,8 +746,12 @@ impl Parser {
         config: ParserConfig,
         source: Arc<str>,
     ) -> Self {
+        // Already `ParserToken`s, from the tokenizer, which never emits the variant --
+        // normalized anyway so that no constructor is the one that forgets.
+        let (tokens, eof_followed_by) = Self::split_parser_terminator(tokens);
         Self {
             tokens,
+            eof_followed_by,
             current: 0,
             config,
             source: Some(source),
@@ -744,6 +761,43 @@ impl Parser {
             if_expr_ruled_out: HashSet::new(),
             recursion: Arc::default(),
         }
+    }
+
+    /// Split a caller-supplied terminator off the front of the stream.
+    ///
+    /// [`Tokenizer`] never emits [`TokenType::Eof`], but `Parser::new` and friends are
+    /// public, so a caller can hand the parser a stream carrying one. It means end of
+    /// input, and the cheapest way to make a terminated stream parse *identically* to an
+    /// unterminated one is to make them the same stream: the tokens up to the terminator
+    /// are the input, and the terminator itself never reaches the grammar.
+    ///
+    /// Doing it here rather than at each reader is what makes it total. There are over a
+    /// hundred places that compare an index against `self.tokens.len()` to ask whether the
+    /// input has run out, and a terminator left in the stream is a token to every one of
+    /// them -- including `peek`, whose span every parse error is built from, so even the
+    /// errors two streams produced would differ in position.
+    ///
+    /// Anything *after* a terminator is a stream built wrongly rather than input. Its token
+    /// type is returned so that `ensure_complexity_guards` can refuse it before any grammar
+    /// runs -- a constructor cannot, having no way to fail.
+    fn split_terminator(tokens: Vec<Token>) -> (Vec<ParserToken>, Option<(TokenType, Span)>) {
+        Self::split_parser_terminator(tokens.into_iter().map(ParserToken::from).collect())
+    }
+
+    fn split_parser_terminator(
+        mut tokens: Vec<ParserToken>,
+    ) -> (Vec<ParserToken>, Option<(TokenType, Span)>) {
+        let Some(at) = tokens
+            .iter()
+            .position(|token| token.token_type == TokenType::Eof)
+        else {
+            return (tokens, None);
+        };
+        let followed_by = tokens
+            .get(at + 1)
+            .map(|token| (token.token_type, token.span));
+        tokens.truncate(at);
+        (tokens, followed_by)
     }
 
     /// Parse one or more SQL statements from a raw string.
@@ -794,6 +848,15 @@ impl Parser {
             return Ok(());
         }
 
+        if let Some((followed_by, span)) = self.eof_followed_by {
+            return Err(Error::parse(
+                format!("Unexpected token after end of input: {followed_by:?}"),
+                span.line,
+                span.column,
+                span.start,
+                span.end,
+            ));
+        }
         if let Some(stats) = &self.token_guard_stats {
             enforce_parser_token_stats(&self.tokens, stats, &self.config.complexity_guard)?;
         } else {
@@ -996,6 +1059,9 @@ impl Parser {
     /// or `CAST(...)` expression.
     pub fn parse_standalone_data_type(&mut self) -> Result<DataType> {
         self.ensure_complexity_guards()?;
+        if self.tokens.is_empty() {
+            return Err(self.end_of_input_error());
+        }
         let data_type = self.parse_data_type()?;
 
         if self.check(TokenType::Semicolon) {
@@ -1019,6 +1085,13 @@ impl Parser {
     /// fall through to a `Command` expression that preserves the raw SQL text.
     pub fn parse_statement(&mut self) -> Result<Expression> {
         self.ensure_complexity_guards()?;
+        // No tokens is end of input rather than a statement to dispatch on. `parse` answers
+        // an empty stream with no statements, so it needs no such guard; these two owe a
+        // value they cannot produce. Reachable before this branch through `Parser::new(vec![])`
+        // -- where it panicked -- and now also through a stream that is only a terminator.
+        if self.tokens.is_empty() {
+            return Err(self.end_of_input_error());
+        }
         let start_pos = self.current;
         match self.with_parser_depth(|parser| parser.parse_statement_inner()) {
             Ok(expr) => Ok(expr),
@@ -32752,6 +32825,12 @@ impl Parser {
 
     #[inline(never)]
     fn parse_primary_inner(&mut self) -> Result<Expression> {
+        // Public fragment parsers can reach this path without the statement-level
+        // empty-input checks, including after a leading EOF has been normalized away.
+        if self.tokens.is_empty() {
+            return Err(self.end_of_input_error());
+        }
+
         // Exasol-style IF expression: IF condition THEN true_value ELSE false_value ENDIF
         // Check for IF not followed by ( (which would be IF function call handled elsewhere)
         // This handles: IF age < 18 THEN 'minor' ELSE 'adult' ENDIF
@@ -45013,10 +45092,17 @@ impl Parser {
 
     // === Helper methods ===
 
-    /// Check if at end of tokens
+    /// Check if at end of input.
+    ///
+    /// A [`TokenType::Eof`] token counts as the end. [`Tokenizer`] never emits one --
+    /// the stream it produces is simply exhausted -- but `Parser::new` is public, so a
+    /// caller can build a stream that ends with the variant, and that is the only thing
+    /// the variant can mean. Recognising it here is what makes such a stream parse the
+    /// same as one without it: every `while !self.is_at_end()` scan stops, and `check`
+    /// reports false, so no scan takes the terminator for another word.
     #[inline]
     fn is_at_end(&self) -> bool {
-        self.current >= self.tokens.len()
+        self.current >= self.tokens.len() || self.tokens[self.current].token_type == TokenType::Eof
     }
 
     /// Check if current token is a query modifier keyword or end of input.
@@ -45050,7 +45136,15 @@ impl Parser {
         if let Some(error) = self.recursion.error() {
             return error;
         }
-        let span = self.peek().span;
+        // Not `self.peek()`: normalizing a stream that begins with a terminator leaves no
+        // tokens at all, and `peek` has nothing to return. Same shape as
+        // `end_of_input_error`, which has always allowed for it.
+        let span = self
+            .tokens
+            .get(self.current)
+            .or_else(|| self.tokens.last())
+            .map(|token| token.span)
+            .unwrap_or_default();
         Error::parse(message, span.line, span.column, span.start, span.end)
     }
 
@@ -45087,7 +45181,9 @@ impl Parser {
     /// loop that ignores it no longer compiles.
     #[inline]
     fn advance(&mut self) -> Result<Token> {
-        if self.current >= self.tokens.len() {
+        // `is_at_end` rather than the stream length: a caller-supplied `Eof` token is the
+        // end, and consuming it as a word is how an empty identifier got into a statement.
+        if self.is_at_end() {
             return Err(self.end_of_input_error());
         }
         let token = self.materialize_token(&self.tokens[self.current]);
@@ -45099,7 +45195,8 @@ impl Parser {
     /// Same reasoning as `advance`.
     #[inline]
     fn advance_text(&mut self) -> Result<String> {
-        if self.current >= self.tokens.len() {
+        // Logical end, for the reason given on `advance`.
+        if self.is_at_end() {
             return Err(self.end_of_input_error());
         }
         let text = self.tokens[self.current].text_owned();
@@ -45787,6 +45884,9 @@ impl Parser {
         let next_idx = self.current + 1;
         if next_idx >= self.tokens.len() {
             return true; // at end of input
+        }
+        if self.tokens[next_idx].token_type == TokenType::Eof {
+            return true; // a caller-supplied terminator is the end too
         }
         let next_type = self.tokens[next_idx].token_type;
         // Clause boundaries that indicate the current token is the last in the expression
@@ -67093,11 +67193,14 @@ mod termination_tests {
 #[cfg(test)]
 mod explicit_eof_token_tests {
     //! [`Tokenizer`] never emits [`TokenType::Eof`], but `Parser::new` is public, so a
-    //! caller can hand the parser a stream that ends with one. The parser's comparisons
-    //! against the variant are what keep such a stream parsing the same as one without
-    //! it, and the cases below are the ones where removing them is observable.
+    //! caller can hand the parser a stream that ends with one. Such a stream must parse
+    //! the same as one without it, and `is_at_end` is what holds that: it reports the end
+    //! at an `Eof` token, so every scan stops there and `check` reports false. The
+    //! parser's explicit comparisons against the variant all remain, and are now
+    //! belt-and-braces rather than the only thing standing between a caller-supplied
+    //! terminator and a misparse.
 
-    use super::Parser;
+    use super::{Parser, ParserConfig};
     use crate::expressions::{AlterTableAction, Expression};
     use crate::tokens::{Span, Token, TokenType, Tokenizer};
 
@@ -67109,28 +67212,174 @@ mod explicit_eof_token_tests {
         Parser::new(tokens).parse_statement()
     }
 
+    type FragmentParser = fn(&mut Parser) -> crate::error::Result<Option<Expression>>;
+
+    const FRAGMENT_PARSERS: &[(&str, FragmentParser, &str)] = &[
+        ("disjunction", Parser::parse_disjunction, "a OR b"),
+        ("conjunction", Parser::parse_conjunction, "a AND b"),
+        (
+            "select_or_expression",
+            Parser::parse_select_or_expression,
+            "SELECT 1",
+        ),
+        ("value", Parser::parse_value, "(1, 2)"),
+        (
+            "set_item_assignment",
+            Parser::parse_set_item_assignment,
+            "x = 1",
+        ),
+    ];
+
+    fn parser_constructors(tokens: &[Token], source: &str) -> [(&'static str, Parser); 3] {
+        [
+            ("new", Parser::new(tokens.to_vec())),
+            (
+                "with_config",
+                Parser::with_config(tokens.to_vec(), ParserConfig::default()),
+            ),
+            (
+                "with_source",
+                Parser::with_source(tokens.to_vec(), ParserConfig::default(), source.to_owned()),
+            ),
+        ]
+    }
+
+    /// Public expression-fragment helpers do not dispatch through `parse_statement`.
+    /// They must safely report no expression when normalization leaves an empty stream.
+    #[test]
+    fn test_expression_fragment_parsers_handle_empty_normalized_streams() {
+        let eof = || Token::new(TokenType::Eof, "", Span::default());
+        let mut leading = vec![eof()];
+        leading.extend(Tokenizer::default().tokenize("SELECT 1").unwrap());
+        for (shape, tokens, malformed) in [
+            ("EOF only", vec![eof()], false),
+            ("empty", Vec::new(), false),
+            ("leading EOF", leading, true),
+            ("duplicate EOF", vec![eof(), eof()], true),
+        ] {
+            for (name, parse_fragment, _) in FRAGMENT_PARSERS {
+                for (constructor, mut parser) in parser_constructors(&tokens, "SELECT 1") {
+                    for _ in 0..2 {
+                        assert!(
+                            parse_fragment(&mut parser)
+                                .expect("an empty fragment is not an error")
+                                .is_none(),
+                            "{name}, {constructor}, {shape}"
+                        );
+                    }
+
+                    // Trying a fragment must not clear the placement error that the
+                    // top-level entry points are responsible for reporting.
+                    if malformed {
+                        for error in [
+                            parser
+                                .parse()
+                                .expect_err("parse must reject tokens after EOF"),
+                            parser
+                                .parse_statement()
+                                .expect_err("parse_statement must reject tokens after EOF"),
+                            parser
+                                .parse_standalone_data_type()
+                                .expect_err("type parsing must reject tokens after EOF"),
+                        ] {
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("Unexpected token after end of input"),
+                                "{name}, {constructor}, {shape}: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expression_fragment_parsers_preserve_nonempty_input_with_eof() {
+        for (name, parse_fragment, sql) in FRAGMENT_PARSERS {
+            let tokens = Tokenizer::default().tokenize(sql).unwrap();
+            let mut terminated = tokens.clone();
+            terminated.push(Token::new(TokenType::Eof, "", Span::default()));
+            for ((constructor, mut plain), (_, mut terminated)) in parser_constructors(&tokens, sql)
+                .into_iter()
+                .zip(parser_constructors(&terminated, sql))
+            {
+                let expected = parse_fragment(&mut plain).expect("valid fragment should parse");
+                assert!(expected.is_some(), "{name}, {constructor}: {sql}");
+                assert_eq!(
+                    parse_fragment(&mut terminated).expect("EOF must not change a valid fragment"),
+                    expected,
+                    "{name}, {constructor}: {sql}"
+                );
+            }
+        }
+    }
+
     /// Appending an `Eof` token must not change the parse.
     ///
+    /// The statements are chosen for the decisions that look at what follows the last
+    /// real token, because those are where a terminator taken for a token shows up:
+    ///
     /// - A trailing `BINARY` is only a column when nothing follows it, and a trailing
-    ///   `OVERLAPS` is only an alias when nothing follows it; with the `Eof` comparison
-    ///   gone, something does follow, and both become parse errors.
+    ///   `OVERLAPS` is only an alias when nothing follows it; if something appears to
+    ///   follow, both become parse errors.
     /// - `ALTER TABLE t UNSET prop` stops being an `UnsetProperty` and becomes a `Raw`
     ///   multi-word clause.
-    /// - The two `SHOW` cases cover the parser's remaining `Eof` comparisons, where the
-    ///   variant is one alternative in a list of clause-starting tokens to stop at.
+    /// - `ALTER TABLE t UNSET PROJECTION POLICY` is a `Raw` clause either way, but the
+    ///   scan that collects its words took the terminator for one of them.
+    /// - `BEGIN` is the sharpest of them and the reason this is worth fixing rather than
+    ///   documenting: with a terminator it stopped being a `Transaction` and became an
+    ///   opaque `Command("BEGIN ")`, so a consumer matching on the AST saw a different
+    ///   node, not a cosmetic difference. Its siblings are here to keep the whole
+    ///   transaction family covered.
+    /// - The `SHOW` cases reach the parser's lists of clause-starting tokens to stop at.
+    /// - The rest are ordinary statements of each kind, as a spot check that recognising
+    ///   the variant did not make an ordinary parse stop early.
     #[test]
     fn test_an_explicit_eof_token_does_not_change_the_parse() {
         for sql in [
             "SELECT BINARY",
             "SELECT a OVERLAPS",
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
             "ALTER TABLE t UNSET prop",
             "ALTER TABLE t UNSET TAG x",
+            "ALTER TABLE t UNSET PROJECTION POLICY",
+            "ALTER TABLE t SET COMMENT = 'c'",
+            "ALTER TABLE t ADD COLUMN c INT",
             "SHOW TABLES",
             "SHOW PRIMARY KEYS",
             "SHOW TERSE DATABASES",
             "SHOW GRANTS FOR foo",
             "SHOW PROFILE FOR QUERY 5",
             "SHOW GROUPS FOR ROLE",
+            "SHOW CREATE TABLE t",
+            "SELECT 1",
+            "SELECT a, b FROM t WHERE c = 1 GROUP BY a HAVING COUNT(*) > 1 ORDER BY b LIMIT 10",
+            "SELECT COUNT(*) OVER (PARTITION BY a ORDER BY b) FROM t",
+            "SELECT CAST(x AS DECIMAL(10, 2)) FROM t",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+            "SELECT a FROM t UNION ALL SELECT b FROM u",
+            "INSERT INTO t (a, b) VALUES (1, 2)",
+            "UPDATE t SET a = 1 WHERE b = 2",
+            "DELETE FROM t WHERE a = 1",
+            "MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET t.b = u.b",
+            "CREATE TABLE t (a INT, b VARCHAR(10))",
+            "CREATE VIEW v AS SELECT 1 AS a",
+            "CREATE INDEX i ON t (a ASC, b DESC)",
+            "DROP TABLE IF EXISTS t",
+            "TRUNCATE TABLE t",
+            "GRANT SELECT, INSERT ON t TO u",
+            "REVOKE SELECT ON t FROM u",
+            "EXPLAIN SELECT 1",
+            "SET x = 1",
+            "COMMENT ON TABLE t IS 'c'",
+            "SELECT * FROM t WHERE a IN (SELECT b FROM u)",
+            "SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t",
         ] {
             let unterminated = parse_statement(sql, false);
             let terminated = parse_statement(sql, true);
@@ -67148,6 +67397,10 @@ mod explicit_eof_token_tests {
     }
 
     /// A caller-supplied EOF is a delimiter, not an empty word in a raw clause.
+    ///
+    /// This scan got its own `check(TokenType::Eof)` in 0.11.0. It is not special --
+    /// there are 125 `while !self.is_at_end()` scans -- so `is_at_end` now reports the
+    /// end at the token and they all stop, with that check left as belt-and-braces.
     #[test]
     fn test_a_raw_unset_clause_stops_at_an_explicit_eof() {
         let raw =
@@ -67161,6 +67414,220 @@ mod explicit_eof_token_tests {
             };
         assert_eq!(raw(false), "UNSET PROJECTION POLICY");
         assert_eq!(raw(true), raw(false));
+    }
+
+    /// A terminator with tokens after it is refused from every public entry point, not
+    /// only from `parse`.
+    ///
+    /// Each of these stops at the terminator, so without the refusal the tokens after it
+    /// would be dropped and the parse would *succeed* -- which is what
+    /// `parse_standalone_data_type` did when the check lived in `parse` alone.
+    #[test]
+    fn test_tokens_after_an_eof_token_are_refused_by_every_entry_point() {
+        let stream = |parts: &[&str]| {
+            let mut out = Vec::new();
+            for part in parts {
+                if *part == "<EOF>" {
+                    out.push(Token::new(TokenType::Eof, "", Span::default()));
+                } else {
+                    out.extend(Tokenizer::default().tokenize(part).expect("tokenizing"));
+                }
+            }
+            out
+        };
+        let refused = |err: crate::error::Error| {
+            assert!(
+                err.to_string()
+                    .contains("Unexpected token after end of input"),
+                "unexpected error: {err}"
+            );
+        };
+
+        refused(
+            Parser::new(stream(&["SELECT 1;", "<EOF>", "SELECT 2"]))
+                .parse()
+                .expect_err("parse must not drop the statement after the terminator"),
+        );
+        refused(
+            Parser::new(stream(&["SELECT 1", "<EOF>", "SELECT 2"]))
+                .parse_statement()
+                .expect_err("parse_statement must not accept tokens after the terminator"),
+        );
+        refused(
+            Parser::new(stream(&["INT", "<EOF>", "SELECT 2"]))
+                .parse_standalone_data_type()
+                .expect_err("parse_standalone_data_type must not stop at the terminator"),
+        );
+        // A statement whose own dispatch consumes the next token: the terminator used to be
+        // eaten as the variable name, giving a `SetStatement` with an empty identifier.
+        refused(
+            Parser::new(stream(&["SET", "<EOF>", "x = 1"]))
+                .parse()
+                .expect_err("SET must not read the terminator as its variable name"),
+        );
+
+        // The same streams without anything after the terminator are ordinary input.
+        assert_eq!(
+            Parser::new(stream(&["SELECT 1", "<EOF>"]))
+                .parse()
+                .expect("a trailing terminator is not an error")
+                .len(),
+            1
+        );
+        Parser::new(stream(&["INT", "<EOF>"]))
+            .parse_standalone_data_type()
+            .expect("a trailing terminator is not an error");
+    }
+
+    /// A stream that *begins* with a terminator has no tokens once it is normalized, and
+    /// nothing downstream may assume otherwise.
+    ///
+    /// This is the shape the constructor normalization got wrong: truncating at a leading
+    /// terminator leaves an empty vector, and `parse_error` built its span from `peek`, which
+    /// has nothing to return. All three entry points panicked with `Token list should not be
+    /// empty` where the base revision returned an error.
+    ///
+    /// The `Vec::new()` rows are the same assumption reached by the older door, and they
+    /// panicked before this branch existed too -- `parse_statement` and
+    /// `parse_standalone_data_type` owe a value an empty stream cannot provide, so they now
+    /// answer end of input rather than dispatching on a token that is not there.
+    #[test]
+    fn test_a_stream_beginning_with_an_eof_token_errors_rather_than_panicking() {
+        let eof = || Token::new(TokenType::Eof, "", Span::default());
+        let select_1 = || {
+            Tokenizer::default()
+                .tokenize("SELECT 1")
+                .expect("tokenizing")
+        };
+
+        let leading_then_tokens = || {
+            let mut t = vec![eof()];
+            t.extend(select_1());
+            t
+        };
+
+        // Tokens after a leading terminator: refused, and the error points at the token that
+        // followed it rather than at the empty remainder.
+        for tokens in [leading_then_tokens(), vec![eof(), eof()]] {
+            for message in [
+                Parser::new(tokens.clone())
+                    .parse()
+                    .expect_err("parse")
+                    .to_string(),
+                Parser::new(tokens.clone())
+                    .parse_statement()
+                    .expect_err("parse_statement")
+                    .to_string(),
+                Parser::new(tokens.clone())
+                    .parse_standalone_data_type()
+                    .expect_err("parse_standalone_data_type")
+                    .to_string(),
+            ] {
+                assert!(
+                    message.contains("Unexpected token after end of input"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
+        assert!(
+            Parser::new(leading_then_tokens())
+                .parse()
+                .expect_err("parse")
+                .to_string()
+                .contains("line 1, column 7"),
+            "the error should point at the token after the terminator"
+        );
+
+        // Every public constructor reaches the same normalization.
+        for message in [
+            Parser::with_config(leading_then_tokens(), ParserConfig::default())
+                .parse()
+                .expect_err("with_config")
+                .to_string(),
+            Parser::with_source(
+                leading_then_tokens(),
+                ParserConfig::default(),
+                "SELECT 1".to_string(),
+            )
+            .parse()
+            .expect_err("with_source")
+            .to_string(),
+        ] {
+            assert!(
+                message.contains("Unexpected token after end of input"),
+                "unexpected error: {message}"
+            );
+        }
+
+        // A stream with nothing in it, by either spelling: no statements from `parse`, end of
+        // input from the two that must return something.
+        for tokens in [vec![eof()], Vec::new()] {
+            assert_eq!(Parser::new(tokens.clone()).parse().expect("parse").len(), 0);
+            for message in [
+                Parser::new(tokens.clone())
+                    .parse_statement()
+                    .expect_err("parse_statement")
+                    .to_string(),
+                Parser::new(tokens.clone())
+                    .parse_standalone_data_type()
+                    .expect_err("parse_standalone_data_type")
+                    .to_string(),
+            ] {
+                assert!(
+                    message.contains("Unexpected end of input"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
+    }
+
+    /// Lookahead that decides whether a trailing keyword is an alias asked whether the
+    /// *stream* had run out, which a terminator answered no to. Splitting the terminator
+    /// off before the grammar runs settles it for every such reader at once, rather than
+    /// one lookahead at a time.
+    ///
+    /// `SELECT 1 is` is the case @tobilg's sweep found; the rest are what a sweep over
+    /// every fixture file turned up alongside it, including the one that changed from
+    /// parsing to failing.
+    #[test]
+    fn test_a_trailing_keyword_is_read_the_same_with_and_without_a_terminator() {
+        for sql in [
+            "SELECT 1 is",
+            "SELECT * FROM t LIMIT 10%",
+            "SELECT 1 limit",
+            "SELECT 1 offset",
+            "SELECT * FROM x prewhere",
+            "SELECT * FROM x qualify",
+            "SELECT FROM x ORDER BY",
+            "CREATE TABLE a",
+            "WITH cte AS (SELECT * FROM x)",
+            "IF(a > 0)",
+            "SELECT A[:",
+        ] {
+            let unterminated = parse_statement(sql, false);
+            let terminated = parse_statement(sql, true);
+            assert_eq!(
+                format!("{terminated:?}"),
+                format!("{unterminated:?}"),
+                "a trailing Eof token changed how {sql:?} was read"
+            );
+        }
+    }
+
+    /// A stream that is *only* a terminator is an empty stream, and now parses like
+    /// one. Before the variant was recognised it was `Unexpected token: Eof`, which made
+    /// a terminated empty input the one empty input that did not parse.
+    #[test]
+    fn test_a_stream_of_only_an_eof_token_parses_as_empty() {
+        let only = vec![Token::new(TokenType::Eof, "", Span::default())];
+        assert_eq!(Parser::new(only).parse().expect("should parse").len(), 0);
+        // The same answer the other spellings of an empty input already gave.
+        assert_eq!(
+            Parser::new(Vec::new()).parse().expect("should parse").len(),
+            0
+        );
+        assert_eq!(Parser::parse_sql("").expect("should parse").len(), 0);
+        assert_eq!(Parser::parse_sql("   ").expect("should parse").len(), 0);
     }
 
     /// The `UNSET` property case names its outcome, because there both parses succeed
