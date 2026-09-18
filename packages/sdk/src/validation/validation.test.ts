@@ -7,6 +7,29 @@ import { validate, validateWithSchema } from './index';
 import type { Schema } from './schema';
 
 describe('validate', () => {
+  it('does not treat lambda-local parameters as ungrouped inputs', () => {
+    const result = validate(
+      'SELECT TRANSFORM(ARRAY_CONSTRUCT(1), x -> x + 1), COUNT(*) FROM items',
+      'snowflake',
+      { semantic: true },
+    );
+    expect(result.valid).toBe(true);
+  });
+  it.each([
+    ['SELECT id, SUM(amount) FROM t', 'E230'],
+    ['SELECT id FROM t WHERE SUM(amount)>0', 'E231'],
+    ['SELECT id FROM t WHERE ROW_NUMBER() OVER()=1', 'E232'],
+  ])('reports opt-in semantic correctness errors: %s', (sql, code) => {
+    expect(validate(sql, 'snowflake').valid).toBe(true);
+    const result = validate(sql, 'snowflake', { semantic: true });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code, severity: 'error' }),
+      ]),
+    );
+  });
+
   describe('syntax validation', () => {
     it('should return valid for correct SQL', () => {
       const result = validate('SELECT 1', 'generic');

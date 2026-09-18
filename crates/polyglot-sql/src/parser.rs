@@ -1075,6 +1075,14 @@ impl Parser {
             )));
         }
 
+        let expression = Expression::DataType(data_type);
+        enforce_ast(
+            std::slice::from_ref(&expression),
+            &self.config.complexity_guard,
+        )?;
+        let Expression::DataType(data_type) = expression else {
+            unreachable!()
+        };
         Ok(data_type)
     }
 
@@ -39412,6 +39420,7 @@ impl Parser {
             let saved_pos = self.current;
             let ident_token = self.advance()?;
             let ident_name = ident_token.text.to_string();
+            let quoted = ident_token.token_type == TokenType::QuotedIdentifier;
 
             if ident_name.eq_ignore_ascii_case("VARIADIC")
                 && matches!(
@@ -39432,7 +39441,7 @@ impl Parser {
                 if self.match_token(TokenType::Arrow) {
                     let body = self.parse_expression()?;
                     Expression::Lambda(Box::new(LambdaExpr {
-                        parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
+                        parameters: vec![Self::identifier_from_token(ident_token, quoted)],
                         body,
                         colon: false,
                         parameter_types: vec![Some(type_annotation)],
@@ -39444,7 +39453,7 @@ impl Parser {
             } else if self.match_token(TokenType::Arrow) {
                 let body = self.parse_expression()?;
                 Expression::Lambda(Box::new(LambdaExpr {
-                    parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
+                    parameters: vec![Self::identifier_from_token(ident_token, quoted)],
                     body,
                     colon: false,
                     parameter_types: Vec::new(),
@@ -47101,13 +47110,13 @@ impl Parser {
             let expr = if self.is_identifier_token() || self.is_safe_keyword_as_identifier() {
                 let saved_pos = self.current;
                 let ident_token = self.advance()?;
-                let ident_name = ident_token.text.to_string();
+                let quoted = ident_token.token_type == TokenType::QuotedIdentifier;
 
                 // Check for arrow (simple lambda: a -> body)
                 if self.match_token(TokenType::Arrow) {
                     let body = self.parse_expression()?;
                     Expression::Lambda(Box::new(LambdaExpr {
-                        parameters: vec![Identifier::new(ident_name).with_span(ident_token.span)],
+                        parameters: vec![Self::identifier_from_token(ident_token, quoted)],
                         body,
                         colon: false,
                         parameter_types: Vec::new(),
@@ -47123,9 +47132,7 @@ impl Parser {
                     if self.match_token(TokenType::Arrow) {
                         let body = self.parse_expression()?;
                         Expression::Lambda(Box::new(LambdaExpr {
-                            parameters: vec![
-                                Identifier::new(ident_name).with_span(ident_token.span)
-                            ],
+                            parameters: vec![Self::identifier_from_token(ident_token, quoted)],
                             body,
                             colon: false,
                             parameter_types: vec![Some(type_annotation)],

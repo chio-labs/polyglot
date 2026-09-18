@@ -4,7 +4,6 @@
 //! - schema checks (unknown tables/columns)
 //! - optional semantic warnings (SELECT *, LIMIT without ORDER BY, etc.)
 
-use crate::ast_transforms::get_aggregate_functions;
 use crate::dialects::{Dialect, DialectType};
 use crate::error::{ValidationError, ValidationResult};
 use crate::expressions::{
@@ -22,9 +21,10 @@ use crate::function_catalog::{
 };
 use crate::function_registry::canonical_typed_function_name_upper;
 use crate::optimizer::annotate_types::annotate_types;
+use crate::optimizer::normalize_identifiers::{get_normalization_strategy, normalize_identifier};
 use crate::optimizer::qualify_columns::normalize_dotted_columns_in_scope;
 use crate::resolver::Resolver;
-use crate::schema::{MappingSchema, Schema as SqlSchema, SchemaError, SchemaResult, TABLE_PARTS};
+use crate::schema::{MappingSchema, Schema as SqlSchema};
 use crate::scope::{build_scope, walk_in_scope};
 use crate::traversal::ExpressionWalk;
 use serde::{Deserialize, Serialize};
@@ -40,10 +40,11 @@ use std::sync::LazyLock;
 
 /// Column definition used for schema-aware validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaColumn {
     /// Column name.
     pub name: String,
-    /// Optional column data type (currently informational).
+    /// Optional column data type used by type inference and validation.
     #[serde(default, rename = "type")]
     pub data_type: String,
     /// Whether the column allows NULL values.
@@ -62,6 +63,7 @@ pub struct SchemaColumn {
 
 /// Column-level foreign key reference metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaColumnReference {
     /// Referenced table name.
     pub table: String,
@@ -74,6 +76,7 @@ pub struct SchemaColumnReference {
 
 /// Table-level foreign key reference metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaForeignKey {
     /// Optional FK name.
     #[serde(default)]
@@ -86,6 +89,7 @@ pub struct SchemaForeignKey {
 
 /// Target of a table-level foreign key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaTableReference {
     /// Referenced table name.
     pub table: String,
@@ -98,6 +102,7 @@ pub struct SchemaTableReference {
 
 /// Table definition used for schema-aware validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaTable {
     /// Table name.
     pub name: String,
@@ -122,6 +127,7 @@ pub struct SchemaTable {
 
 /// Schema payload used for schema-aware validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationSchema {
     /// Known tables.
     pub tables: Vec<SchemaTable>,
@@ -136,6 +142,9 @@ pub struct ValidationSchema {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaValidationOptions {
+    /// Per-call parser limits, shared by syntax and schema validation.
+    #[serde(default, alias = "complexityGuard")]
+    pub complexity_guard: Option<crate::ComplexityGuardOptions>,
     /// Enables type compatibility checks for expressions, DML assignments, and set operations.
     #[serde(default, alias = "checkTypes")]
     pub check_types: bool,
@@ -145,7 +154,7 @@ pub struct SchemaValidationOptions {
     /// If true/false, overrides schema.strict.
     #[serde(default)]
     pub strict: Option<bool>,
-    /// Enables semantic warnings (W001..W004).
+    /// Enables semantic correctness errors (E230..E232) and quality warnings (W001..W004).
     #[serde(default)]
     pub semantic: bool,
     /// Enables strict syntax checks (e.g. rejects trailing commas before clause boundaries).
@@ -307,6 +316,9 @@ pub mod validation_codes {
     pub const E_UNKNOWN_COLUMN: &str = "E201";
     pub const E_UNKNOWN_FUNCTION: &str = "E202";
     pub const E_INVALID_FUNCTION_ARITY: &str = "E203";
+    pub const E_INVALID_GROUPING: &str = "E230";
+    pub const E_INVALID_AGGREGATE: &str = "E231";
+    pub const E_INVALID_WINDOW: &str = "E232";
 
     pub const W_SELECT_STAR: &str = "W001";
     pub const W_AGGREGATE_WITHOUT_GROUP_BY: &str = "W002";
@@ -663,76 +675,6 @@ pub fn mapping_schema_from_validation_schema_with_dialect(
     mapping
 }
 
-fn collect_cte_aliases(expr: &Expression) -> HashSet<String> {
-    let mut aliases = HashSet::new();
-
-    for node in expr.dfs() {
-        match node {
-            Expression::Select(select) => {
-                if let Some(with) = &select.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Insert(insert) => {
-                if let Some(with) = &insert.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Update(update) => {
-                if let Some(with) = &update.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Delete(delete) => {
-                if let Some(with) = &delete.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Union(union) => {
-                if let Some(with) = &union.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Intersect(intersect) => {
-                if let Some(with) = &intersect.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Except(except) => {
-                if let Some(with) = &except.with {
-                    for cte in &with.ctes {
-                        aliases.insert(lower(&cte.alias.name));
-                    }
-                }
-            }
-            Expression::Merge(merge) => {
-                if let Some(with_) = &merge.with_ {
-                    if let Expression::With(with_clause) = with_.as_ref() {
-                        for cte in &with_clause.ctes {
-                            aliases.insert(lower(&cte.alias.name));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    aliases
-}
-
 fn table_ref_candidates(table: &TableRef) -> Vec<String> {
     let name = lower(&table.name.name);
     let schema = table.schema.as_ref().map(|s| lower(&s.name));
@@ -898,9 +840,13 @@ fn collect_type_check_context(
     }
 
     let mut context = TypeCheckContext::default();
-    let cte_aliases = collect_cte_aliases(stmt);
+    let cte_aliases: HashSet<_> = build_scope(stmt)
+        .cte_sources
+        .keys()
+        .map(|name| lower(name))
+        .collect();
 
-    for node in stmt.find_all(|e| matches!(e, Expression::Table(_))) {
+    for node in walk_in_scope(stmt, false) {
         let Expression::Table(table) = node else {
             continue;
         };
@@ -1256,187 +1202,16 @@ fn check_reference_integrity(
     errors
 }
 
-fn resolve_unqualified_column_type(
-    column_name: &str,
-    schema_map: &HashMap<String, TableSchemaEntry>,
-    context: &TypeCheckContext,
-) -> TypeFamily {
-    let candidate_tables: Vec<&String> = if !context.referenced_tables.is_empty() {
-        context.referenced_tables.iter().collect()
-    } else {
-        schema_map.keys().collect()
-    };
-
-    let mut families = HashSet::new();
-    for table_name in candidate_tables {
-        if let Some(table_schema) = schema_map.get(table_name) {
-            if let Some(family) = table_schema.columns.get(column_name) {
-                families.insert(*family);
-            }
-        }
-    }
-
-    if families.len() == 1 {
-        *families.iter().next().unwrap_or(&TypeFamily::Unknown)
-    } else {
-        TypeFamily::Unknown
-    }
-}
-
-fn resolve_column_type(
-    column: &Column,
-    schema_map: &HashMap<String, TableSchemaEntry>,
-    context: &TypeCheckContext,
-) -> TypeFamily {
-    let column_name = lower(&column.name.name);
-    if column_name.is_empty() {
-        return TypeFamily::Unknown;
-    }
-
-    if let Some(table) = &column.table {
-        let mut table_key = lower(&table.name);
-        if let Some(mapped) = context.table_aliases.get(&table_key) {
-            table_key = mapped.clone();
-        }
-
-        return schema_map
-            .get(&table_key)
-            .and_then(|t| t.columns.get(&column_name))
-            .copied()
-            .unwrap_or(TypeFamily::Unknown);
-    }
-
-    resolve_unqualified_column_type(&column_name, schema_map, context)
-}
-
-struct TypeInferenceSchema<'a> {
-    schema_map: &'a HashMap<String, TableSchemaEntry>,
-    context: &'a TypeCheckContext,
-}
-
-impl TypeInferenceSchema<'_> {
-    fn resolve_table_key(&self, table: &str) -> Option<String> {
-        let mut table_key = lower(table);
-        if let Some(mapped) = self.context.table_aliases.get(&table_key) {
-            table_key = mapped.clone();
-        }
-        if self.schema_map.contains_key(&table_key) {
-            Some(table_key)
-        } else {
-            None
-        }
-    }
-}
-
-impl SqlSchema for TypeInferenceSchema<'_> {
-    fn dialect(&self) -> Option<DialectType> {
-        None
-    }
-
-    fn add_table(
-        &mut self,
-        _table: &str,
-        _columns: &[(String, DataType)],
-        _dialect: Option<DialectType>,
-    ) -> SchemaResult<()> {
-        Err(SchemaError::InvalidStructure(
-            "Type inference schema is read-only".to_string(),
-        ))
-    }
-
-    fn column_names(&self, table: &str) -> SchemaResult<Vec<String>> {
-        let table_key = self
-            .resolve_table_key(table)
-            .ok_or_else(|| SchemaError::TableNotFound(table.to_string()))?;
-        let entry = self
-            .schema_map
-            .get(&table_key)
-            .ok_or_else(|| SchemaError::TableNotFound(table.to_string()))?;
-        Ok(entry.column_order.clone())
-    }
-
-    fn get_column_type(&self, table: &str, column: &str) -> SchemaResult<DataType> {
-        let col_name = lower(column);
-        if table.is_empty() {
-            let family = resolve_unqualified_column_type(&col_name, self.schema_map, self.context);
-            return if family == TypeFamily::Unknown {
-                Err(SchemaError::ColumnNotFound {
-                    table: "<unqualified>".to_string(),
-                    column: column.to_string(),
-                })
-            } else {
-                Ok(type_family_to_data_type(family))
-            };
-        }
-
-        let table_key = self
-            .resolve_table_key(table)
-            .ok_or_else(|| SchemaError::TableNotFound(table.to_string()))?;
-        let entry = self
-            .schema_map
-            .get(&table_key)
-            .ok_or_else(|| SchemaError::TableNotFound(table.to_string()))?;
-        let family =
-            entry
-                .columns
-                .get(&col_name)
-                .copied()
-                .ok_or_else(|| SchemaError::ColumnNotFound {
-                    table: table.to_string(),
-                    column: column.to_string(),
-                })?;
-        Ok(type_family_to_data_type(family))
-    }
-
-    fn has_column(&self, table: &str, column: &str) -> bool {
-        self.get_column_type(table, column).is_ok()
-    }
-
-    fn supported_table_args(&self) -> &[&str] {
-        TABLE_PARTS
-    }
-
-    fn is_empty(&self) -> bool {
-        self.schema_map.is_empty()
-    }
-
-    fn depth(&self) -> usize {
-        1
-    }
-
-    fn find_tables_for_column(&self, column: &str) -> Vec<String> {
-        let col_name = column.to_lowercase();
-        self.schema_map
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .column_order
-                    .iter()
-                    .any(|c| c.to_lowercase() == col_name)
-            })
-            .map(|(table, _)| table.clone())
-            .collect()
-    }
-}
-
 fn infer_expression_type_family(
     expr: &Expression,
     schema_map: &HashMap<String, TableSchemaEntry>,
     context: &TypeCheckContext,
 ) -> TypeFamily {
-    let inference_schema = TypeInferenceSchema {
-        schema_map,
-        context,
-    };
-    let mut expr_clone = expr.clone();
-    annotate_types(&mut expr_clone, Some(&inference_schema), None);
-    if let Some(data_type) = expr_clone.inferred_type() {
-        let family = data_type_family(&data_type);
-        if family != TypeFamily::Unknown {
-            return family;
-        }
+    // Scoped annotation wins, including Unknown; never rebind an annotated
+    // reference against unrelated sources in the statement-wide catalogue.
+    if let Some(data_type) = expr.inferred_type() {
+        return data_type_family(data_type);
     }
-
     infer_expression_type_family_fallback(expr, schema_map, context)
 }
 
@@ -1466,7 +1241,9 @@ fn infer_expression_type_family_fallback(
         },
         Expression::Boolean(_) => TypeFamily::Boolean,
         Expression::Null(_) => TypeFamily::Unknown,
-        Expression::Column(column) => resolve_column_type(column, schema_map, context),
+        // The shared annotator already resolved every lexical input. Missing
+        // annotations must not trigger a second, statement-global lookup.
+        Expression::Column(_) => TypeFamily::Unknown,
         Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
             data_type_family(&cast.to)
         }
@@ -2226,10 +2003,48 @@ fn are_assignment_compatible(target: TypeFamily, source: TypeFamily) -> bool {
 }
 
 fn projection_families(
-    query_expr: &Expression,
+    query: &Expression,
     schema_map: &HashMap<String, TableSchemaEntry>,
+    dialect: DialectType,
 ) -> Option<Vec<TypeFamily>> {
-    match query_expr {
+    let pair = match query {
+        Expression::Union(query) => Some((&query.left, &query.right)),
+        Expression::Intersect(query) => Some((&query.left, &query.right)),
+        Expression::Except(query) => Some((&query.left, &query.right)),
+        _ => None,
+    };
+    if let Some((left, right)) = pair {
+        let left = projection_families(left, schema_map, dialect)?;
+        let right = projection_families(right, schema_map, dialect)?;
+        return match crate::set_operation::set_operation_layout(query, Some(dialect)).ok()? {
+            Some(layout) => Some(
+                layout
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        merged_setop_family(
+                            output
+                                .left_ordinal
+                                .and_then(|i| left.get(i).copied())
+                                .unwrap_or(TypeFamily::Unknown),
+                            output
+                                .right_ordinal
+                                .and_then(|i| right.get(i).copied())
+                                .unwrap_or(TypeFamily::Unknown),
+                        )
+                    })
+                    .collect(),
+            ),
+            None if left.len() == right.len() => Some(
+                left.into_iter()
+                    .zip(right)
+                    .map(|(l, r)| merged_setop_family(l, r))
+                    .collect(),
+            ),
+            _ => None,
+        };
+    }
+    match query {
         Expression::Select(select) => {
             if select
                 .expressions
@@ -2238,8 +2053,7 @@ fn projection_families(
             {
                 return None;
             }
-            let select_expr = Expression::Select(select.clone());
-            let context = collect_type_check_context(&select_expr, schema_map);
+            let context = collect_type_check_context(query, schema_map);
             Some(
                 select
                     .expressions
@@ -2248,62 +2062,24 @@ fn projection_families(
                     .collect(),
             )
         }
-        Expression::Subquery(subquery) => projection_families(&subquery.this, schema_map),
-        Expression::Union(union) => {
-            let left = projection_families(&union.left, schema_map)?;
-            let right = projection_families(&union.right, schema_map)?;
-            if left.len() != right.len() {
-                return None;
-            }
-            Some(
-                left.into_iter()
-                    .zip(right)
-                    .map(|(l, r)| merged_setop_family(l, r))
-                    .collect(),
-            )
-        }
-        Expression::Intersect(intersect) => {
-            let left = projection_families(&intersect.left, schema_map)?;
-            let right = projection_families(&intersect.right, schema_map)?;
-            if left.len() != right.len() {
-                return None;
-            }
-            Some(
-                left.into_iter()
-                    .zip(right)
-                    .map(|(l, r)| merged_setop_family(l, r))
-                    .collect(),
-            )
-        }
-        Expression::Except(except) => {
-            let left = projection_families(&except.left, schema_map)?;
-            let right = projection_families(&except.right, schema_map)?;
-            if left.len() != right.len() {
-                return None;
-            }
-            Some(
-                left.into_iter()
-                    .zip(right)
-                    .map(|(l, r)| merged_setop_family(l, r))
-                    .collect(),
-            )
-        }
-        Expression::Values(values) => {
-            let first_row = values.expressions.first()?;
-            let context = TypeCheckContext::default();
-            Some(
-                first_row
-                    .expressions
-                    .iter()
-                    .map(|e| infer_expression_type_family(e, schema_map, &context))
-                    .collect(),
-            )
-        }
+        Expression::Subquery(query) => projection_families(&query.this, schema_map, dialect),
+        Expression::Paren(query) => projection_families(&query.this, schema_map, dialect),
+        Expression::Values(values) => Some(
+            values
+                .expressions
+                .first()?
+                .expressions
+                .iter()
+                .map(|e| infer_expression_type_family(e, schema_map, &TypeCheckContext::default()))
+                .collect(),
+        ),
         _ => None,
     }
 }
 
 fn check_set_operation_compatibility(
+    query: &Expression,
+    dialect: DialectType,
     op_name: &str,
     left_expr: &Expression,
     right_expr: &Expression,
@@ -2311,13 +2087,51 @@ fn check_set_operation_compatibility(
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some(left_projection) = projection_families(left_expr, schema_map) else {
+    let Some(mut left_projection) = projection_families(left_expr, schema_map, dialect) else {
         return;
     };
-    let Some(right_projection) = projection_families(right_expr, schema_map) else {
+    let Some(mut right_projection) = projection_families(right_expr, schema_map, dialect) else {
         return;
     };
 
+    match crate::set_operation::set_operation_layout(query, Some(dialect)) {
+        Ok(Some(layout)) => {
+            let left = left_projection;
+            let right = right_projection;
+            left_projection = layout
+                .outputs
+                .iter()
+                .map(|output| {
+                    output
+                        .left_ordinal
+                        .and_then(|i| left.get(i).copied())
+                        .unwrap_or(TypeFamily::Unknown)
+                })
+                .collect();
+            right_projection = layout
+                .outputs
+                .iter()
+                .map(|output| {
+                    output
+                        .right_ordinal
+                        .and_then(|i| right.get(i).copied())
+                        .unwrap_or(TypeFamily::Unknown)
+                })
+                .collect();
+        }
+        Err(error) => {
+            if !error.is_indeterminate() {
+                errors.push(type_issue(
+                    strict,
+                    validation_codes::E_SETOP_ARITY_MISMATCH,
+                    validation_codes::W_SETOP_IMPLICIT_COERCION,
+                    error.to_string(),
+                ));
+            }
+            return;
+        }
+        Ok(None) => {}
+    }
     if left_projection.len() != right_projection.len() {
         errors.push(type_issue(
             strict,
@@ -2356,6 +2170,7 @@ fn check_set_operation_compatibility(
 }
 
 fn check_insert_assignments(
+    dialect: DialectType,
     stmt: &Expression,
     insert: &Insert,
     schema_map: &HashMap<String, TableSchemaEntry>,
@@ -2450,7 +2265,7 @@ fn check_insert_assignments(
             return;
         }
 
-        let Some(source_projection) = projection_families(query, schema_map) else {
+        let Some(source_projection) = projection_families(query, schema_map, dialect) else {
             return;
         };
 
@@ -2559,15 +2374,31 @@ fn check_types(
     let context = collect_type_check_context(stmt, schema_map);
 
     for node in stmt.dfs() {
+        for (clause, predicate) in crate::binding::predicates(node) {
+            let family = infer_expression_type_family(predicate, schema_map, &context);
+            if !predicate_compatible(family, dialect) {
+                errors.push(type_issue(
+                    strict,
+                    validation_codes::E_INVALID_PREDICATE_TYPE,
+                    validation_codes::W_PREDICATE_NULLABILITY,
+                    format!(
+                        "{clause} expects a boolean predicate, found {}",
+                        type_family_name(family)
+                    ),
+                ));
+            }
+        }
         match node {
             Expression::Insert(insert) => {
-                check_insert_assignments(stmt, insert, schema_map, strict, &mut errors);
+                check_insert_assignments(dialect, stmt, insert, schema_map, strict, &mut errors);
             }
             Expression::Update(update) => {
                 check_update_assignments(stmt, update, schema_map, strict, &mut errors);
             }
             Expression::Union(union) => {
                 check_set_operation_compatibility(
+                    node,
+                    dialect,
                     "UNION",
                     &union.left,
                     &union.right,
@@ -2578,6 +2409,8 @@ fn check_types(
             }
             Expression::Intersect(intersect) => {
                 check_set_operation_compatibility(
+                    node,
+                    dialect,
                     "INTERSECT",
                     &intersect.left,
                     &intersect.right,
@@ -2588,6 +2421,8 @@ fn check_types(
             }
             Expression::Except(except) => {
                 check_set_operation_compatibility(
+                    node,
+                    dialect,
                     "EXCEPT",
                     &except.left,
                     &except.right,
@@ -2596,119 +2431,10 @@ fn check_types(
                     &mut errors,
                 );
             }
-            Expression::Select(select) => {
-                if let Some(prewhere) = &select.prewhere {
-                    let family = infer_expression_type_family(prewhere, schema_map, &context);
-                    if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                        errors.push(type_issue(
-                            strict,
-                            validation_codes::E_INVALID_PREDICATE_TYPE,
-                            validation_codes::W_PREDICATE_NULLABILITY,
-                            format!(
-                                "PREWHERE clause expects a boolean predicate, found {}",
-                                type_family_name(family)
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(where_clause) = &select.where_clause {
-                    let family =
-                        infer_expression_type_family(&where_clause.this, schema_map, &context);
-                    if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                        errors.push(type_issue(
-                            strict,
-                            validation_codes::E_INVALID_PREDICATE_TYPE,
-                            validation_codes::W_PREDICATE_NULLABILITY,
-                            format!(
-                                "WHERE clause expects a boolean predicate, found {}",
-                                type_family_name(family)
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(having_clause) = &select.having {
-                    let family =
-                        infer_expression_type_family(&having_clause.this, schema_map, &context);
-                    if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                        errors.push(type_issue(
-                            strict,
-                            validation_codes::E_INVALID_PREDICATE_TYPE,
-                            validation_codes::W_PREDICATE_NULLABILITY,
-                            format!(
-                                "HAVING clause expects a boolean predicate, found {}",
-                                type_family_name(family)
-                            ),
-                        ));
-                    }
-                }
-
-                for join in &select.joins {
-                    if let Some(on) = &join.on {
-                        let family = infer_expression_type_family(on, schema_map, &context);
-                        if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                            errors.push(type_issue(
-                                strict,
-                                validation_codes::E_INVALID_PREDICATE_TYPE,
-                                validation_codes::W_PREDICATE_NULLABILITY,
-                                format!(
-                                    "JOIN ON expects a boolean predicate, found {}",
-                                    type_family_name(family)
-                                ),
-                            ));
-                        }
-                    }
-                    if let Some(match_condition) = &join.match_condition {
-                        let family =
-                            infer_expression_type_family(match_condition, schema_map, &context);
-                        if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                            errors.push(type_issue(
-                                strict,
-                                validation_codes::E_INVALID_PREDICATE_TYPE,
-                                validation_codes::W_PREDICATE_NULLABILITY,
-                                format!(
-                                    "JOIN MATCH_CONDITION expects a boolean predicate, found {}",
-                                    type_family_name(family)
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-            Expression::Where(where_clause) => {
-                let family = infer_expression_type_family(&where_clause.this, schema_map, &context);
-                if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                    errors.push(type_issue(
-                        strict,
-                        validation_codes::E_INVALID_PREDICATE_TYPE,
-                        validation_codes::W_PREDICATE_NULLABILITY,
-                        format!(
-                            "WHERE clause expects a boolean predicate, found {}",
-                            type_family_name(family)
-                        ),
-                    ));
-                }
-            }
-            Expression::Having(having_clause) => {
-                let family =
-                    infer_expression_type_family(&having_clause.this, schema_map, &context);
-                if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
-                    errors.push(type_issue(
-                        strict,
-                        validation_codes::E_INVALID_PREDICATE_TYPE,
-                        validation_codes::W_PREDICATE_NULLABILITY,
-                        format!(
-                            "HAVING clause expects a boolean predicate, found {}",
-                            type_family_name(family)
-                        ),
-                    ));
-                }
-            }
             Expression::And(op) | Expression::Or(op) => {
                 for (side, expr) in [("left", &op.left), ("right", &op.right)] {
                     let family = infer_expression_type_family(expr, schema_map, &context);
-                    if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
+                    if !predicate_compatible(family, dialect) {
                         errors.push(type_issue(
                             strict,
                             validation_codes::E_INVALID_PREDICATE_TYPE,
@@ -2724,7 +2450,7 @@ fn check_types(
             }
             Expression::Not(unary) => {
                 let family = infer_expression_type_family(&unary.this, schema_map, &context);
-                if family != TypeFamily::Unknown && family != TypeFamily::Boolean {
+                if !predicate_compatible(family, dialect) {
                     errors.push(type_issue(
                         strict,
                         validation_codes::E_INVALID_PREDICATE_TYPE,
@@ -3178,79 +2904,16 @@ fn check_types(
     errors
 }
 
-pub(crate) fn check_semantics(stmt: &Expression) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    let Expression::Select(select) = stmt else {
-        return errors;
-    };
-    let select_expr = Expression::Select(select.clone());
-
-    // W001: SELECT * is discouraged
-    if let Some(star) = select_expr
-        .find_all(|e| matches!(e, Expression::Star(_)))
-        .into_iter()
-        .next()
-    {
-        let mut warning = ValidationError::warning(
-            "SELECT * is discouraged; specify columns explicitly for better performance and maintainability",
-            validation_codes::W_SELECT_STAR,
-        );
-        if let Expression::Star(star) = star {
-            if let Some(span) = star.span {
-                warning = warning
-                    .with_location(span.line, span.column)
-                    .with_span(Some(span.start), Some(span.end));
-            }
-        }
-        errors.push(warning);
-    }
-
-    // W002: aggregate + non-aggregate columns without GROUP BY
-    let aggregate_count = get_aggregate_functions(&select_expr).len();
-    if aggregate_count > 0 && select.group_by.is_none() {
-        let first_non_aggregate_column = select.expressions.iter().find(|expr| {
-            matches!(expr, Expression::Column(_) | Expression::Identifier(_))
-                && get_aggregate_functions(expr).is_empty()
-        });
-
-        if let Some(expression) = first_non_aggregate_column {
-            let mut warning = ValidationError::warning(
-                "Mixing aggregate functions with non-aggregated columns without GROUP BY may cause errors in strict SQL mode",
-                validation_codes::W_AGGREGATE_WITHOUT_GROUP_BY,
-            );
-            let span = match expression {
-                Expression::Column(column) => column.span,
-                Expression::Identifier(identifier) => identifier.span,
-                _ => None,
-            };
-            if let Some(span) = span {
-                warning = warning
-                    .with_location(span.line, span.column)
-                    .with_span(Some(span.start), Some(span.end));
-            }
-            errors.push(warning);
-        }
-    }
-
-    // W003: DISTINCT with ORDER BY
-    if select.distinct && select.order_by.is_some() {
-        errors.push(ValidationError::warning(
-            "DISTINCT with ORDER BY: ensure ORDER BY columns are in SELECT list",
-            validation_codes::W_DISTINCT_ORDER_BY,
-        ));
-    }
-
-    // W004: LIMIT without ORDER BY
-    if select.limit.is_some() && select.order_by.is_none() {
-        errors.push(ValidationError::warning(
-            "LIMIT without ORDER BY produces non-deterministic results",
-            validation_codes::W_LIMIT_WITHOUT_ORDER_BY,
-        ));
-    }
-
-    errors
+fn predicate_compatible(family: TypeFamily, dialect: DialectType) -> bool {
+    matches!(family, TypeFamily::Unknown | TypeFamily::Boolean)
+        || (matches!(
+            dialect,
+            DialectType::MySQL | DialectType::SQLite | DialectType::DuckDB
+        ) && family.is_numeric())
 }
+
+mod semantics;
+pub(crate) use semantics::check_semantics;
 
 fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<String> {
     scope
@@ -3266,10 +2929,27 @@ fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<
         })
 }
 
-fn source_has_column(columns: &[String], column_name: &str) -> bool {
-    columns
-        .iter()
-        .any(|c| c == "*" || c.eq_ignore_ascii_case(column_name))
+fn source_has_column(
+    scope: &crate::scope::Scope,
+    source: &str,
+    columns: &[String],
+    column: &crate::expressions::Identifier,
+    dialect: DialectType,
+) -> bool {
+    let strategy = get_normalization_strategy(Some(dialect));
+    let expected = normalize_identifier(column.clone(), strategy).name;
+    columns.iter().any(|name| {
+        if name == "*" {
+            return true;
+        }
+        let identifier = scope
+            .sources
+            .get(source)
+            .and_then(|source| source_output_identifier(&source.expression, name))
+            .cloned()
+            .unwrap_or_else(|| crate::binding::schema_identifier(name));
+        normalize_identifier(identifier, strategy).name == expected
+    })
 }
 
 fn source_display_name(scope: &crate::scope::Scope, source_name: &str) -> String {
@@ -3305,14 +2985,380 @@ fn reference_diagnostic(
 
 use crate::scope::{scope_query, selected_reference_scope as selected_validation_scope};
 
+/// Validation starts from SQL, so source ranges identify individual references
+/// across the scope tree's AST copies. Never bind synthetic/unpositioned columns.
+/// Types, not defining expressions, are stored to keep alias chains linear in size.
+type ProjectionAliasBindings = HashMap<(usize, usize), DataType>;
+
+fn projection_reference_key(column: &Column) -> Option<(usize, usize)> {
+    if column.table.is_some() {
+        return None;
+    }
+    column
+        .name
+        .span
+        .or(column.span)
+        .map(|span| (span.start, span.end))
+}
+
+use crate::binding::bound_identifier as validation_bound_identifier;
+
+/// Apply already resolved bindings to the private validation AST. The canonical
+/// visitor keeps this stack-safe and covers references inside typed functions.
+fn apply_projection_alias_bindings(
+    expression: Expression,
+    bindings: &ProjectionAliasBindings,
+) -> Expression {
+    if bindings.is_empty() {
+        return expression;
+    }
+    enum Task {
+        Visit(Expression),
+        Finish(Expression, usize),
+    }
+    let mut pending = vec![Task::Visit(expression)];
+    let mut results = Vec::new();
+    while let Some(task) = pending.pop() {
+        match task {
+            Task::Visit(mut expression) => {
+                if let Expression::Column(column) = &expression {
+                    if let Some(data_type) =
+                        projection_reference_key(column).and_then(|key| bindings.get(&key))
+                    {
+                        results.push(validation_bound_identifier(column.name.clone(), data_type));
+                        continue;
+                    }
+                }
+                let mut children = Vec::new();
+                crate::ast_children::for_each_child_mut(&mut expression, |child| {
+                    children.push(std::mem::replace(
+                        child,
+                        Expression::Null(crate::expressions::Null),
+                    ));
+                });
+                pending.push(Task::Finish(expression, children.len()));
+                pending.extend(children.into_iter().rev().map(Task::Visit));
+            }
+            Task::Finish(mut expression, count) => {
+                let mut children = results.split_off(results.len() - count).into_iter();
+                crate::ast_children::for_each_child_mut(&mut expression, |child| {
+                    *child = children.next().expect("alias binding child");
+                });
+                results.push(expression);
+            }
+        }
+    }
+    results.pop().expect("alias binding result")
+}
+
+fn bind_scope_projection_aliases(
+    scope: &mut crate::scope::Scope,
+    ancestors: &[&crate::scope::Scope],
+    resolver_schema: &MappingSchema,
+    dialect: DialectType,
+    check_types: bool,
+    bindings: &mut ProjectionAliasBindings,
+) {
+    let Expression::Select(select) = &scope.expression else {
+        return;
+    };
+    if !select
+        .expressions
+        .iter()
+        .any(|expression| matches!(expression, Expression::Alias(_)))
+    {
+        return;
+    }
+
+    // A real input wins over a lateral alias. Ambiguous inputs must also remain
+    // columns so the ordinary reference checker can diagnose them. Open sources
+    // do not provide enough information to safely choose an alias instead.
+    let strategy = get_normalization_strategy(Some(dialect));
+    let mut inputs = HashSet::new();
+    let mut open = false;
+    for source_scope in std::iter::once(&*scope).chain(ancestors.iter().copied()) {
+        let mut resolver = Resolver::new(source_scope, resolver_schema, true);
+        for source in source_scope.sources.keys() {
+            let columns = resolver.get_source_columns(source).unwrap_or_default();
+            open |= columns.is_empty() || columns.iter().any(|name| name == "*");
+            let expression = &source_scope.sources[source].expression;
+            for name in columns {
+                let identifier = source_output_identifier(expression, &name)
+                    .cloned()
+                    .unwrap_or_else(|| crate::expressions::Identifier::new(name));
+                inputs.insert(normalize_identifier(identifier, strategy).name);
+            }
+        }
+    }
+    if open {
+        return;
+    }
+
+    // A child SELECT can use CTEs declared in a containing WITH. Reconstruct
+    // that lexical catalogue for type inference, in original declaration order.
+    let mut ctes: Vec<_> = if check_types {
+        scope
+            .cte_sources
+            .values()
+            .filter_map(|source| match &source.expression {
+                Expression::Cte(cte) => Some(cte.as_ref().clone()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ctes.sort_by_key(|cte| cte.alias.span.map(|span| span.start));
+    let mut aliases = HashMap::<String, Option<DataType>>::new();
+    let Expression::Select(select) = &mut scope.expression else {
+        unreachable!()
+    };
+    // Keep the original sources/CTEs for scoped type inference, without copying
+    // the entire projection list for each alias. Bound uses are constant-size.
+    let mut projections = std::mem::take(&mut select.expressions);
+    let mut type_select = select.clone();
+    if !ctes.is_empty() {
+        type_select.with = Some(crate::expressions::With {
+            ctes,
+            recursive: false,
+            leading_comments: Vec::new(),
+            search: None,
+        });
+    }
+    for projection in projections.iter_mut() {
+        let mut references = ProjectionAliasBindings::new();
+        for node in walk_in_scope(projection, false) {
+            if !crate::binding::lateral_aliases(dialect) {
+                break;
+            }
+            let Expression::Column(column) = node else {
+                continue;
+            };
+            let Some(key) = projection_reference_key(column) else {
+                continue;
+            };
+            let name = normalize_identifier(column.name.clone(), strategy).name;
+            if inputs.contains(&name) {
+                continue;
+            }
+            if let Some(Some(data_type)) = aliases.get(&name) {
+                references.insert(key, data_type.clone());
+            }
+        }
+        let original = std::mem::replace(projection, Expression::Null(crate::expressions::Null));
+        *projection = apply_projection_alias_bindings(original, &references);
+        bindings.extend(references);
+        if let Expression::Alias(alias) = projection {
+            let name = normalize_identifier(alias.alias.clone(), strategy).name;
+            // Duplicate names are not evidence of an unambiguous binding.
+            if aliases.contains_key(&name) {
+                aliases.insert(name, None);
+                continue;
+            }
+            if !check_types {
+                aliases.insert(name, Some(DataType::Unknown));
+                continue;
+            }
+            let mut typed = Expression::Select(type_select.clone());
+            if let Expression::Select(query) = &mut typed {
+                query.expressions.push(alias.this.clone());
+            }
+            // Child queries were bound first. Their aliases must contribute
+            // their actual types, not remain unresolved inputs in this copy.
+            typed = apply_projection_alias_bindings(typed, bindings);
+            annotate_types(&mut typed, Some(resolver_schema), Some(dialect));
+            let data_type = match typed {
+                Expression::Select(query) => query.expressions[0]
+                    .inferred_type()
+                    .cloned()
+                    .unwrap_or(DataType::Unknown),
+                _ => unreachable!(),
+            };
+            aliases.insert(name, Some(data_type));
+        }
+    }
+    select.expressions = projections;
+    // Only clause-specific output visibility is enabled. JOIN ON remains an
+    // input scope, and aliases never become visible in a nested query.
+    use crate::binding::{clause_aliases, AliasClause};
+    let mut clauses = Vec::new();
+    if clause_aliases(dialect, AliasClause::Where) {
+        if let Some(clause) = &mut select.where_clause {
+            clauses.push(&mut clause.this);
+        }
+    }
+    if clause_aliases(dialect, AliasClause::Group) {
+        if let Some(clause) = &mut select.group_by {
+            clauses.extend(clause.expressions.iter_mut());
+        }
+    }
+    if clause_aliases(dialect, AliasClause::Having) {
+        if let Some(clause) = &mut select.having {
+            clauses.push(&mut clause.this);
+        }
+    }
+    if clause_aliases(dialect, AliasClause::Qualify) {
+        if let Some(clause) = &mut select.qualify {
+            clauses.push(&mut clause.this);
+        }
+    }
+    for clause in clauses {
+        let mut references = ProjectionAliasBindings::new();
+        for node in walk_in_scope(clause, false) {
+            let Expression::Column(column) = node else {
+                continue;
+            };
+            let Some(key) = projection_reference_key(column) else {
+                continue;
+            };
+            let name = normalize_identifier(column.name.clone(), strategy).name;
+            if !inputs.contains(&name) {
+                if let Some(Some(data_type)) = aliases.get(&name) {
+                    references.insert(key, data_type.clone());
+                }
+            }
+        }
+        let original = std::mem::replace(clause, Expression::Null(crate::expressions::Null));
+        *clause = apply_projection_alias_bindings(original, &references);
+        bindings.extend(references);
+    }
+}
+
+/// Resolver output names are strings. Retain quoting when those names were
+/// declared by a CTE/derived table, rather than folding a quoted output name.
+fn source_output_identifier<'a>(
+    expression: &'a Expression,
+    name: &str,
+) -> Option<&'a crate::expressions::Identifier> {
+    let columns: &[crate::expressions::Identifier] = match expression {
+        Expression::Cte(cte) => &cte.columns,
+        Expression::Subquery(query) => &query.column_aliases,
+        Expression::Alias(alias) => &alias.column_aliases,
+        Expression::Table(table) => &table.column_aliases,
+        Expression::Paren(paren) => return source_output_identifier(&paren.this, name),
+        _ => &[],
+    };
+    if !columns.is_empty() {
+        return columns.iter().find(|column| column.name == name);
+    }
+    match scope_query(expression) {
+        Expression::Select(select) => select.expressions.iter().find_map(|projection| {
+            let identifier = match projection {
+                Expression::Alias(alias) => &alias.alias,
+                Expression::Column(column) => &column.name,
+                Expression::Identifier(identifier) => identifier,
+                _ => return None,
+            };
+            (identifier.name == name).then_some(identifier)
+        }),
+        Expression::Union(query) => source_output_identifier(&query.left, name),
+        Expression::Intersect(query) => source_output_identifier(&query.left, name),
+        Expression::Except(query) => source_output_identifier(&query.left, name),
+        _ => None,
+    }
+}
+
+/// Prepare the private validation AST, not the public parser/serialized AST.
+/// Bound parameters become identifiers (optionally typed), leaving only free
+/// column references for schema resolution. Doing this once, before dotted
+/// normalization, also prevents type checks from borrowing a shadowed table
+/// column's type. Nested query scopes do not inherit lambda parameters.
+use crate::binding::bind_lambdas as bind_validation_lambdas;
+
+#[derive(Clone, Copy)]
+struct ReferenceValidationOptions {
+    dialect: DialectType,
+    strict: bool,
+    check_references: bool,
+    check_types: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputNameResolution {
+    InputOnly,
+    OutputFirst,
+    InputFirst,
+}
+
+/// Collect ordering references together with whether they can resolve to the
+/// current SELECT's outputs. Other clauses use the ordinary input-source walk.
+fn order_by_validation_columns(
+    order_by: &crate::expressions::OrderBy,
+    dialect: DialectType,
+) -> Vec<(&Column, OutputNameResolution)> {
+    // Only enable aliases inside scalar expressions for dialects whose rules
+    // support them. In particular, PostgreSQL and T-SQL require standalone
+    // output names; `ORDER BY alias + 1` must resolve against input columns.
+    let scalar_resolution = match dialect {
+        // DuckDB's scalar binder prefers inputs inside ordering expressions,
+        // unlike its standalone ORDER BY output-name lookup.
+        DialectType::DuckDB => OutputNameResolution::InputFirst,
+        DialectType::Snowflake | DialectType::BigQuery => OutputNameResolution::OutputFirst,
+        _ => OutputNameResolution::InputOnly,
+    };
+    let mut columns = Vec::new();
+    let mut pending: Vec<_> = order_by
+        .expressions
+        .iter()
+        .rev()
+        .map(|ordered| (&ordered.this, OutputNameResolution::OutputFirst))
+        .collect();
+    while let Some((node, resolution)) = pending.pop() {
+        match node {
+            // Child query scopes are validated separately and must not inherit
+            // their parent's SELECT-list aliases.
+            Expression::Select(_)
+            | Expression::Union(_)
+            | Expression::Intersect(_)
+            | Expression::Except(_)
+            | Expression::Subquery(_)
+            | Expression::Exists(_)
+            | Expression::Cte(_) => continue,
+            Expression::Column(column) => columns.push((column.as_ref(), resolution)),
+            Expression::Paren(paren) => pending.push((&paren.this, resolution)),
+            _ => {
+                let input_only = resolution == OutputNameResolution::InputOnly
+                    || matches!(
+                        node,
+                        Expression::WindowFunction(_)
+                            | Expression::WithinGroup(_)
+                            | Expression::Filter(_)
+                    )
+                    || crate::traversal::is_aggregate(node);
+                if input_only {
+                    columns.extend(walk_in_scope(node, false).filter_map(|node| match node {
+                        Expression::Column(column) => {
+                            Some((column.as_ref(), OutputNameResolution::InputOnly))
+                        }
+                        _ => None,
+                    }));
+                } else {
+                    pending.extend(
+                        node.children()
+                            .into_iter()
+                            .rev()
+                            .map(|child| (child, scalar_resolution)),
+                    );
+                }
+            }
+        }
+    }
+    columns
+}
+
 fn validate_scope_columns(
     scope: &crate::scope::Scope,
     ancestors: &[&crate::scope::Scope],
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
-    strict: bool,
-    check_references: bool,
+    options: ReferenceValidationOptions,
 ) -> Vec<ValidationError> {
+    let ReferenceValidationOptions {
+        dialect,
+        strict,
+        check_references,
+        ..
+    } = options;
     let mut errors = Vec::new();
     let Expression::Select(select) = &scope.expression else {
         return errors;
@@ -3331,6 +3377,32 @@ fn validate_scope_columns(
     let mut normalized = select.clone();
     let mut normalizer = Resolver::new(&visible, resolver_schema, true);
     let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+    let strategy = get_normalization_strategy(Some(dialect));
+    let mut output_names = HashMap::<String, usize>::new();
+    for projection in &normalized.expressions {
+        let identifier = match projection {
+            // Until wildcards are expanded, output-name uniqueness is not
+            // known. Preserve source validation instead of letting an explicit
+            // alias hide a conflicting column contributed by a wildcard.
+            Expression::Star(_) => {
+                output_names.clear();
+                break;
+            }
+            Expression::Alias(alias) => &alias.alias,
+            Expression::Column(column) if column.name.name != "*" => &column.name,
+            Expression::Column(_) => {
+                output_names.clear();
+                break;
+            }
+            _ => continue,
+        };
+        let name = normalize_identifier(identifier.clone(), strategy).name;
+        *output_names.entry(name).or_default() += 1;
+    }
+    // Separate query-level ordering from the ordinary scope walk. This avoids
+    // accidentally exempting a same-named reference in another clause, window,
+    // or nested query, and leaves the caller's AST untouched.
+    let order_by = normalized.order_by.take();
     let expression = Expression::Select(normalized);
     let mut resolvers: Vec<_> = std::iter::once(scope)
         .chain(ancestors.iter().copied())
@@ -3342,10 +3414,27 @@ fn validate_scope_columns(
         .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
         .collect();
 
-    for node in walk_in_scope(&expression, false) {
-        let Expression::Column(column) = node else {
+    let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
+        Expression::Column(column) => Some((column.as_ref(), OutputNameResolution::InputOnly)),
+        _ => None,
+    });
+    let order_columns = order_by
+        .as_ref()
+        .into_iter()
+        .flat_map(|order| order_by_validation_columns(order, dialect));
+    for (column, resolution) in input_columns.chain(order_columns) {
+        let output_matches =
+            if resolution != OutputNameResolution::InputOnly && column.table.is_none() {
+                let name = normalize_identifier(column.name.clone(), strategy).name;
+                // Only an unambiguous output name takes precedence over sources.
+                // Duplicate output names retain the existing reference checks.
+                output_names.get(&name) == Some(&1)
+            } else {
+                false
+            };
+        if output_matches && resolution == OutputNameResolution::OutputFirst {
             continue;
-        };
+        }
         let name = lower(&column.name.name);
         if name.is_empty() || name == "*" {
             continue;
@@ -3362,7 +3451,9 @@ fn validate_scope_columns(
                 })
             });
             if let Some((source_scope, columns, source)) = resolved {
-                if !columns.is_empty() && !source_has_column(&columns, &name) {
+                if !columns.is_empty()
+                    && !source_has_column(source_scope, &source, &columns, &column.name, dialect)
+                {
                     errors.push(reference_diagnostic(
                         format!(
                             "Unknown column '{}' in table '{}'",
@@ -3396,7 +3487,10 @@ fn validate_scope_columns(
                 let columns = resolver.get_source_columns(source).unwrap_or_default();
                 open |= columns.is_empty() || columns.iter().any(|name| name == "*");
                 // Wildcards are not evidence of a definite ambiguity.
-                matches += usize::from(columns.iter().any(|col| col.eq_ignore_ascii_case(&name)));
+                matches += usize::from(
+                    !columns.iter().any(|name| name == "*")
+                        && source_has_column(source_scope, source, &columns, &column.name, dialect),
+                );
             }
             if matches > 0 || open {
                 if matches > 1 && check_references && !using_columns.contains(&name) {
@@ -3419,6 +3513,9 @@ fn validate_scope_columns(
             }
         }
         if !found {
+            if output_matches && resolution == OutputNameResolution::InputFirst {
+                continue;
+            }
             // Preserve the existing schema-only lookup for standalone column
             // expressions (SELECT id). Never consult unrelated tables when
             // the query has actual sources or an enclosing query context.
@@ -3460,34 +3557,14 @@ fn validate_scope_tree(
     ancestors: &[&crate::scope::Scope],
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
-    strict: bool,
-    check_references: bool,
+    options: ReferenceValidationOptions,
     errors: &mut Vec<ValidationError>,
+    bindings: &mut ProjectionAliasBindings,
 ) {
-    let selected = selected_validation_scope(scope);
-    for node in walk_in_scope(&selected.expression, false) {
-        let Expression::Table(table) = node else {
-            continue;
-        };
-        let is_cte = table.schema.is_none()
-            && table.catalog.is_none()
-            && selected
-                .cte_sources
-                .keys()
-                .any(|name| name.eq_ignore_ascii_case(&table.name.name));
-        if !is_cte {
-            validate_schema_table(table, schema_map, strict, errors);
-        }
-    }
-    errors.extend(validate_scope_columns(
-        &selected,
-        ancestors,
-        schema_map,
-        resolver_schema,
-        strict,
-        check_references,
-    ));
-
+    let mut selected = selected_validation_scope(scope);
+    // Bind children before consumers, but retain the existing parent-first
+    // diagnostic order. Only physical sources are inherited, never output aliases.
+    let mut child_errors = Vec::new();
     // CTEs and ordinary derived tables cannot see their containing SELECT's
     // sources, but may retain ancestors of an enclosing correlated subquery.
     for child in scope
@@ -3501,9 +3578,9 @@ fn validate_scope_tree(
             ancestors,
             schema_map,
             resolver_schema,
-            strict,
-            check_references,
-            errors,
+            options,
+            &mut child_errors,
+            bindings,
         );
     }
     let outer: Vec<_> = std::iter::once(&selected)
@@ -3515,11 +3592,41 @@ fn validate_scope_tree(
             &outer,
             schema_map,
             resolver_schema,
-            strict,
-            check_references,
-            errors,
+            options,
+            &mut child_errors,
+            bindings,
         );
     }
+    bind_scope_projection_aliases(
+        &mut selected,
+        ancestors,
+        resolver_schema,
+        options.dialect,
+        options.check_types,
+        bindings,
+    );
+    for node in walk_in_scope(&selected.expression, false) {
+        let Expression::Table(table) = node else {
+            continue;
+        };
+        let is_cte = table.schema.is_none()
+            && table.catalog.is_none()
+            && selected
+                .cte_sources
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(&table.name.name));
+        if !is_cte {
+            validate_schema_table(table, schema_map, options.strict, errors);
+        }
+    }
+    errors.extend(validate_scope_columns(
+        &selected,
+        ancestors,
+        schema_map,
+        resolver_schema,
+        options,
+    ));
+    errors.extend(child_errors);
 }
 
 fn validate_schema_table(
@@ -3545,13 +3652,154 @@ fn validate_statement_with_schema(
     stmt: &Expression,
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
-    strict: bool,
-    check_references: bool,
+    options: ReferenceValidationOptions,
+    bindings: &mut ProjectionAliasBindings,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     // Visit each query tree once, including queries embedded in DML/DDL.
     let mut pending = vec![stmt];
     while let Some(expression) = pending.pop() {
+        if let Some(select) = crate::binding::dml_scope(expression) {
+            let query = Expression::Select(Box::new(select));
+            let scope = build_scope(&query);
+            validate_scope_tree(
+                &scope,
+                &[],
+                schema_map,
+                resolver_schema,
+                options,
+                &mut errors,
+                bindings,
+            );
+            let target_columns = match expression {
+                Expression::Insert(insert) => {
+                    Some((&insert.table, insert.columns.iter().collect::<Vec<_>>()))
+                }
+                Expression::Update(update) => Some((
+                    &update.table,
+                    update.set.iter().map(|(column, _)| column).collect(),
+                )),
+                _ => None,
+            };
+            if let Some((table, columns)) = target_columns {
+                if let Some((_, entry)) = resolve_table_schema_entry(table, schema_map) {
+                    for column in columns {
+                        if !entry.columns.is_empty()
+                            && !entry.columns.contains_key("*")
+                            && !entry.columns.contains_key(&lower(&column.name))
+                        {
+                            errors.push(reference_diagnostic(
+                                format!(
+                                    "Unknown column '{}' in table '{}'",
+                                    column.name, table.name.name
+                                ),
+                                validation_codes::E_UNKNOWN_COLUMN,
+                                options.strict,
+                                column.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Expression::Insert(insert) = expression {
+                // VALUES has no implicit target-table input scope.
+                for value in insert.values.iter().flatten() {
+                    for node in walk_in_scope(value, false) {
+                        if let Expression::Column(column) = node {
+                            errors.push(reference_diagnostic(
+                                format!("Unknown column '{}' in INSERT VALUES", column.name.name),
+                                validation_codes::E_UNKNOWN_COLUMN,
+                                options.strict,
+                                column.name.span.or(column.span),
+                            ));
+                        }
+                    }
+                    pending.extend(value.children().into_iter().filter(|child| {
+                        matches!(child, Expression::Subquery(_) | Expression::Select(_))
+                    }));
+                }
+                if let Some(query) = &insert.query {
+                    // A leading WITH belongs to both the INSERT and its source.
+                    let mut source = crate::expressions::Select::new();
+                    source.with = insert.with.clone();
+                    source.expressions.push(query.clone());
+                    let scope = build_scope(&Expression::Select(Box::new(source)));
+                    validate_scope_tree(
+                        &scope,
+                        &[],
+                        schema_map,
+                        resolver_schema,
+                        options,
+                        &mut errors,
+                        bindings,
+                    );
+                }
+            }
+            if let Expression::Merge(merge) = expression {
+                let target = match merge.this.as_ref() {
+                    Expression::Table(table) => Some(table.as_ref()),
+                    Expression::Alias(alias) => match &alias.this {
+                        Expression::Table(table) => Some(table.as_ref()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((table, (_, entry))) = target.and_then(|table| {
+                    resolve_table_schema_entry(table, schema_map).map(|entry| (table, entry))
+                }) {
+                    if let Some(whens) = &merge.whens {
+                        for node in whens.dfs() {
+                            let Expression::When(when) = node else {
+                                continue;
+                            };
+                            let Expression::Tuple(action) = when.then.as_ref() else {
+                                continue;
+                            };
+                            let Some(Expression::Var(kind)) = action.expressions.first() else {
+                                continue;
+                            };
+                            let Some(Expression::Tuple(assignments)) = action.expressions.get(1)
+                            else {
+                                continue;
+                            };
+                            for assignment in &assignments.expressions {
+                                let target = if kind.this.eq_ignore_ascii_case("UPDATE") {
+                                    if let Expression::Eq(eq) = assignment {
+                                        &eq.left
+                                    } else {
+                                        continue;
+                                    }
+                                } else if kind.this.eq_ignore_ascii_case("INSERT") {
+                                    assignment
+                                } else {
+                                    continue;
+                                };
+                                let identifier = match target {
+                                    Expression::Identifier(id) => id,
+                                    Expression::Column(column) => &column.name,
+                                    _ => continue,
+                                };
+                                if !entry.columns.is_empty()
+                                    && !entry.columns.contains_key("*")
+                                    && !entry.columns.contains_key(&lower(&identifier.name))
+                                {
+                                    errors.push(reference_diagnostic(
+                                        format!(
+                                            "Unknown column '{}' in table '{}'",
+                                            identifier.name, table.name.name
+                                        ),
+                                        validation_codes::E_UNKNOWN_COLUMN,
+                                        options.strict,
+                                        identifier.span,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if matches!(
             scope_query(expression),
             Expression::Select(_)
@@ -3565,13 +3813,23 @@ fn validate_statement_with_schema(
                 &[],
                 schema_map,
                 resolver_schema,
-                strict,
-                check_references,
+                options,
                 &mut errors,
+                bindings,
             );
         } else {
+            // DDL may declare a new table; only its query inputs are references.
+            if let Expression::CreateTable(create) = expression {
+                if let Some(query) = &create.as_select {
+                    pending.push(query);
+                }
+                if let Some(source) = &create.clone_source {
+                    validate_schema_table(source, schema_map, options.strict, &mut errors);
+                }
+                continue;
+            }
             if let Expression::Table(table) = expression {
-                validate_schema_table(table, schema_map, strict, &mut errors);
+                validate_schema_table(table, schema_map, options.strict, &mut errors);
             }
             pending.extend(expression.children().into_iter().rev());
         }
@@ -3579,7 +3837,7 @@ fn validate_statement_with_schema(
     errors
 }
 
-/// Validate SQL using syntax + schema-aware checks, with optional semantic warnings.
+/// Validate SQL using syntax + schema-aware checks, with optional semantic checks.
 pub fn validate_with_schema(
     sql: &str,
     dialect: DialectType,
@@ -3588,33 +3846,24 @@ pub fn validate_with_schema(
 ) -> ValidationResult {
     let strict = options.strict.unwrap_or(schema.strict.unwrap_or(true));
 
-    // Syntax validation first.
-    let syntax_result = crate::validate_with_options(
+    // Parse once, preserving syntax-error precedence and the caller's guards.
+    let d = Dialect::get(dialect);
+    let statements = match crate::parse_for_validation(
         sql,
-        dialect,
+        &d,
         &crate::ValidationOptions {
+            complexity_guard: options.complexity_guard,
             strict_syntax: options.strict_syntax,
             semantic: options.semantic,
         },
-    );
-    if !syntax_result.valid {
-        return syntax_result;
-    }
-
-    let d = Dialect::get(dialect);
-    let statements = match d.parse(sql) {
+    ) {
         Ok(exprs) => exprs,
-        Err(e) => {
-            return ValidationResult::with_errors(vec![ValidationError::error(
-                e.to_string(),
-                validation_codes::E_PARSE_OR_OPTIONS,
-            )]);
-        }
+        Err(result) => return result,
     };
 
     let schema_map = build_schema_map(schema);
-    let resolver_schema = build_resolver_schema(schema);
-    let mut all_errors = syntax_result.errors;
+    let resolver_schema = mapping_schema_from_validation_schema_with_dialect(schema, dialect);
+    let mut all_errors = Vec::new();
     let embedded_function_catalog = if options.check_types && options.function_catalog.is_none() {
         default_embedded_function_catalog()
     } else {
@@ -3634,14 +3883,49 @@ pub fn validate_with_schema(
         all_errors.extend(check_reference_integrity(schema, &schema_map, strict));
     }
 
-    for stmt in &statements {
+    for mut statement in statements {
+        if options.semantic {
+            all_errors.extend(check_semantics(&statement, dialect, Some(schema)));
+        }
+        crate::binding::bind_dml_pseudoreferences(&mut statement);
+        let statement = bind_validation_lambdas(statement, dialect);
+        let mut bindings = ProjectionAliasBindings::new();
         all_errors.extend(validate_statement_with_schema(
-            stmt,
+            &statement,
             &schema_map,
             &resolver_schema,
-            strict,
-            options.check_references,
+            ReferenceValidationOptions {
+                dialect,
+                strict,
+                check_references: options.check_references,
+                check_types: options.check_types,
+            },
+            &mut bindings,
         ));
+        let mut statement = apply_projection_alias_bindings(statement, &bindings);
+        if options.check_types {
+            // Expand known stars using the same qualification path as lineage.
+            // Open/partial schemas remain conservative if qualification fails.
+            if statement.dfs().any(|node| {
+                matches!(
+                    node,
+                    Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+                )
+            }) && statement
+                .dfs()
+                .any(|node| matches!(node, Expression::Star(_)))
+            {
+                if let Ok(qualified) = crate::optimizer::qualify_schema_aware_expression(
+                    statement.clone(),
+                    &resolver_schema,
+                    Some(dialect),
+                ) {
+                    statement = qualified;
+                }
+            }
+            annotate_types(&mut statement, Some(&resolver_schema), Some(dialect));
+        }
+        let stmt = &statement;
         if options.check_types {
             all_errors.extend(check_types(
                 stmt,

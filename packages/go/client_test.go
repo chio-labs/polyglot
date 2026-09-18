@@ -217,10 +217,9 @@ func TestTranspileOptionsJSON(t *testing.T) {
 }
 
 func TestTranspileOptionsComplexityGuardJSON(t *testing.T) {
-	limit := 128
 	payload, err := marshalOptions(TranspileOptions{
 		ComplexityGuard: &ComplexityGuardOptions{
-			MaxFunctionCallDepth: &limit,
+			MaxFunctionCallDepth: NewGuardLimit(128),
 		},
 	})
 	if err != nil {
@@ -258,6 +257,44 @@ func TestParserDepthGuardJSON(t *testing.T) {
 		var decoded ComplexityGuardOptions
 		if err := json.Unmarshal([]byte(data), &decoded); err == nil {
 			t.Fatalf("accepted %s", data)
+		}
+	}
+}
+
+func TestAllComplexityGuardLimitsPreserveThreeStates(t *testing.T) {
+	for _, name := range []string{"maxParserDepth", "maxInputBytes", "maxTokens", "maxAstNodes", "maxAstDepth", "maxParenthesisDepth", "maxFunctionCallDepth"} {
+		for _, value := range []string{"0", "128", "null"} {
+			payload := `{"` + name + `":` + value + `}`
+			var options ComplexityGuardOptions
+			if err := json.Unmarshal([]byte(payload), &options); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(options)
+			if err != nil || string(data) != payload {
+				t.Fatalf("round trip %s: %s, %v", payload, data, err)
+			}
+		}
+		for _, value := range []string{"-1", "true", "1.0", "1.5", `"128"`, "18446744073709551616"} {
+			var options ComplexityGuardOptions
+			if err := json.Unmarshal([]byte(`{"`+name+`":`+value+`}`), &options); err == nil {
+				t.Fatalf("accepted %s=%s", name, value)
+			}
+		}
+	}
+	guard := &ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit()}
+	for _, options := range []any{ParseOptions{ComplexityGuard: guard}, ValidationOptions{ComplexityGuard: guard}, SchemaValidationOptions{ComplexityGuard: guard}, AnalyzeQueryOptions{ComplexityGuard: guard}} {
+		payload, err := marshalOptions(options)
+		if err != nil || payload != `{"complexityGuard":{"maxFunctionCallDepth":null}}` {
+			t.Fatalf("%T: %s, %v", options, payload, err)
+		}
+	}
+}
+
+func TestParseRejectsMultipleOptions(t *testing.T) {
+	client := &Client{}
+	for _, parse := range []func(string, string, ...ParseOptions) (json.RawMessage, error){client.Parse, client.ParseOne, client.ParseDataType} {
+		if _, err := parse("SELECT 1", "generic", ParseOptions{}, ParseOptions{}); err == nil || !strings.Contains(err.Error(), "at most one") {
+			t.Fatalf("expected options error, got %v", err)
 		}
 	}
 }

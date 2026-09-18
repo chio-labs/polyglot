@@ -364,22 +364,6 @@ fn lineage_from_column_ref(
     to_node(column, scope, dialect, "", "", "", trim_selects)
 }
 
-#[cfg(feature = "generate")]
-pub(crate) fn lineage_by_index_from_expression(
-    column_index: usize,
-    sql: &Expression,
-    dialect: Option<DialectType>,
-    trim_selects: bool,
-) -> Result<LineageNode> {
-    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
-    lineage_from_column_ref(
-        ColumnRef::Index(column_index),
-        &prepared,
-        dialect,
-        trim_selects,
-    )
-}
-
 fn lineage_normalized_expression(sql: &Expression) -> Expression {
     match sql {
         Expression::Prepare(prepare) => lineage_normalized_expression(&prepare.statement),
@@ -1011,6 +995,7 @@ struct LineageScopeContext {
 /// The caller selects the lexical owner and checks ambiguous/open sources first.
 /// This keeps CTE, derived-table, virtual-source and set-operation tracing shared
 /// with projection lineage, without manufacturing SELECT projections.
+#[cfg(feature = "generate")]
 pub(crate) struct ScopedLineage {
     context: LineageScopeContext,
     root: ScopeId,
@@ -1018,6 +1003,7 @@ pub(crate) struct ScopedLineage {
     dialect: Option<DialectType>,
 }
 
+#[cfg(feature = "generate")]
 impl ScopedLineage {
     pub(crate) fn new(scope: Scope, inherited_ctes: &[Scope], dialect: DialectType) -> Self {
         let visible_ctes = scope.cte_sources.clone();
@@ -1049,7 +1035,7 @@ impl ScopedLineage {
         let mut node = LineageNode::new(
             column,
             Expression::qualified_column(source, column),
-            self.context.scope(self.root).expression.clone(),
+            Expression::Null(crate::expressions::Null),
         );
         resolve_qualified_column(
             &mut node,
@@ -1256,7 +1242,11 @@ fn to_node_inner(
     let column_name = resolve_column_name(&column, &select_expr);
 
     // 3. Trim source if requested
-    let node_source = if trim_selects {
+    // Internal fact consumers need physical leaf sources, not a copy of the
+    // entire SELECT for every output. Public lineage retains its source ASTs.
+    let node_source = if context.conservative {
+        Expression::Null(crate::expressions::Null)
+    } else if trim_selects {
         trim_source(effective_expr, &select_expr)
     } else {
         effective_expr.clone()

@@ -4,6 +4,108 @@ use polyglot_sql::expressions::{
 };
 use polyglot_sql::{ComplexityGuardOptions, TranspileOptions};
 
+#[test]
+fn parse_and_validation_share_per_call_guard_options() {
+    use polyglot_sql::{
+        parse_one_with_options, parse_with_options, validate_with_options, ParseOptions,
+        ValidationOptions,
+    };
+    let sql = |depth| {
+        format!(
+            "SELECT {}value{} FROM records",
+            "COALESCE(".repeat(depth),
+            ", 0)".repeat(depth)
+        )
+    };
+    let dialect = DialectType::Snowflake;
+    for depth in [64, 65] {
+        let sql = sql(depth);
+        assert_eq!(
+            parse_with_options(&sql, dialect, &ParseOptions::default()).is_ok(),
+            depth == 64
+        );
+        assert_eq!(
+            validate_with_options(&sql, dialect, &ValidationOptions::default()).valid,
+            depth == 64
+        );
+        for limit in [Some(128), None] {
+            let guard = ComplexityGuardOptions {
+                max_function_call_depth: limit,
+                ..Default::default()
+            };
+            let options = ParseOptions {
+                complexity_guard: Some(guard),
+            };
+            assert_eq!(
+                parse_with_options(&sql, dialect, &options).unwrap().len(),
+                1
+            );
+            assert!(parse_one_with_options(&sql, dialect, &options).is_ok());
+            assert!(
+                validate_with_options(
+                    &sql,
+                    dialect,
+                    &ValidationOptions {
+                        complexity_guard: Some(guard),
+                        ..Default::default()
+                    }
+                )
+                .valid
+            );
+        }
+    }
+    assert!(
+        parse_with_options(&sql(65), DialectType::ClickHouse, &ParseOptions::default()).is_ok()
+    );
+    let limited = ParseOptions {
+        complexity_guard: Some(ComplexityGuardOptions {
+            max_function_call_depth: None,
+            max_input_bytes: Some(1),
+            ..Default::default()
+        }),
+    };
+    assert!(parse_one_with_options(&sql(65), dialect, &limited)
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_INPUT_TOO_LARGE"));
+    assert!(
+        parse_one_with_options("SELECT 1; SELECT 2", dialect, &ParseOptions::default()).is_err()
+    );
+    assert!(parse_one_with_options("SELECT 1", dialect, &ParseOptions::default()).is_ok());
+}
+
+#[test]
+fn guard_json_rejects_invalid_limits_and_preserves_null() {
+    for name in [
+        "maxParserDepth",
+        "maxInputBytes",
+        "maxTokens",
+        "maxAstNodes",
+        "maxAstDepth",
+        "maxParenthesisDepth",
+        "maxFunctionCallDepth",
+    ] {
+        for value in ["-1", "true", "1.0", "\"128\"", "18446744073709551616"] {
+            assert!(serde_json::from_str::<ComplexityGuardOptions>(&format!(
+                "{{\"{name}\":{value}}}"
+            ))
+            .is_err());
+        }
+        for value in ["0", "128", "null"] {
+            let options: ComplexityGuardOptions =
+                serde_json::from_str(&format!("{{\"{name}\":{value}}}")).unwrap();
+            assert_eq!(
+                serde_json::to_value(options).unwrap()[name],
+                serde_json::from_str::<serde_json::Value>(value).unwrap()
+            );
+        }
+    }
+    assert!(
+        serde_json::from_str::<ComplexityGuardOptions>(r#"{"max_function_call_depth":128}"#)
+            .is_err()
+    );
+}
+
 fn select_star_from(source: Expression) -> Expression {
     Expression::Select(Box::new(
         Select::new().column(Expression::star()).from(source),

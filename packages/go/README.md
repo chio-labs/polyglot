@@ -21,7 +21,7 @@ go get github.com/tobilg/polyglot/packages/go
 ```
 
 Go module releases use nested tags that match the root Polyglot release, for
-example `packages/go/v0.11.0`.
+example `packages/go/v0.12.0`.
 
 ## Native Library Setup
 
@@ -147,7 +147,7 @@ These methods are available on `*Client` and as package-level wrappers:
 | `GenerateDataType(dataType json.RawMessage, dialect string) (string, error)` | Generate SQL from a JSON `DataType` returned by `ParseDataType`. |
 | `Build(expression Expression) (json.RawMessage, error)` | Evaluate an immutable builder plan and return its JSON AST. |
 | `BuildSQL(expression Expression, dialect string) (string, error)` | Evaluate an immutable builder plan and render SQL for a dialect. |
-| `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic warnings; diagnostics are returned as data. |
+| `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic correctness/quality checks; diagnostics are returned as data. |
 | `ValidateWithSchema(sql string, schema ValidationSchema, dialect string, options ...SchemaValidationOptions) (ValidationResult, error)` | Validate references and optional types using the shared Rust engine. |
 | `Dialects() ([]string, error)` | Return supported dialect names. |
 | `DialectCount() (int, error)` | Return the number of supported dialects. |
@@ -180,9 +180,9 @@ parts they need:
 
 | API | Description |
 | --- | --- |
-| `Parse(sql, dialect string) (json.RawMessage, error)` | Parse one or more SQL statements into a JSON AST array. |
-| `ParseOne(sql, dialect string) (json.RawMessage, error)` | Parse one SQL statement into a single JSON AST node. |
-| `ParseDataType(sql, dialect string) (json.RawMessage, error)` | Parse exactly one standalone SQL data type into a JSON `DataType`. |
+| `Parse(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse one or more SQL statements into a JSON AST array. |
+| `ParseOne(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse one SQL statement into a single JSON AST node. |
+| `ParseDataType(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse exactly one standalone SQL data type into a JSON `DataType`. |
 | `Tokenize(sql, dialect string) (json.RawMessage, error)` | Tokenize SQL and return token JSON. |
 | `AnnotateTypes(sql, dialect string, schema *ValidationSchema) (json.RawMessage, error)` | Parse SQL and annotate expression types, optionally using schema metadata. |
 | `Diff(sql1, sql2, dialect string) (json.RawMessage, error)` | Return an AST diff between two SQL strings. |
@@ -436,22 +436,46 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 
 Parser nesting is limited to 1024 logical levels by default in the native Rust core
 (WASM uses a separate default of 32).
-Set `TranspileOptions.ComplexityGuard.MaxParserDepth` with `NewGuardLimit(n)` to override
+Set `ComplexityGuardOptions.MaxParserDepth` with `NewGuardLimit(n)` to override
 it, or `DisabledGuardLimit()` to disable that check. The zero-value `GuardLimit` omits
 the option; `NewGuardLimit(0)` rejects parsing descents. This is separate from AST depth.
 Raising/disabling limits can permit stack exhaustion and process termination; it does
 not increase available stack or provide a general time/memory budget. Only application
-owners should control overrides. Other guard fields keep their existing types and meanings.
+owners should control overrides.
+
+All seven complexity limits now use `GuardLimit`: the zero value omits the field,
+`NewGuardLimit(n)` supplies a bound, and `DisabledGuardLimit()` emits JSON `null`.
+**Migration:** fields previously using `*int` must now use `NewGuardLimit(uint64(n))`
+(after checking that `n` is nonnegative); replace nil/defaults with `GuardLimit{}`.
+This change does not affect `FormatOptions`.
+
+`Parse`, `ParseOne`, and `ParseDataType` accept an optional `ParseOptions` value.
+`ValidationOptions`, `SchemaValidationOptions`, and `AnalyzeQueryOptions` also
+accept `ComplexityGuard`, using the same Rust implementation as transpilation.
+Omitting the guard preserves dialect defaults; an explicit guard object uses
+shared defaults for omitted fields. Rebuild/update the native FFI library with
+this SDK: it loads the new `polyglot_parse*_with_options` symbols.
+
+```go
+guard := &polyglot.ComplexityGuardOptions{
+    MaxFunctionCallDepth: polyglot.NewGuardLimit(128),
+}
+ast, err := client.ParseOne(sql, "snowflake", polyglot.ParseOptions{ComplexityGuard: guard})
+result, err := client.Validate(sql, "snowflake", polyglot.ValidationOptions{ComplexityGuard: guard})
+```
+
+Lineage, optimization, and other SQL-consuming helpers retain their default limits.
 
 | Type | Fields |
 | --- | --- |
 | `TranspileOptions` | `Pretty`, `UnsupportedLevel`, `MaxUnsupported`, `ComplexityGuard` |
+| `ParseOptions` | `ComplexityGuard` |
 | `ComplexityGuardOptions` | `MaxParserDepth`, `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxASTDepth`, `MaxParenthesisDepth`, `MaxFunctionCallDepth` |
 | `UnsupportedLevel` | `UnsupportedIgnore`, `UnsupportedWarn`, `UnsupportedRaise`, `UnsupportedImmediate` |
 | `FormatOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxSetOpChain` |
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
-| `AnalyzeQueryOptions` | `Dialect`, `Schema` |
+| `AnalyzeQueryOptions` | `Dialect`, `Schema`, `ComplexityGuard` |
 | `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations`, `ColumnUses` |
 | `ColumnUseFact` | `Context`, `ScopePath`, `ExpressionPath`, `ExpressionSQL`, `Span`, `References` |
 | `ColumnUseReferenceFact` | Embedded `ColumnReferenceFact`, optional original-use `Span` |
@@ -465,7 +489,8 @@ owners should control overrides. Other guard fields keep their existing types an
 | `SetOperationBranchFact` | `Index`, `Role`, `Projections` |
 | `ValidationResult` | `Valid`, `Errors` |
 | `ValidationError` | `Message`, `Line`, `Column`, `Severity`, `Code`, `Start`, `End` |
-| `ValidationOptions` | `StrictSyntax`, `Semantic` |
+| `ValidationOptions` | `StrictSyntax`, `Semantic`, `ComplexityGuard` |
+| `SchemaValidationOptions` | `CheckTypes`, `CheckReferences`, `Strict`, `Semantic`, `StrictSyntax`, `ComplexityGuard` |
 | `ValidationSchema` | `Tables`, `Strict` |
 | `SchemaTable` | `Name`, `Schema`, `Columns`, `Aliases`, `PrimaryKey`, `UniqueKeys`, `ForeignKeys` |
 | `SchemaColumn` | `Name`, `Type`, `Nullable`, `PrimaryKey`, `Unique`, `References` |

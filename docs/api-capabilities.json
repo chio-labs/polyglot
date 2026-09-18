@@ -42,9 +42,9 @@
       "id": "parse",
       "description": "SQL statement parsing",
       "layers": {
-        "rust": { "status": "supported", "symbols": ["parse", "parse_one"] },
+        "rust": { "status": "supported", "symbols": ["parse", "parse_one", "parse_with_options", "parse_one_with_options"] },
         "python": { "status": "supported", "symbols": ["parse", "parse_one"] },
-        "ffi": { "status": "supported", "symbols": ["polyglot_parse", "polyglot_parse_one"] },
+        "ffi": { "status": "supported", "symbols": ["polyglot_parse", "polyglot_parse_one", "polyglot_parse_with_options", "polyglot_parse_one_with_options"] },
         "go": { "status": "supported", "symbols": ["Client.Parse", "Client.ParseOne"] },
         "wasm": { "status": "partial", "symbols": ["parse"], "notes": "The raw WASM API returns all parsed statements and has no parse_one export." },
         "typescript": { "status": "partial", "symbols": ["parse"], "notes": "The SDK returns all parsed statements and has no parseOne helper." }
@@ -54,9 +54,9 @@
       "id": "data_types",
       "description": "Standalone data type parsing and generation",
       "layers": {
-        "rust": { "status": "supported", "symbols": ["parse_data_type", "generate_data_type"] },
+        "rust": { "status": "supported", "symbols": ["parse_data_type", "parse_data_type_with_options", "generate_data_type"] },
         "python": { "status": "partial", "symbols": ["parse_data_type"], "notes": "Python has no dedicated generate_data_type helper." },
-        "ffi": { "status": "supported", "symbols": ["polyglot_parse_data_type", "polyglot_generate_data_type"] },
+        "ffi": { "status": "supported", "symbols": ["polyglot_parse_data_type", "polyglot_parse_data_type_with_options", "polyglot_generate_data_type"] },
         "go": { "status": "supported", "symbols": ["Client.ParseDataType", "Client.GenerateDataType"] },
         "wasm": { "status": "supported", "symbols": ["parse_data_type", "generate_data_type"] },
         "typescript": { "status": "supported", "symbols": ["parseDataType", "generateDataType"] }
@@ -88,7 +88,7 @@
     },
     {
       "id": "validate",
-      "description": "Syntax validation and query-quality semantic warnings",
+      "description": "Syntax validation, optional semantic correctness errors E230-E232, and quality warnings W001-W004",
       "layers": {
         "rust": { "status": "supported", "symbols": ["validate", "validate_with_options", "validate_with_dialect"] },
         "python": { "status": "supported", "symbols": ["validate"] },
@@ -102,8 +102,8 @@
       "id": "validate_schema",
       "description": "Schema-aware validation",
       "layers": {
-        "rust": { "status": "supported", "symbols": ["validation.validate_with_schema"] },
-        "python": { "status": "supported", "symbols": ["validate_with_schema"] },
+        "rust": { "status": "supported", "symbols": ["validation.validate_with_schema"], "notes": "Supports native FunctionCatalog and declarative FunctionCatalogSpec replacement catalogs." },
+        "python": { "status": "supported", "symbols": ["validate_with_schema"], "notes": "Accepts a keyword-only declarative function_catalog replacement catalog; public TypedDict models describe schema, analysis, and catalog dictionaries." },
         "ffi": { "status": "supported", "symbols": ["polyglot_validate_with_schema"] },
         "go": { "status": "supported", "symbols": ["Client.ValidateWithSchema"] },
         "wasm": { "status": "supported", "symbols": ["validate_with_schema"] },

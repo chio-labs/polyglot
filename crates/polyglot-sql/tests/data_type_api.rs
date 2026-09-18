@@ -350,3 +350,48 @@ fn parse_standalone_data_type_errors_on_an_empty_or_eof_first_stream() {
         "unexpected error: {error}"
     );
 }
+#[test]
+fn standalone_data_types_honor_parse_options() {
+    use polyglot_sql::{
+        parse_data_type_with_options, ComplexityGuardOptions, DialectType, ParseOptions,
+    };
+    for (guard, code) in [
+        (
+            ComplexityGuardOptions {
+                max_input_bytes: Some(2),
+                ..Default::default()
+            },
+            "E_GUARD_INPUT_TOO_LARGE",
+        ),
+        (
+            ComplexityGuardOptions {
+                max_ast_nodes: Some(0),
+                ..Default::default()
+            },
+            "E_GUARD_AST_BUDGET_EXCEEDED",
+        ),
+        (
+            ComplexityGuardOptions {
+                max_parser_depth: Some(0),
+                ..Default::default()
+            },
+            "E_GUARD_PARSER_DEPTH_EXCEEDED",
+        ),
+    ] {
+        let error = parse_data_type_with_options(
+            "DECIMAL(10, 2)",
+            DialectType::Snowflake,
+            &ParseOptions {
+                complexity_guard: Some(guard),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(code), "{error}");
+    }
+    assert!(parse_data_type_with_options(
+        "DECIMAL(10, 2)",
+        DialectType::Snowflake,
+        &ParseOptions::default()
+    )
+    .is_ok());
+}

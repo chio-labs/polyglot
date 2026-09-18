@@ -240,7 +240,13 @@ test-rust-feature-gates:
 	cargo check -p polyglot-sql --no-default-features --features dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features generate,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-clickhouse,dialect-postgresql
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-tsql
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-fabric
+	cargo check -p polyglot-sql --no-default-features --features dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features generate,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features ast-tools,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features semantic,generate
 	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features openlineage,dialect-clickhouse

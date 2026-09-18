@@ -4,6 +4,110 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.12.0] - 2026-09-18
+
+### Added
+
+- Per-call complexity guards for parsing, standalone data-type parsing,
+  validation, schema validation, and query analysis. Rust adds `ParseOptions`,
+  `parse_with_options`, `parse_one_with_options`, and
+  `parse_data_type_with_options`; Python exposes keyword-only `complexity_guard`
+  arguments, including on `parse_one(..., into=DataType)`. Analysis also accepts
+  `options.complexityGuard`, but rejects supplying both forms in one Python call.
+- FFI parsing entry points `polyglot_parse_with_options`,
+  `polyglot_parse_one_with_options`, and `polyglot_parse_data_type_with_options`,
+  preserving the existing no-options symbols. Go parsing methods accept optional
+  `ParseOptions`; parsing, validation, schema validation, and analysis expose the
+  shared guards. Analysis carries supplied limits through SQL rendering of facts.
+- Declarative function catalogs through Rust's `FunctionCatalogSpec` and Python's
+  `validate_with_schema(..., function_catalog=...)`, supporting overloads,
+  variadic arities, and global/per-function case policies. Explicit catalogs
+  replace the embedded name/arity catalog when `check_types=True`; native
+  typed-function checks remain active. Invalid specifications are rejected.
+- Public Python `TypedDict` contracts for analysis options/results, schema
+  metadata, and function catalogs, plus wide-query validation/analysis benchmarks
+  and regression coverage in existing Rust and SDK test files.
+
+### Changed
+
+- Opt-in semantic validation now reports correctness errors for invalid grouping
+  (`E230`), aggregate placement/nesting (`E231`), and window placement/nesting
+  (`E232`) in each query scope. These errors invalidate SQL even with
+  `strict=False`. Quality hints remain warnings, with `W002` reserved for
+  uncertain grouping; default syntax-only validation is unchanged.
+- All seven Go complexity limits now use `GuardLimit`, replacing the remaining
+  `*int` fields. Use `GuardLimit{}` for defaults, `NewGuardLimit(n)` for a bound,
+  and `DisabledGuardLimit()` to disable a check. This is a source-breaking change
+  for callers using pointer-valued limits. The updated Go SDK requires a matching
+  native FFI library with the new parsing symbols.
+- Rust callers constructing exhaustive `ValidationOptions`,
+  `SchemaValidationOptions`, or `AnalyzeQueryOptions` literals must include
+  `complexity_guard`; `..Default::default()` preserves existing behavior.
+  An absent guard preserves dialect defaults, while an explicit guard object
+  uses shared defaults for omitted limits. Raising or disabling limits does not
+  increase stack space or provide a general time/memory budget.
+- Parse/validation/analysis options, complexity guards, and schema metadata reject
+  unknown fields, including nested schema keys. Python guard values reject
+  booleans, floats, negative values, and out-of-range integers. Missing-column
+  analysis dependencies retain best-effort source information but report
+  `unknown` rather than `resolved` confidence.
+- Feature-gate verification now includes additional T-SQL, Fabric, Snowflake,
+  and semantic/generation combinations. SDK capability documentation and version
+  references are synchronized with the new APIs and release.
+
+### Fixed
+
+- Caller-supplied EOF tokens are normalized before parsing, so terminated and
+  unterminated token streams produce equivalent results. Tokens after EOF return
+  an error at the offending token. Empty and EOF-only streams no longer panic
+  in statement, standalone-type, or expression-fragment parsing. (#450)
+- Unicode function names no longer panic during `WITH ORDINALITY` suffix checks;
+  mixed-case suffixes remain supported, including directly constructed ASTs.
+  Date/time format conversion uses UTF-8-safe traversal across shared generation
+  and DuckDB, Snowflake, and Presto conversion paths, preserving Unicode literals
+  without treating Unicode case-folding expansions as format directives.
+  (#451, #452, #453)
+- Query analysis propagates nullability through chained CTEs and derived tables,
+  renamed and positional outputs, known stars, and set operations. It respects
+  quoted names, CTE shadowing, expression results, and outer-join null extension,
+  while keeping ambiguous, recursive, and otherwise indeterminate dependencies
+  conservative. (#455)
+- Python, FFI, and Go can override or disable individual parsing/analysis/
+  validation limits without changing global defaults. Invalid guard payloads are
+  rejected consistently, and validation reports guard exhaustion as diagnostics
+  rather than silently ignoring overrides. (#456)
+- Formatting preserves explicit `NULLS FIRST`/`NULLS LAST`, including nested,
+  window, and aggregate ordering. Snowflake and DuckDB generation retain explicit
+  clauses because their defaults are configurable; same-dialect operations no
+  longer inject assumed Snowflake defaults into omitted clauses. Cross-dialect
+  normalization remains separate. Incorrect reference-fixture expectations are
+  narrowly excluded for the approved source/target cases. (#457)
+- Schema validation resolves `ORDER BY` output aliases without falsely reporting
+  ambiguous joined inputs, while preserving errors in the original projection.
+  Lateral projection aliases, chained aliases, quoted outputs, and clause aliases
+  follow dialect-specific visibility and input-column precedence. (#458, #460)
+- Lambda parameters are bound lexically instead of treated as table columns,
+  including typed/quoted parameters, nested shadowing, and struct-field access.
+  Free captures still receive reference/type checks and source diagnostics.
+  Analysis excludes lambda locals from physical dependencies and preserves
+  array result types for higher-order array functions. (#459)
+- Type validation uses scoped annotations through CTEs, derived tables,
+  predicates, and DML instead of re-resolving columns against a flat schema.
+  DML targets and references are checked independently of `check_types`, with
+  pseudo-relations confined to their introducing clauses. Numeric predicate
+  acceptance follows the dialect, and UNION BY NAME type checks align outputs
+  by name, including nested operations, null padding, and known star expansion.
+- Grouping and aggregate/window validation respects query boundaries, grouping
+  aliases/ordinals/sets, declared PostgreSQL primary-key dependencies, and
+  lambda-local variables, avoiding false errors from nested queries or windows.
+- Schema validation parses input once, and analysis reuses lineage scope
+  contexts across projections instead of repeatedly preparing whole queries.
+  Internal fact extraction avoids unnecessary full-query AST copies while
+  preserving public lineage output.
+- Feature-specific imports and helpers are gated to their actual consumers,
+  eliminating Rust warnings in supported feature combinations without broad
+  warning suppression, including Fabric's internal T-SQL dependency.
+
 ## [0.11.0] - 2026-09-16
 
 ### Added

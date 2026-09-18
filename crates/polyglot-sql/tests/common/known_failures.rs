@@ -212,6 +212,24 @@ pub fn dialect_identity_known_failures(_dialect: &str) -> HashSet<String> {
 pub fn transpilation_known_failures(source: &str, target: &str) -> HashSet<String> {
     let mut failures = HashSet::new();
 
+    // Issue #457 (approved exclusions): SQLGlot removes explicit NULL ordering
+    // that matches Snowflake/DuckDB's factory defaults, but both are configurable.
+    // Verified against SQLGlot 30.14.0. Exclude only these source/target/index
+    // expectations, not other destinations or whole ORDER BY fixture groups.
+    // All but duckdb:13 use the shared fname/lname/age ORDER BY example;
+    // duckdb:13 is SELECT * FROM x ORDER BY 1 NULLS LAST.
+    let null_ordering_cases: &[usize] = match (source, target) {
+        ("generic", "duckdb") => &[99],
+        ("hive", "duckdb") => &[45],
+        ("spark", "duckdb" | "snowflake") => &[82],
+        ("snowflake", "duckdb" | "snowflake") => &[143],
+        ("duckdb", "duckdb") => &[13, 112],
+        _ => &[],
+    };
+    for index in null_ordering_cases {
+        failures.insert(format!("{source}->{target}:{index}"));
+    }
+
     if source == "generic" && target == "tsql" {
         // SQLGlot currently keeps the unsupported T-SQL aggregate FILTER syntax
         // for COUNT_IF(...). Polyglot rewrites remaining filters into CASE

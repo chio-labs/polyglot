@@ -18,6 +18,8 @@ pub mod ast_json;
 mod ast_mutation;
 #[cfg(any(feature = "ast-tools", feature = "generate", feature = "semantic"))]
 pub mod ast_transforms;
+#[cfg(feature = "semantic")]
+mod binding;
 #[cfg(feature = "builder")]
 pub mod builder;
 pub mod dialects;
@@ -25,7 +27,12 @@ pub mod dialects;
 pub mod diff;
 pub mod error;
 pub mod expressions;
-#[cfg(any(test, feature = "dialect-tsql"))]
+#[cfg(any(
+    test,
+    feature = "generate",
+    feature = "dialect-tsql",
+    feature = "dialect-fabric"
+))]
 mod format_tokens;
 #[cfg(feature = "semantic")]
 pub mod function_catalog;
@@ -52,6 +59,7 @@ pub mod resolver;
 pub mod schema;
 #[cfg(feature = "semantic")]
 pub mod scope;
+#[cfg(any(feature = "ast-tools", feature = "generate", feature = "semantic"))]
 mod set_operation;
 #[cfg(feature = "time")]
 pub mod time;
@@ -92,7 +100,7 @@ pub use function_catalog::{
 };
 #[cfg(feature = "generate")]
 pub use generator::{Generator, UnsupportedLevel};
-pub use guard::ComplexityGuardOptions;
+pub use guard::{ComplexityGuardOptions, ParseOptions};
 #[cfg(feature = "semantic")]
 pub use helper::{
     csv, find_new_name, is_date_unit, is_float, is_int, is_iso_date, is_iso_datetime, merge_ranges,
@@ -505,6 +513,15 @@ pub fn parse(sql: &str, dialect: DialectType) -> Result<Vec<Expression>> {
     d.parse(sql)
 }
 
+/// Parse SQL with per-call complexity limits.
+pub fn parse_with_options(
+    sql: &str,
+    dialect: DialectType,
+    options: &ParseOptions,
+) -> Result<Vec<Expression>> {
+    Dialect::get(dialect).parse_with_options(sql, options)
+}
+
 /// Parse a single SQL statement.
 ///
 /// # Arguments
@@ -514,7 +531,16 @@ pub fn parse(sql: &str, dialect: DialectType) -> Result<Vec<Expression>> {
 /// # Returns
 /// The parsed expression, or an error if multiple statements found
 pub fn parse_one(sql: &str, dialect: DialectType) -> Result<Expression> {
-    let mut expressions = parse(sql, dialect)?;
+    parse_one_with_options(sql, dialect, &ParseOptions::default())
+}
+
+/// Parse exactly one SQL statement with per-call complexity limits.
+pub fn parse_one_with_options(
+    sql: &str,
+    dialect: DialectType,
+    options: &ParseOptions,
+) -> Result<Expression> {
+    let mut expressions = parse_with_options(sql, dialect, options)?;
 
     if expressions.len() != 1 {
         return Err(Error::parse(
@@ -539,6 +565,15 @@ pub fn parse_one(sql: &str, dialect: DialectType) -> Result<Expression> {
 /// The parsed data type
 pub fn parse_data_type(sql: &str, dialect: DialectType) -> Result<DataType> {
     Dialect::get(dialect).parse_data_type(sql)
+}
+
+/// Parse a standalone SQL data type with per-call complexity limits.
+pub fn parse_data_type_with_options(
+    sql: &str,
+    dialect: DialectType,
+    options: &ParseOptions,
+) -> Result<DataType> {
+    Dialect::get(dialect).parse_data_type_with_options(sql, options)
 }
 
 /// Generate SQL from a standalone data type.
@@ -603,18 +638,21 @@ pub fn validate(sql: &str, dialect: DialectType) -> ValidationResult {
 /// Options for syntax validation behavior.
 #[cfg(feature = "semantic")]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValidationOptions {
+    /// Optional per-call parser limits; absence preserves dialect defaults.
+    #[serde(default)]
+    pub complexity_guard: Option<ComplexityGuardOptions>,
     /// When enabled, validation rejects non-canonical trailing commas that the parser
     /// would otherwise accept for compatibility (e.g. `SELECT a, FROM t`).
     #[serde(default)]
     pub strict_syntax: bool,
-    /// When enabled, validation reports query-quality warnings W001 through W004.
+    /// Enable semantic correctness errors and query-quality warnings.
     #[serde(default)]
     pub semantic: bool,
 }
 
-/// Validate SQL syntax and optional query-quality semantic warnings.
+/// Validate SQL syntax and optional semantic correctness/quality checks.
 #[cfg(feature = "semantic")]
 pub fn validate_with_options(
     sql: &str,
@@ -635,7 +673,33 @@ pub fn validate_with_dialect(
     dialect: &Dialect,
     options: &ValidationOptions,
 ) -> ValidationResult {
-    match dialect.parse(sql) {
+    match parse_for_validation(sql, dialect, options) {
+        Ok(expressions) => ValidationResult::with_errors(if options.semantic {
+            expressions
+                .iter()
+                .flat_map(|expression| {
+                    validation::check_semantics(expression, dialect.dialect_type(), None)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }),
+        Err(result) => result,
+    }
+}
+
+#[cfg(feature = "semantic")]
+pub(crate) fn parse_for_validation(
+    sql: &str,
+    dialect: &Dialect,
+    options: &ValidationOptions,
+) -> std::result::Result<Vec<Expression>, ValidationResult> {
+    match dialect.parse_with_options(
+        sql,
+        &ParseOptions {
+            complexity_guard: options.complexity_guard,
+        },
+    ) {
         Ok(expressions) => {
             // Reject bare expressions that aren't valid SQL statements.
             // The parser accepts any expression at the top level, but bare identifiers,
@@ -643,23 +707,17 @@ pub fn validate_with_dialect(
             for expr in &expressions {
                 if !expr.is_statement() {
                     let msg = format!("Invalid expression / Unexpected token");
-                    return ValidationResult::with_errors(vec![ValidationError::error(
+                    return Err(ValidationResult::with_errors(vec![ValidationError::error(
                         msg, "E004",
-                    )]);
+                    )]));
                 }
             }
             if options.strict_syntax {
                 if let Some(error) = strict_syntax_error(sql, dialect) {
-                    return ValidationResult::with_errors(vec![error]);
+                    return Err(ValidationResult::with_errors(vec![error]));
                 }
             }
-            let mut errors = Vec::new();
-            if options.semantic {
-                for expression in &expressions {
-                    errors.extend(validation::check_semantics(expression));
-                }
-            }
-            ValidationResult::with_errors(errors)
+            Ok(expressions)
         }
         Err(e) => {
             let error = match &e {
@@ -692,7 +750,7 @@ pub fn validate_with_dialect(
                     .with_span(Some(*start), Some(*end)),
                 _ => ValidationError::error(e.to_string(), "E000"),
             };
-            ValidationResult::with_errors(vec![error])
+            Err(ValidationResult::with_errors(vec![error]))
         }
     }
 }
@@ -845,8 +903,8 @@ mod api_contract_tests {
         let actual = exported_symbols! {
             "dialects" => { "Dialect.get" => Dialect::get },
             "transpile" => { "transpile" => transpile },
-            "parse" => { "parse" => parse, "parse_one" => parse_one },
-            "data_types" => { "parse_data_type" => parse_data_type, "generate_data_type" => generate_data_type },
+            "parse" => { "parse" => parse, "parse_one" => parse_one, "parse_with_options" => parse_with_options, "parse_one_with_options" => parse_one_with_options },
+            "data_types" => { "parse_data_type" => parse_data_type, "parse_data_type_with_options" => parse_data_type_with_options, "generate_data_type" => generate_data_type },
             "generate" => { "generate" => generate },
             "format" => { "format" => format, "format_with_options" => format_with_options },
             "validate" => {
@@ -991,9 +1049,9 @@ mod validation_tests {
             &options,
         );
 
-        assert!(result.valid, "Warnings must not invalidate SQL");
+        assert!(!result.valid, "Semantic correctness errors invalidate SQL");
         assert!(result.errors.iter().any(|error| error.code == "W001"));
-        assert!(result.errors.iter().any(|error| error.code == "W002"));
+        assert!(result.errors.iter().any(|error| error.code == "E230"));
         assert!(result.errors.iter().any(|error| error.code == "W004"));
 
         let median_result = validate_with_options(
@@ -1002,11 +1060,14 @@ mod validation_tests {
             &options,
         );
 
-        assert!(median_result.valid, "Warnings must not invalidate SQL");
+        assert!(
+            !median_result.valid,
+            "Semantic correctness errors invalidate SQL"
+        );
         assert!(median_result
             .errors
             .iter()
-            .any(|error| error.code == "W002"));
+            .any(|error| error.code == "E230"));
     }
 
     #[test]
@@ -1014,6 +1075,7 @@ mod validation_tests {
         let options = ValidationOptions {
             strict_syntax: true,
             semantic: true,
+            ..Default::default()
         };
         let dialect = Dialect::get_by_name("generic").expect("generic dialect");
         let result = validate_with_dialect("SELECT *, FROM products", &dialect, &options);
@@ -1033,6 +1095,57 @@ mod format_tests {
         let result = format("SELECT a,b FROM t", DialectType::Generic).expect("format failed");
         assert_eq!(result.len(), 1);
         assert!(result[0].contains('\n'));
+    }
+
+    #[test]
+    fn format_preserves_explicit_null_ordering() {
+        // Formatting must not drop clauses merely because they match a dialect
+        // default, or add clauses when the input relies on the server settings.
+        for name in [
+            "generic",
+            "snowflake",
+            "duckdb",
+            "postgres",
+            "dremio",
+            "bigquery",
+        ] {
+            let Some(dialect) = Dialect::get_by_name(name) else {
+                continue; // Dialect may be disabled in feature-gate test builds.
+            };
+            for ordering in [
+                "x",
+                "x DESC",
+                "x ASC",
+                "x NULLS FIRST",
+                "x NULLS LAST",
+                "x ASC NULLS FIRST",
+                "x ASC NULLS LAST",
+                "x DESC NULLS FIRST",
+                "x DESC NULLS LAST",
+            ] {
+                for sql in [
+                    std::format!("SELECT x FROM t ORDER BY {ordering}"),
+                    std::format!("SELECT ROW_NUMBER() OVER (ORDER BY {ordering}) FROM t"),
+                    std::format!("SELECT ARRAY_AGG(x) WITHIN GROUP (ORDER BY {ordering}) FROM t"),
+                ] {
+                    let formatted =
+                        format_with_dialect(&sql, &dialect, &Default::default()).unwrap();
+                    assert_eq!(
+                        formatted[0]
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        sql,
+                        "{name}: {sql}"
+                    );
+                    assert_eq!(
+                        format_with_dialect(&formatted[0], &dialect, &Default::default()).unwrap(),
+                        formatted,
+                        "formatting must be idempotent: {name}: {sql}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

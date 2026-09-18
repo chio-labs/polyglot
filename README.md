@@ -306,7 +306,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.11.0", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.12.0", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.

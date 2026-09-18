@@ -461,9 +461,12 @@ const result = validate('SELECT * FROM users', 'postgresql', { semantic: true })
 // May also report warnings like "SELECT * is discouraged"
 ```
 
-Basic syntax, strict-syntax checks, and semantic warnings W001-W004 are
-computed by the Rust core in one WASM call. Semantic warnings do not make the
-result invalid.
+Syntax, strict-syntax checks, and semantic checks are computed by the Rust core
+in one WASM call. With `semantic: true`, invalid grouping (`E230`), aggregate
+placement/nesting (`E231`), and window placement/nesting (`E232`) make the result
+invalid, even with schema validation's `strict: false`. Quality hints W001-W004
+remain warnings; W002 is reserved for uncertain grouping cases. Unknown schema
+and option fields are rejected, including nested schema metadata.
 
 ### Schema Validation
 

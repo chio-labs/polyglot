@@ -155,11 +155,31 @@ typedef struct {
 ### Parser Depth Guard
 
 Native parsing defaults to 1024 logical levels in the shared Rust core; WASM uses
-a separate default of 32. `polyglot_transpile_with_options` accepts
+a separate default of 32. The following APIs accept a `complexityGuard` entry in
+their options JSON:
+
+- `polyglot_parse_with_options(sql, dialect, options_json)`
+- `polyglot_parse_one_with_options(sql, dialect, options_json)`
+- `polyglot_parse_data_type_with_options(sql, dialect, options_json)`
+- `polyglot_validate_with_options`, `polyglot_validate_with_schema`
+- `polyglot_analyze_query`, `polyglot_transpile_with_options`
+
+The existing no-options parsing symbols retain their signatures and defaults.
+The new parsing functions require non-NULL UTF-8, NUL-terminated arguments; pass
+`{}` for default options and free results with `polyglot_free_result`.
+For example, use `{"complexityGuard":{"maxFunctionCallDepth":128}}` for deeper
+function calls, or
 `{"complexityGuard":{"maxParserDepth":128}}` to override this limit. Omit the
 field for the target's default, use `null` to disable only this check, or use `0`
 to reject parsing descents. Exhaustion returns a nonzero status and an error
 containing `E_GUARD_PARSER_DEPTH_EXCEEDED`.
+
+All seven shared limits are available: `maxParserDepth`, `maxInputBytes`,
+`maxTokens`, `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, and
+`maxFunctionCallDepth`. An absent or null guard retains dialect defaults; an
+object uses shared defaults for omitted fields. Unknown guard keys and invalid
+limit values return `STATUS_SERIALIZATION_ERROR` (6). Parsing guard failures
+return status 1; validation guard failures remain validation diagnostics (4).
 
 Other complexity guards remain independent. Raising or disabling limits does not
 increase stack space and can permit stack exhaustion and process termination.

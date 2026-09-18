@@ -9,23 +9,23 @@ use crate::resolver::Resolver;
 use crate::scope::{scope_query, selected_reference_scope};
 
 pub(super) fn collect(
-    original: &Expression,
+    original: &Scope,
     prepared: &Scope,
     schema: Option<&MappingSchema>,
     dialect: DialectType,
+    uncertain: &HashMap<(usize, usize), ReferenceConfidence>,
+    guard: Option<ComplexityGuardOptions>,
 ) -> Vec<ColumnUseFact> {
     let empty = MappingSchema::with_dialect(dialect);
-    let original = build_scope(original);
     let schema = schema.unwrap_or(&empty);
-    let mut uncertain = HashSet::new();
-    collect_uncertain_occurrences(&original, schema, &mut uncertain);
     let mut collector = Collector {
         schema,
         dialect,
         facts: Vec::new(),
         uncertain,
+        guard,
     };
-    collector.scope(&original, prepared, "root", &[], &[], false);
+    collector.scope(original, prepared, "root", &[], &[], false);
     collector.facts
 }
 
@@ -41,7 +41,8 @@ struct Collector<'a> {
     schema: &'a MappingSchema,
     dialect: DialectType,
     facts: Vec<ColumnUseFact>,
-    uncertain: HashSet<(usize, usize)>,
+    uncertain: &'a HashMap<(usize, usize), ReferenceConfidence>,
+    guard: Option<ComplexityGuardOptions>,
 }
 
 impl Collector<'_> {
@@ -225,7 +226,7 @@ impl Collector<'_> {
 
     fn sql(&self, expression: &Expression) -> String {
         Dialect::get(self.dialect)
-            .generate(expression)
+            .generate_with_guard(expression, self.guard)
             .unwrap_or_default()
     }
 
@@ -477,15 +478,9 @@ impl Collector<'_> {
         // Qualification may infer an owner from partial schema information.
         // Preserve uncertainty from the original scope, including through CTEs,
         // instead of upgrading an inferred upstream reference to resolved.
-        let uncertain = node.walk().any(|node| {
-            crate::scope::walk_in_scope(&node.expression, false).any(|expression| {
-                expression_span(expression)
-                    .is_some_and(|span| self.uncertain.contains(&(span.start, span.end)))
-            })
-        });
-        if uncertain {
+        if let Some(confidence) = lineage_uncertainty(node, self.uncertain) {
             for usage in &mut references {
-                usage.reference.confidence = ReferenceConfidence::Unknown;
+                usage.reference.confidence = confidence;
             }
         }
         references
@@ -689,10 +684,10 @@ fn merged_join_column(expression: &Expression, column: &str) -> bool {
     }))
 }
 
-fn collect_uncertain_occurrences(
+pub(super) fn collect_uncertain_occurrences(
     scope: &Scope,
     schema: &MappingSchema,
-    uncertain: &mut HashSet<(usize, usize)>,
+    uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
 ) {
     let selected = selected_reference_scope(scope);
     let mut resolver = Resolver::new(&selected, schema, false);
@@ -717,7 +712,14 @@ fn collect_uncertain_occurrences(
                 || (matches.len() == 1 && open.iter().any(|source| source != &matches[0]));
             if ambiguous || incomplete {
                 if let Some(span) = expression_span(expression) {
-                    uncertain.insert((span.start, span.end));
+                    uncertain.insert(
+                        (span.start, span.end),
+                        if ambiguous {
+                            ReferenceConfidence::Ambiguous
+                        } else {
+                            ReferenceConfidence::Unknown
+                        },
+                    );
                 }
             }
         }

@@ -1568,7 +1568,7 @@ describe('Polyglot SDK', () => {
           expect.objectContaining({
             column: 'order_id',
             table: 't',
-            confidence: 'resolved',
+            confidence: 'unknown',
           }),
         ]),
       );
@@ -1737,6 +1737,28 @@ describe('Polyglot SDK', () => {
   });
 
   describe('format', () => {
+    it.each([
+      Dialect.Snowflake,
+      Dialect.DuckDB,
+      Dialect.PostgreSQL,
+    ])('preserves explicit and omitted null ordering for %s', (dialect) => {
+      for (const ordering of [
+        'category NULLS LAST, created_at DESC NULLS FIRST',
+        'category, created_at DESC',
+      ]) {
+        const sql = `SELECT id FROM items ORDER BY ${ordering}`;
+        for (const result of [
+          format(sql, dialect),
+          formatWithOptions(sql, dialect, {}),
+        ]) {
+          expect(result.success).toBe(true);
+          expect(result.sql).toHaveLength(1);
+          expect(result.sql?.[0].replace(/\s+/g, ' ').trim()).toBe(sql);
+          expect(format(result.sql![0], dialect).sql).toEqual(result.sql);
+        }
+      }
+    });
+
     it('should format SQL', () => {
       const result = format('SELECT a,b,c FROM t', Dialect.Generic);
       expect(result.success).toBe(true);

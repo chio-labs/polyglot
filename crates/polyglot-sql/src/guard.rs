@@ -18,6 +18,14 @@ const DEFAULT_MAX_PARSER_DEPTH: usize = 32;
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_MAX_PARSER_DEPTH: usize = 1_024;
 
+/// Per-call parsing options. An absent guard preserves dialect-specific defaults.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ParseOptions {
+    #[serde(default)]
+    pub complexity_guard: Option<ComplexityGuardOptions>,
+}
+
 fn default_max_parser_depth() -> Option<usize> {
     Some(DEFAULT_MAX_PARSER_DEPTH)
 }
@@ -56,7 +64,7 @@ fn default_max_function_call_depth() -> Option<usize> {
 /// These limits turn excessively deep or large inputs into regular errors
 /// instead of relying on process stack exhaustion as the failure mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComplexityGuardOptions {
     /// Maximum logical nesting during parsing, before an AST exists.
     /// Defaults to 32 on WASM and 1024 on native targets.

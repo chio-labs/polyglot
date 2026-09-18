@@ -24,6 +24,9 @@ type Library struct {
 	Parse                    func(string, string) Result
 	ParseOne                 func(string, string) Result
 	ParseDataType            func(string, string) Result
+	ParseWithOptions         func(string, string, string) Result
+	ParseOneWithOptions      func(string, string, string) Result
+	ParseDataTypeWithOptions func(string, string, string) Result
 	Tokenize                 func(string, string) Result
 	AnnotateTypes            func(string, string, string) Result
 	Diff                     func(string, string, string) Result
@@ -97,6 +100,9 @@ func (l *Library) registerAll() error {
 		{"polyglot_parse", &l.Parse},
 		{"polyglot_parse_one", &l.ParseOne},
 		{"polyglot_parse_data_type", &l.ParseDataType},
+		{"polyglot_parse_with_options", &l.ParseWithOptions},
+		{"polyglot_parse_one_with_options", &l.ParseOneWithOptions},
+		{"polyglot_parse_data_type_with_options", &l.ParseDataTypeWithOptions},
 		{"polyglot_tokenize", &l.Tokenize},
 		{"polyglot_annotate_types", &l.AnnotateTypes},
 		{"polyglot_diff", &l.Diff},

@@ -496,8 +496,14 @@ impl<'a> TypeAnnotator<'a> {
             // Column references - look up type from schema if available
             Expression::Column(col) => {
                 if let Some(schema) = &self._schema {
-                    let table_name = col.table.as_ref().map(|t| t.name.as_str()).unwrap_or("");
-                    schema.get_column_type(table_name, &col.name.name).ok()
+                    let table_name = col
+                        .table
+                        .as_ref()
+                        .map(crate::binding::identifier_name)
+                        .unwrap_or_default();
+                    schema
+                        .get_column_type(&table_name, &crate::binding::identifier_name(&col.name))
+                        .ok()
                 } else {
                     None
                 }
@@ -533,6 +539,18 @@ impl<'a> TypeAnnotator<'a> {
             // parse as ArrayFunc, while some normalized expressions use Array.
             Expression::Array(arr) => self.annotate_array(&arr.expressions),
             Expression::ArrayFunc(arr) => self.annotate_array(&arr.expressions),
+            Expression::ArrayTransform(array) => {
+                let element = match &array.transform {
+                    Expression::Lambda(lambda) => self.annotate(&lambda.body),
+                    _ => None,
+                }
+                .unwrap_or(DataType::Unknown);
+                Some(DataType::Array {
+                    element_type: Box::new(element),
+                    dimension: None,
+                })
+            }
+            Expression::ArrayFilter(array) => self.annotate(&array.this),
 
             // Interval expressions
             Expression::Interval(_) => Some(DataType::Interval {
@@ -767,6 +785,21 @@ impl<'a> TypeAnnotator<'a> {
     /// read-only `annotate` method, and finally stores the result via
     /// `set_inferred_type`.
     pub fn annotate_in_place(&mut self, expr: &mut Expression) {
+        if matches!(
+            expr,
+            Expression::Select(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_)
+        ) {
+            annotate_scoped_expression_with_outer(
+                expr,
+                self.query_schema,
+                self._dialect,
+                self._schema,
+            );
+            return;
+        }
         // 1. Recurse into children (bottom-up)
         self.annotate_children_in_place(expr);
 
@@ -1163,8 +1196,10 @@ impl<'a> TypeAnnotator<'a> {
                 }
             }
 
-            // Everything else - no children to recurse or not value-producing
-            _ => {}
+            // Keep less common clause/function nodes on the canonical visitor.
+            _ => {
+                crate::ast_children::for_each_child_mut(expr, |child| self.annotate_in_place(child))
+            }
         }
     }
 
@@ -1346,6 +1381,27 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate a function call
     fn annotate_function(&mut self, func: &Function) -> Option<DataType> {
+        if func.name.eq_ignore_ascii_case("TRANSFORM")
+            || func.name.eq_ignore_ascii_case("ARRAY_TRANSFORM")
+        {
+            return Some(DataType::Array {
+                element_type: Box::new(
+                    func.args
+                        .get(1)
+                        .and_then(|arg| match arg {
+                            Expression::Lambda(lambda) => self.annotate(&lambda.body),
+                            _ => None,
+                        })
+                        .unwrap_or(DataType::Unknown),
+                ),
+                dimension: None,
+            });
+        }
+        if func.name.eq_ignore_ascii_case("FILTER")
+            || func.name.eq_ignore_ascii_case("ARRAY_FILTER")
+        {
+            return func.args.first().and_then(|arg| self.annotate(arg));
+        }
         let func_name = func.name.to_uppercase();
 
         if self._dialect == Some(DialectType::DuckDB) && !func.quoted {
@@ -1998,20 +2054,33 @@ impl Schema for ScopedSchema<'_> {
     }
 
     fn column_names(&self, table: &str) -> SchemaResult<Vec<String>> {
-        let table = self.normalized(table, true);
-        if let Some(columns) = self.tables.get(&table) {
-            return Ok(columns.keys().cloned().collect());
+        let normalized_table = self.normalized(table, true);
+        if let Some(columns) = self.tables.get(&normalized_table) {
+            return Ok(columns
+                .keys()
+                .map(|name| {
+                    if self.normalized(name, false) == *name {
+                        name.clone()
+                    } else {
+                        crate::binding::identifier_name(&crate::expressions::Identifier::quoted(
+                            name,
+                        ))
+                    }
+                })
+                .collect());
         }
         self.parent
-            .ok_or_else(|| SchemaError::TableNotFound(table.clone()))?
-            .column_names(&table)
+            .ok_or_else(|| SchemaError::TableNotFound(table.to_string()))?
+            .column_names(table)
     }
 
     fn get_column_type(&self, table: &str, column: &str) -> SchemaResult<DataType> {
         if table.is_empty() {
             let local_tables = self.local_tables_for_column(column);
             return match local_tables.as_slice() {
-                [local_table] => self.get_column_type(local_table, column),
+                [local_table] => {
+                    Ok(self.tables[local_table][&self.normalized(column, false)].clone())
+                }
                 [] if self.lookup_parent_columns => self
                     .parent
                     .ok_or_else(|| SchemaError::ColumnNotFound {
@@ -2092,12 +2161,12 @@ type OutputColumns = Vec<(String, DataType)>;
 fn table_name(table: &crate::expressions::TableRef) -> String {
     let mut parts = Vec::new();
     if let Some(catalog) = &table.catalog {
-        parts.push(catalog.name.as_str());
+        parts.push(crate::binding::identifier_name(catalog));
     }
     if let Some(schema) = &table.schema {
-        parts.push(schema.name.as_str());
+        parts.push(crate::binding::identifier_name(schema));
     }
-    parts.push(table.name.name.as_str());
+    parts.push(crate::binding::identifier_name(&table.name));
     parts.join(".")
 }
 
@@ -2120,16 +2189,16 @@ fn apply_column_aliases(
     aliases: &[crate::expressions::Identifier],
 ) -> OutputColumns {
     for ((name, _), alias) in columns.iter_mut().zip(aliases) {
-        *name = alias.name.clone();
+        *name = crate::binding::identifier_name(alias);
     }
     columns
 }
 
 fn projection_name(expression: &Expression) -> Option<String> {
     match expression {
-        Expression::Alias(alias) => Some(alias.alias.name.clone()),
-        Expression::Column(column) => Some(column.name.name.clone()),
-        Expression::Identifier(identifier) => Some(identifier.name.clone()),
+        Expression::Alias(alias) => Some(crate::binding::identifier_name(&alias.alias)),
+        Expression::Column(column) => Some(crate::binding::identifier_name(&column.name)),
+        Expression::Identifier(identifier) => Some(crate::binding::identifier_name(identifier)),
         _ => None,
     }
 }
@@ -2248,12 +2317,12 @@ fn annotate_relation_source(
             let source_table = table_name(table);
             let mut columns = table_columns(schema, &source_table);
             columns = apply_column_aliases(columns, &table.column_aliases);
-            let visible_name = table
-                .alias
-                .as_ref()
-                .map(|alias| alias.name.as_str())
-                .unwrap_or(table.name.name.as_str());
-            let _ = schema.add_table(visible_name, &columns, dialect);
+            let visible_name = table.alias.as_ref().unwrap_or(&table.name);
+            let _ = schema.add_table(
+                &crate::binding::identifier_name(visible_name),
+                &columns,
+                dialect,
+            );
         }
         Expression::Subquery(subquery) => {
             let mut columns = annotate_derived_query(subquery, schema, dialect);
@@ -2262,7 +2331,8 @@ fn annotate_relation_source(
                 subquery.inferred_type = Some(first_type.clone());
             }
             if let Some(alias) = &subquery.alias {
-                let _ = schema.add_table(&alias.name, &columns, dialect);
+                let _ =
+                    schema.add_table(&crate::binding::identifier_name(alias), &columns, dialect);
             }
         }
         Expression::Alias(alias) => {
@@ -2270,7 +2340,11 @@ fn annotate_relation_source(
                 Expression::Subquery(subquery) => {
                     let columns = annotate_derived_query(subquery, schema, dialect);
                     let columns = apply_column_aliases(columns, &alias.column_aliases);
-                    let _ = schema.add_table(&alias.alias.name, &columns, dialect);
+                    let _ = schema.add_table(
+                        &crate::binding::identifier_name(&alias.alias),
+                        &columns,
+                        dialect,
+                    );
                     return;
                 }
                 _ => {
@@ -2281,7 +2355,11 @@ fn annotate_relation_source(
             let columns =
                 virtual_output_columns(&alias.this, &alias.alias.name, &alias.column_aliases);
             if !columns.is_empty() {
-                let _ = schema.add_table(&alias.alias.name, &columns, dialect);
+                let _ = schema.add_table(
+                    &crate::binding::identifier_name(&alias.alias),
+                    &columns,
+                    dialect,
+                );
             }
         }
         Expression::Unnest(_) => {
@@ -2333,7 +2411,11 @@ fn annotate_with(
             let columns =
                 annotate_scoped_expression_with_outer(&mut cte.this, Some(schema), dialect, outer);
             let columns = apply_column_aliases(columns, &cte.columns);
-            let _ = schema.add_table(&cte.alias.name, &columns, dialect);
+            let _ = schema.add_table(
+                &crate::binding::identifier_name(&cte.alias),
+                &columns,
+                dialect,
+            );
         }
     }
 }
@@ -2363,6 +2445,37 @@ fn annotate_select(
     annotator.query_schema = Some(&ctes);
     for expression in &mut select.expressions {
         annotator.annotate_in_place(expression);
+    }
+    // Clause expressions use selected inputs, not the whole catalogue.
+    if let Some(expression) = &mut select.prewhere {
+        annotator.annotate_in_place(expression);
+    }
+    if let Some(clause) = &mut select.qualify {
+        annotator.annotate_in_place(&mut clause.this);
+    }
+    if let Some(clause) = &mut select.where_clause {
+        annotator.annotate_in_place(&mut clause.this);
+    }
+    if let Some(clause) = &mut select.having {
+        annotator.annotate_in_place(&mut clause.this);
+    }
+    if let Some(group) = &mut select.group_by {
+        for expression in &mut group.expressions {
+            annotator.annotate_in_place(expression);
+        }
+    }
+    if let Some(order) = &mut select.order_by {
+        for expression in &mut order.expressions {
+            annotator.annotate_in_place(&mut expression.this);
+        }
+    }
+    for join in &mut select.joins {
+        if let Some(on) = &mut join.on {
+            annotator.annotate_in_place(on);
+        }
+        if let Some(condition) = &mut join.match_condition {
+            annotator.annotate_in_place(condition);
+        }
     }
     query_outputs(&select.expressions)
 }
@@ -2439,6 +2552,27 @@ fn annotate_scoped_expression_with_outer(
             columns
         }
         _ => {
+            if let Some(mut selected) = crate::binding::dml_scope(expression) {
+                let mut ctes = ScopedSchema::new(parent, dialect);
+                annotate_with(&mut selected.with, &mut ctes, dialect, outer);
+                let mut inputs = ScopedSchema::new(Some(&ctes), dialect);
+                inputs.outer = outer;
+                if let Some(from) = &mut selected.from {
+                    for source in &mut from.expressions {
+                        annotate_relation_source(source, &mut inputs, dialect);
+                    }
+                }
+                for join in &mut selected.joins {
+                    annotate_relation_source(&mut join.this, &mut inputs, dialect);
+                }
+                inputs.lookup_parent_columns = false;
+                let mut annotator = TypeAnnotator::new(Some(&inputs), dialect);
+                annotator.query_schema = Some(&ctes);
+                crate::ast_children::for_each_child_mut(expression, |child| {
+                    annotator.annotate_in_place(child)
+                });
+                return Vec::new();
+            }
             let mut annotator = TypeAnnotator::new(parent, dialect);
             annotator.annotate_in_place(expression);
             Vec::new()

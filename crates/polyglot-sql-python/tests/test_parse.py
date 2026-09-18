@@ -5,6 +5,50 @@ import pytest
 import polyglot_sql
 
 
+@pytest.mark.parametrize("parse", [polyglot_sql.parse, polyglot_sql.parse_one])
+def test_parse_function_depth_guard_options(parse):
+    for depth in (64, 65):
+        sql = "SELECT " + "COALESCE(" * depth + "value" + ", 0)" * depth + " FROM records"
+        for options in (None, {}):
+            if depth == 65:
+                with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED"):
+                    parse(sql, dialect="snowflake", complexity_guard=options)
+            else:
+                assert parse(sql, dialect="snowflake", complexity_guard=options)
+        for limit in (128, None):
+            assert parse(sql, dialect="snowflake", complexity_guard={"maxFunctionCallDepth": limit})
+    assert parse(sql, dialect="clickhouse")
+    with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_INPUT_TOO_LARGE"):
+        parse(sql, complexity_guard={"maxFunctionCallDepth": None, "maxInputBytes": 1})
+    assert parse("SELECT 1")
+
+
+@pytest.mark.parametrize("name", ["parse", "parse_one", "parse_data_type", "validate", "validate_with_schema", "analyze_query", "transpile"])
+def test_complexity_options_reject_invalid_values_consistently(name):
+    function = getattr(polyglot_sql, name)
+    args = ("SELECT 1", {"tables": []}) if name == "validate_with_schema" else ("INT" if name == "parse_data_type" else "SELECT 1",)
+    for value in (-1, True, False, 1.0, 1.5, float("nan"), float("inf"), "128", 2**100):
+        with pytest.raises((TypeError, ValueError)):
+            function(*args, complexity_guard={"maxFunctionCallDepth": value})
+    with pytest.raises(ValueError, match="unknown field"):
+        function(*args, complexity_guard={"max_function_call_depth": 128})
+
+
+@pytest.mark.parametrize("into", [False, True])
+def test_data_type_parse_guard_options(into):
+    parse = polyglot_sql.parse_one if into else polyglot_sql.parse_data_type
+    kwargs = {"into": polyglot_sql.DataType} if into else {}
+    for options, code in [
+        ({"maxInputBytes": 1}, "E_GUARD_INPUT_TOO_LARGE"),
+        ({"maxTokens": 0}, "E_GUARD_TOKEN_BUDGET_EXCEEDED"),
+        ({"maxAstNodes": 0}, "E_GUARD_AST_BUDGET_EXCEEDED"),
+        ({"maxParserDepth": 0}, "E_GUARD_PARSER_DEPTH_EXCEEDED"),
+    ]:
+        with pytest.raises(polyglot_sql.ParseError, match=code):
+            parse("DECIMAL(10, 2)", complexity_guard=options, **kwargs)
+    assert parse("DECIMAL(10, 2)", complexity_guard={"maxParserDepth": None}, **kwargs)
+
+
 @pytest.mark.parametrize(
     "dialect", ["snowflake", "duckdb", "postgres", "mysql", "tsql", "bigquery"]
 )

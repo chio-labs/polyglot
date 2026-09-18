@@ -11,7 +11,8 @@ use std::os::raw::c_char;
 /// All arguments must be non-NULL, UTF-8, NUL-terminated strings. Pass "{}" for
 /// default options. SchemaValidationOptions accepts snake_case option names
 /// (check_types, check_references, strict, semantic, strict_syntax), with
-/// camelCase aliases for the compound names. Unknown options are rejected.
+/// camelCase aliases for the compound names, including complexityGuard.
+/// Unknown options are rejected.
 /// Free the returned payload with polyglot_free_validation_result.
 #[no_mangle]
 pub extern "C" fn polyglot_validate_with_schema(
@@ -84,10 +85,10 @@ pub extern "C" fn polyglot_validate(
     }
 }
 
-/// Validate SQL syntax and optional semantic warnings for a dialect.
+/// Validate SQL syntax and optional semantic correctness/quality checks for a dialect.
 ///
 /// `options_json` must be a JSON object compatible with `ValidationOptions`, e.g.
-/// `{"strictSyntax": true, "semantic": true}`.
+/// `{"strictSyntax": true, "semantic": true, "complexityGuard": {"maxFunctionCallDepth": 128}}`.
 #[no_mangle]
 pub extern "C" fn polyglot_validate_with_options(
     sql: *const c_char,

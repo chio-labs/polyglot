@@ -3,6 +3,77 @@ import pytest
 import polyglot_sql
 
 
+def test_review_lambda_analysis_and_confidence():
+    schema = {"tables": [{"name": "items", "columns": [{"name": "quantity", "type": "INT"}]}]}
+    result = polyglot_sql.analyze_query(
+        "SELECT TRANSFORM(ARRAY_CONSTRUCT(quantity), x -> x+1) FROM items",
+        {"schema": schema, "dialect": "snowflake"},
+    )
+    projection = result["projections"][0]
+    assert projection["typeHint"].startswith("ARRAY")
+    assert [r["column"].lower() for r in projection["upstream"]] == ["quantity"]
+    result = polyglot_sql.analyze_query("SELECT missing FROM items WHERE missing>0", {"schema": schema})
+    assert result["projections"][0]["upstream"][0]["confidence"] == "unknown"
+    assert result["columnUses"][0]["references"][0]["confidence"] == "unknown"
+    with pytest.raises(ValueError):
+        polyglot_sql.analyze_query("SELECT 1", {"scheam": schema})
+
+
+def test_analyze_query_complexity_guard_options():
+    expr = "COALESCE(" * 65 + "value" + ", 0)" * 65
+    sql = f"WITH c AS (SELECT {expr} AS value FROM records) SELECT value FROM c WHERE {expr} > 0"
+    with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED"):
+        polyglot_sql.analyze_query(sql, dialect="snowflake")
+    for limit in (128, None):
+        guard = {"maxFunctionCallDepth": limit}
+        for kwargs in ({"complexity_guard": guard}, {"options": {"complexityGuard": guard}}):
+            result = polyglot_sql.analyze_query(sql, dialect="snowflake", **kwargs)
+            assert len(result["projections"]) == 1
+            assert "COALESCE" in result["cteFacts"][0]["bodySql"]
+            assert result["columnUses"][0]["expressionSql"]
+    for value in (True, 1.0, float("nan"), -1):
+        with pytest.raises((TypeError, ValueError)):
+            polyglot_sql.analyze_query("SELECT 1", {"complexityGuard": {"maxFunctionCallDepth": value}})
+    with pytest.raises(ValueError, match="not both"):
+        polyglot_sql.analyze_query("SELECT 1", {"complexityGuard": {}}, complexity_guard={})
+    with pytest.raises(polyglot_sql.ParseError, match="E_GUARD_INPUT_TOO_LARGE"):
+        polyglot_sql.analyze_query(sql, complexity_guard={"maxFunctionCallDepth": None, "maxInputBytes": 1})
+    assert polyglot_sql.analyze_query("SELECT 1")["projections"]
+
+
+@pytest.mark.parametrize("nullable, expected", [(False, "non_null"), (True, "nullable"), (None, "unknown")])
+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "postgresql", "bigquery"])
+def test_analyze_query_preserves_schema_nullability_through_ctes(nullable, expected, dialect):
+    schema = {
+        "tables": [{
+            "name": "orders",
+            "columns": [{"name": "amount", "type": "INTEGER", "nullable": nullable}],
+        }]
+    }
+    for sql in (
+        "SELECT amount FROM orders",
+        "WITH typed AS (SELECT amount FROM orders) SELECT amount FROM typed",
+        "WITH a(value) AS (SELECT amount FROM orders), b AS (SELECT value FROM a) SELECT value FROM b",
+        "SELECT value FROM (SELECT amount FROM orders) AS typed(value)",
+    ):
+        projection = polyglot_sql.analyze_query(sql, {"dialect": dialect, "schema": schema})["projections"][0]
+        assert projection["nullability"] == expected, sql
+
+
+@pytest.mark.parametrize("sql, expected", [
+    ("WITH orders AS (SELECT NULL AS amount) SELECT amount FROM orders", "nullable"),
+    ("WITH typed AS (SELECT COALESCE(amount, 0) AS amount FROM orders) SELECT amount FROM typed", "non_null"),
+    ("WITH typed AS (SELECT o.amount FROM (SELECT 1) AS d LEFT JOIN orders AS o ON TRUE) SELECT amount FROM typed", "nullable"),
+    ("WITH typed AS (SELECT amount FROM orders UNION ALL SELECT NULL AS amount) SELECT amount FROM typed", "nullable"),
+    ('WITH d AS (SELECT 1 AS x) SELECT "D".x FROM d', "non_null"),
+    ('SELECT a.x FROM (SELECT NULL AS x) AS "a" CROSS JOIN (SELECT 1 AS x) AS "A"', "non_null"),
+])
+def test_analyze_query_cte_nullability_respects_expression_and_scope(sql, expected):
+    schema = {"tables": [{"name": "orders", "columns": [{"name": "amount", "type": "INTEGER", "nullable": False}]}]}
+    analysis = polyglot_sql.analyze_query(sql, {"dialect": "snowflake", "schema": schema})
+    assert analysis["projections"][0]["nullability"] == expected
+
+
 @pytest.mark.parametrize("with_schema", [False, True])
 def test_analyze_query_preserves_cast_type_through_cte_passthroughs(with_schema):
     sql = """
@@ -118,7 +189,7 @@ def test_analyze_query_tolerates_partial_schema():
     assert any(
         reference["column"] == "order_id"
         and reference["table"] == "t"
-        and reference["confidence"] == "resolved"
+        and reference["confidence"] == "unknown"
         for reference in result["projections"][0]["upstream"]
     )
     assert any(

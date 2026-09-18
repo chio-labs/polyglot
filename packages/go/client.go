@@ -253,30 +253,45 @@ func (c *Client) DialectCount() (int, error) {
 	return int(lib.DialectCount()), nil
 }
 
-func (c *Client) Parse(sql, dialect string) (json.RawMessage, error) {
-	if err := rejectNUL(sql, dialect); err != nil {
-		return nil, err
-	}
-	return c.callRaw("parse", func(lib *ffi.Library) ffi.Result {
-		return lib.Parse(sql, defaultDialect(dialect))
-	})
+func (c *Client) Parse(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse", sql, dialect, options)
 }
 
-func (c *Client) ParseOne(sql, dialect string) (json.RawMessage, error) {
-	if err := rejectNUL(sql, dialect); err != nil {
-		return nil, err
-	}
-	return c.callRaw("parse_one", func(lib *ffi.Library) ffi.Result {
-		return lib.ParseOne(sql, defaultDialect(dialect))
-	})
+func (c *Client) ParseOne(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse_one", sql, dialect, options)
 }
 
-func (c *Client) ParseDataType(sql, dialect string) (json.RawMessage, error) {
+func (c *Client) ParseDataType(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse_data_type", sql, dialect, options)
+}
+
+func (c *Client) callParse(operation, sql, dialect string, options []ParseOptions) (json.RawMessage, error) {
 	if err := rejectNUL(sql, dialect); err != nil {
 		return nil, err
 	}
-	return c.callRaw("parse_data_type", func(lib *ffi.Library) ffi.Result {
-		return lib.ParseDataType(sql, defaultDialect(dialect))
+	if len(options) > 1 {
+		return nil, fmt.Errorf("polyglot: expected at most one parse options value")
+	}
+	var optionsJSON string
+	if len(options) == 1 {
+		var err error
+		optionsJSON, err = marshalOptions(options[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c.callRaw(operation, func(lib *ffi.Library) ffi.Result {
+		plain, configured := lib.Parse, lib.ParseWithOptions
+		switch operation {
+		case "parse_one":
+			plain, configured = lib.ParseOne, lib.ParseOneWithOptions
+		case "parse_data_type":
+			plain, configured = lib.ParseDataType, lib.ParseDataTypeWithOptions
+		}
+		if optionsJSON != "" {
+			return configured(sql, defaultDialect(dialect), optionsJSON)
+		}
+		return plain(sql, defaultDialect(dialect))
 	})
 }
 

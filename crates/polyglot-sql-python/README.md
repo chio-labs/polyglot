@@ -85,7 +85,9 @@ polyglot_sql.generate(ast)
 
 ### Complexity Guard Options
 
-`transpile` also accepts `complexity_guard`, a `ComplexityGuardOptions` typed dictionary
+`parse`, `parse_one` (including `into=DataType`), `parse_data_type`, `validate`,
+`validate_with_schema`, `analyze_query`, and `transpile` accept the keyword-only
+`complexity_guard`, a `ComplexityGuardOptions` typed dictionary
 using the shared camelCase keys: `maxParserDepth`, `maxInputBytes`, `maxTokens`,
 `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, and `maxFunctionCallDepth`.
 Omit the argument, pass `None`, or omit a key to use its default. A field-level `None`
@@ -93,7 +95,17 @@ disables that check; a nonnegative integer overrides it. For example:
 
 ```python
 polyglot_sql.transpile(sql, complexity_guard={"maxParserDepth": 128})
+polyglot_sql.validate(sql, dialect="snowflake", complexity_guard={"maxFunctionCallDepth": 128})
+polyglot_sql.parse_one(sql, dialect="snowflake", complexity_guard={"maxFunctionCallDepth": None})
 ```
+
+`analyze_query` also accepts `options={"complexityGuard": {...}}`; do not supply
+both forms in one call. Limits must be nonnegative integers or `None`; booleans,
+floats, out-of-range integers, and unknown guard keys are rejected.
+Omitting the entire guard preserves dialect-specific defaults (including
+ClickHouse's higher function-nesting limit). A supplied dictionary uses the
+shared Rust defaults for omitted fields. Validation reports guard exhaustion
+as diagnostics; parsing and analysis raise `ParseError`.
 
 Parser depth defaults to 1024 logical levels on native targets (32 on WASM) and is
 checked during parsing, before an AST exists. Zero rejects parsing descents.
@@ -101,7 +113,8 @@ Other checks remain independent.
 Raising or disabling limits can permit stack exhaustion and process termination,
 even for trusted generated SQL. Increasing a limit does not increase stack space;
 these limits are not general time/memory budgets. Application owners should control
-overrides. Parsing APIs without guard options inherit the default protection.
+overrides. Other SQL-consuming helpers, including lineage and optimization,
+continue to inherit default protection.
 
 ### Format Guard Behavior
 
@@ -338,9 +351,47 @@ Unknown dialect names raise built-in `ValueError`.
 - `bool(result)` works (`True` when valid)
 
 `strict_syntax=True` rejects compatibility forms such as trailing commas before
-clause boundaries. `semantic=True` adds warning diagnostics W001-W004 for
-`SELECT *`, mixed aggregate projections, `DISTINCT` with `ORDER BY`, and
-`LIMIT` without `ORDER BY`; warnings do not make the result invalid.
+clause boundaries. `semantic=True` checks every query scope and reports errors
+for invalid grouping (`E230`), aggregate placement/nesting (`E231`), and window
+placement/nesting (`E232`). These errors make the result invalid, including with
+`strict=False`. Quality hints remain warnings: `SELECT *` (`W001`), uncertain
+grouping (`W002`), `DISTINCT` with `ORDER BY` (`W003`), and unordered `LIMIT`
+(`W004`). Default validation remains syntax-only.
+
+Schema validation always checks DML targets and references, independently of
+`check_types`. Type checks use lexical query scopes and name-aligned set-operation
+outputs. An empty column list or `*` denotes an open schema; validation is not a
+database execution check and cannot prove runtime/session-dependent behavior.
+
+Analysis options and schemas reject unknown keys, including nested metadata.
+Public `TypedDict` models such as `AnalyzeQueryOptions`, `ValidationSchema`,
+`QueryAnalysis`, and `FunctionCatalogSpec` describe their dictionary payloads.
+Analysis retains best-effort references for missing columns but marks them
+`unknown`, not `resolved`. Lambda-local parameters are not physical dependencies.
+
+Python also accepts a declarative function catalog (Rust offers
+`FunctionCatalogSpec::build` and the existing `FunctionCatalog` trait):
+
+```python
+catalog: polyglot_sql.FunctionCatalogSpec = {
+    "functions": [{
+        "name": "my_udf",
+        "signatures": [{"minArity": 1, "maxArity": 2}],
+    }],
+}
+result = polyglot_sql.validate_with_schema(
+    "SELECT my_udf(1)", {"tables": []}, check_types=True,
+    function_catalog=catalog,
+)
+```
+
+The catalog **replaces** the embedded function name/arity catalog; it does not
+activate `check_types` automatically. Overloads are supported; omitted/null
+`maxArity` means variadic. `nameCase` is `insensitive` by default, or `sensitive`,
+and can be overridden per function. Native typed-function checks remain active.
+Blank names, empty signature lists, negative/noninteger arities, reversed bounds,
+conflicting case overrides, and unknown fields are rejected. Other SDKs do not
+expose this catalog option.
 
 Each `ValidationErrorInfo` has:
 

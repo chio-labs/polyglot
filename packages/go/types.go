@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.11.0"
+const sdkVersion = "0.12.0"
 
 func Version() string {
 	return sdkVersion
@@ -16,13 +16,13 @@ type TranspileOptions struct {
 }
 
 type ComplexityGuardOptions struct {
-	MaxParserDepth       GuardLimit `json:"-"`
-	MaxInputBytes        *int       `json:"maxInputBytes,omitempty"`
-	MaxTokens            *int       `json:"maxTokens,omitempty"`
-	MaxASTNodes          *int       `json:"maxAstNodes,omitempty"`
-	MaxASTDepth          *int       `json:"maxAstDepth,omitempty"`
-	MaxParenthesisDepth  *int       `json:"maxParenthesisDepth,omitempty"`
-	MaxFunctionCallDepth *int       `json:"maxFunctionCallDepth,omitempty"`
+	MaxParserDepth       GuardLimit `json:"maxParserDepth"`
+	MaxInputBytes        GuardLimit `json:"maxInputBytes"`
+	MaxTokens            GuardLimit `json:"maxTokens"`
+	MaxASTNodes          GuardLimit `json:"maxAstNodes"`
+	MaxASTDepth          GuardLimit `json:"maxAstDepth"`
+	MaxParenthesisDepth  GuardLimit `json:"maxParenthesisDepth"`
+	MaxFunctionCallDepth GuardLimit `json:"maxFunctionCallDepth"`
 }
 
 // GuardLimit distinguishes an omitted limit from a number (including zero) and
@@ -51,33 +51,30 @@ func (limit *GuardLimit) UnmarshalJSON(data []byte) error {
 
 // Custom omission is needed on Go 1.22: omitempty does not omit a value struct.
 func (options ComplexityGuardOptions) MarshalJSON() ([]byte, error) {
-	type fields ComplexityGuardOptions
-	var depth *GuardLimit
-	if options.MaxParserDepth.set {
-		depth = &options.MaxParserDepth
+	limits := map[string]GuardLimit{
+		"maxParserDepth":       options.MaxParserDepth,
+		"maxInputBytes":        options.MaxInputBytes,
+		"maxTokens":            options.MaxTokens,
+		"maxAstNodes":          options.MaxASTNodes,
+		"maxAstDepth":          options.MaxASTDepth,
+		"maxParenthesisDepth":  options.MaxParenthesisDepth,
+		"maxFunctionCallDepth": options.MaxFunctionCallDepth,
 	}
-	return json.Marshal(struct {
-		fields
-		MaxParserDepth *GuardLimit `json:"maxParserDepth,omitempty"`
-	}{fields: fields(options), MaxParserDepth: depth})
+	for name, limit := range limits {
+		if !limit.set {
+			delete(limits, name)
+		}
+	}
+	return json.Marshal(limits)
 }
 
 func (options *ComplexityGuardOptions) UnmarshalJSON(data []byte) error {
 	type fields ComplexityGuardOptions
-	var decoded struct {
-		fields
-		MaxParserDepth json.RawMessage `json:"maxParserDepth"`
-	}
+	var decoded fields
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	result := ComplexityGuardOptions(decoded.fields)
-	if decoded.MaxParserDepth != nil {
-		if err := json.Unmarshal(decoded.MaxParserDepth, &result.MaxParserDepth); err != nil {
-			return err
-		}
-	}
-	*options = result
+	*options = ComplexityGuardOptions(decoded)
 	return nil
 }
 
@@ -101,9 +98,15 @@ type OptimizeOptions struct{}
 
 type GenerateOptions struct{}
 
+// ParseOptions configures parsing without changing dialect-specific defaults.
+type ParseOptions struct {
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+}
+
 type AnalyzeQueryOptions struct {
-	Dialect string            `json:"dialect,omitempty"`
-	Schema  *ValidationSchema `json:"schema,omitempty"`
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	Dialect         string                  `json:"dialect,omitempty"`
+	Schema          *ValidationSchema       `json:"schema,omitempty"`
 }
 
 type ValidationResult struct {
@@ -112,19 +115,21 @@ type ValidationResult struct {
 }
 
 type ValidationOptions struct {
-	StrictSyntax bool `json:"strictSyntax,omitempty"`
-	Semantic     bool `json:"semantic,omitempty"`
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	StrictSyntax    bool                    `json:"strictSyntax,omitempty"`
+	Semantic        bool                    `json:"semantic,omitempty"`
 }
 
 // SchemaValidationOptions controls the shared Rust schema validator. Unknown
 // identifiers are checked by default. Strict overrides ValidationSchema.Strict;
 // nil inherits the schema setting (which defaults to true).
 type SchemaValidationOptions struct {
-	CheckTypes      bool  `json:"check_types,omitempty"`
-	CheckReferences bool  `json:"check_references,omitempty"`
-	Strict          *bool `json:"strict,omitempty"`
-	Semantic        bool  `json:"semantic,omitempty"`
-	StrictSyntax    bool  `json:"strict_syntax,omitempty"`
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	CheckTypes      bool                    `json:"check_types,omitempty"`
+	CheckReferences bool                    `json:"check_references,omitempty"`
+	Strict          *bool                   `json:"strict,omitempty"`
+	Semantic        bool                    `json:"semantic,omitempty"`
+	StrictSyntax    bool                    `json:"strict_syntax,omitempty"`
 }
 
 type ValidationError struct {

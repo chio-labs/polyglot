@@ -40,7 +40,10 @@ pub use openlineage::{
     polyglot_openlineage_run_event,
 };
 pub use optimize::polyglot_optimize;
-pub use parse::{polyglot_parse, polyglot_parse_data_type, polyglot_parse_one};
+pub use parse::{
+    polyglot_parse, polyglot_parse_data_type, polyglot_parse_data_type_with_options,
+    polyglot_parse_one, polyglot_parse_one_with_options, polyglot_parse_with_options,
+};
 pub use query_analysis::polyglot_analyze_query;
 pub use tokenize::polyglot_tokenize;
 pub use transpile::{polyglot_transpile, polyglot_transpile_with_options};

@@ -76,14 +76,9 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
     let query = scope_query(&scope.expression);
     let aliases: HashSet<_> = walk_in_scope(query, false)
         .filter_map(|node| match node {
-            Expression::Table(table) => Some(
-                table
-                    .alias
-                    .as_ref()
-                    .unwrap_or(&table.name)
-                    .name
-                    .to_lowercase(),
-            ),
+            Expression::Table(table) => {
+                Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
+            }
             _ => None,
         })
         .collect();
@@ -93,7 +88,9 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
         .sources
         .iter()
         .filter(|(name, source)| {
-            source.kind != SourceKind::Cte || aliases.contains(&name.to_lowercase())
+            // Source keys use the spelling of the actual FROM/JOIN binding.
+            // Folding here can accidentally retain an unused, quoted CTE.
+            source.kind != SourceKind::Cte || aliases.contains(*name)
         })
         .map(|(name, source)| (name.clone(), source.clone()))
         .collect();

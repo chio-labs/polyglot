@@ -5,6 +5,87 @@ use polyglot_sql::{
 use serde_json::json;
 
 #[test]
+fn analysis_review_lambda_dependencies_and_result_type() {
+    let options: AnalyzeQueryOptions = serde_json::from_value(json!({"dialect":"snowflake", "schema":{"tables":[{"name":"items","columns":[{"name":"quantity","type":"INT"}]}]}})).unwrap();
+    for sql in [
+        "SELECT TRANSFORM(ARRAY_CONSTRUCT(quantity), x -> x + 1) AS xs FROM items",
+        "SELECT TRANSFORM(ARRAY_CONSTRUCT(quantity), x INT -> x + quantity) AS xs FROM items",
+        "SELECT TRANSFORM(ARRAY_CONSTRUCT(quantity), x -> TRANSFORM(ARRAY_CONSTRUCT(quantity), x -> x + quantity)) AS xs FROM items",
+    ] {
+        let result = analyze_query(sql, options.clone()).unwrap();
+        let projection = &result.projections[0];
+        assert!(projection.type_hint.as_deref().is_some_and(|t| t.starts_with("ARRAY")), "{sql}: {:?}", projection.type_hint);
+        assert_eq!(projection.upstream.len(), 1, "{sql}: {:?}", projection.upstream);
+        assert!(projection.upstream[0].column.eq_ignore_ascii_case("quantity"));
+    }
+    let result = analyze_query("SELECT quantity FROM items WHERE ARRAY_SIZE(FILTER(ARRAY_CONSTRUCT(quantity), x -> x > 0)) > 0", options).unwrap();
+    assert!(result
+        .column_uses
+        .iter()
+        .flat_map(|fact| &fact.references)
+        .all(|r| r.reference.column.eq_ignore_ascii_case("quantity")));
+}
+
+#[test]
+fn analysis_review_projection_and_clause_confidence() {
+    let options: AnalyzeQueryOptions = serde_json::from_value(json!({"schema":{"tables":[{"name":"items","columns":[{"name":"quantity","type":"INT"}]}]}})).unwrap();
+    for sql in [
+        "SELECT missing FROM items WHERE missing > 0",
+        "SELECT quantity FROM items JOIN unknown_source ON TRUE WHERE quantity > 0",
+    ] {
+        let result = analyze_query(sql, options.clone()).unwrap();
+        assert!(
+            result.projections[0]
+                .upstream
+                .iter()
+                .all(|r| r.confidence != ReferenceConfidence::Resolved),
+            "{sql}: {:?}",
+            result.projections[0].upstream
+        );
+        let filter = result
+            .column_uses
+            .iter()
+            .find(|f| f.context == polyglot_sql::ColumnUseContext::Filter)
+            .unwrap();
+        assert!(filter
+            .references
+            .iter()
+            .all(|r| r.reference.confidence != ReferenceConfidence::Resolved));
+    }
+}
+
+#[test]
+fn analysis_honors_complexity_guards_in_parsing_and_fact_rendering() {
+    let expression = format!("{}value{}", "COALESCE(".repeat(65), ", 0)".repeat(65));
+    let sql = format!("WITH c AS (SELECT {expression} AS value FROM records) SELECT value FROM c WHERE {expression} > 0");
+    assert!(analyze_query(&sql, AnalyzeQueryOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED"));
+    for limit in [Some(128), None] {
+        let options: AnalyzeQueryOptions = serde_json::from_value(json!({
+            "dialect": "snowflake", "complexityGuard": {"maxFunctionCallDepth": limit}
+        }))
+        .unwrap();
+        let result = analyze_query(&sql, options).unwrap();
+        assert!(result.cte_facts[0].body_sql.contains("COALESCE"));
+        assert!(!result.column_uses[0].expression_sql.is_empty());
+        assert_eq!(result.projections.len(), 1);
+    }
+    // Rendering a permitted deep AST must not revert to the default depth of 512.
+    let expression = format!("value{}", " + 1".repeat(520));
+    let sql = format!("WITH c AS (SELECT {expression} AS value FROM records) SELECT value FROM c WHERE {expression} > 0");
+    let options: AnalyzeQueryOptions =
+        serde_json::from_value(json!({"complexityGuard": {"maxAstDepth": 1024}})).unwrap();
+    let result = analyze_query(&sql, options).unwrap();
+    assert_eq!(result.cte_facts[0].body_sql.matches(" + ").count(), 520);
+    assert!(result
+        .column_uses
+        .iter()
+        .any(|fact| fact.expression_sql.matches(" + ").count() == 520));
+}
+
+#[test]
 fn analyze_query_preserves_cast_types_through_cte_chains() {
     let schema: ValidationSchema = serde_json::from_value(json!({
         "tables": [{"name": "raw_orders", "columns": [{"name": "amount", "type": "VARCHAR"}]}]
@@ -27,6 +108,7 @@ fn analyze_query_preserves_cast_types_through_cte_chains() {
         ] {
             for with_schema in [false, true] {
                 let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None,
                     dialect,
                     schema: with_schema.then(|| schema.clone()),
                 }).unwrap();
@@ -61,6 +143,7 @@ fn analyze_query_keeps_scalar_subquery_types_in_their_own_scope() {
         ("WITH unused AS (SELECT 1 AS n) SELECT (SELECT n) AS v FROM t1", "UNKNOWN"),
     ] {
         let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None,
             dialect: DialectType::DuckDB, schema: Some(schema.clone()),
         }).unwrap();
         assert_eq!(analysis.projections[0].type_hint.as_deref(), Some(expected), "{sql}");
@@ -114,6 +197,7 @@ fn column_use_analysis(sql: &str, with_schema: bool) -> polyglot_sql::QueryAnaly
     analyze_query(
         sql,
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: with_schema.then(schema),
         },
@@ -503,6 +587,7 @@ fn analyze_query_column_uses_reuse_struct_field_resolution() {
     let analysis = analyze_query(
         "SELECT 1 FROM events WHERE payload.active = TRUE",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(schema),
         },
@@ -540,7 +625,8 @@ fn analyze_query_column_uses_cover_supported_qualify_dialects_and_filter_operato
         DialectType::BigQuery,
         DialectType::Snowflake,
     ] {
-        let analysis = analyze_query("SELECT o.id, ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.id) AS rn FROM orders o QUALIFY rn = 1", AnalyzeQueryOptions { dialect, schema: Some(schema()) }).unwrap();
+        let analysis = analyze_query("SELECT o.id, ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.id) AS rn FROM orders o QUALIFY rn = 1", AnalyzeQueryOptions {
+complexity_guard: None, dialect, schema: Some(schema()) }).unwrap();
         let fact = analysis
             .column_uses
             .iter()
@@ -655,6 +741,7 @@ fn analyze_query_reports_projection_relations_and_types() {
         "SELECT u.id, CAST(o.total AS TEXT) AS total_text, 1 AS one \
          FROM users AS u JOIN orders AS o ON u.id = o.user_id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -730,6 +817,7 @@ fn analyze_query_duckdb_extract_date_part_types() {
         let analysis = analyze_query(
             &sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(schema.clone()),
             },
@@ -779,6 +867,7 @@ fn analyze_query_duckdb_trim_types_and_lineage() {
             let analysis = analyze_query(
                 &sql,
                 AnalyzeQueryOptions {
+                    complexity_guard: None,
                     dialect: DialectType::DuckDB,
                     schema,
                 },
@@ -836,6 +925,7 @@ fn analyze_query_duckdb_regexp_extract_all_types() {
             let analysis = analyze_query(
                 &sql,
                 AnalyzeQueryOptions {
+                    complexity_guard: None,
                     dialect: DialectType::DuckDB,
                     schema,
                 },
@@ -876,6 +966,7 @@ fn analyze_query_duckdb_date_name_types() {
                 let analysis = analyze_query(
                     &sql,
                     AnalyzeQueryOptions {
+                        complexity_guard: None,
                         dialect: DialectType::DuckDB,
                         schema,
                     },
@@ -924,6 +1015,7 @@ fn analyze_query_duckdb_array_to_string_types() {
             let analysis = analyze_query(
                 &sql,
                 AnalyzeQueryOptions {
+                    complexity_guard: None,
                     dialect: DialectType::DuckDB,
                     schema,
                 },
@@ -952,6 +1044,7 @@ fn analyze_query_reports_function_projection_arguments() {
     let analysis = analyze_query(
         "SELECT DATE_TRUNC('month', created_at) AS bucket FROM events",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(
                 serde_json::from_value(json!({
@@ -993,6 +1086,7 @@ fn analyze_query_follows_cte_lineage() {
     let analysis = analyze_query(
         "WITH base AS (SELECT id FROM users) SELECT id FROM base",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1014,6 +1108,7 @@ fn analyze_query_reports_top_level_cte_facts() {
          nested AS (WITH inner_cte AS (SELECT id FROM users) SELECT id FROM inner_cte) \
          SELECT order_id FROM base",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1037,6 +1132,7 @@ fn analyze_query_reports_original_cte_body_sql_before_schema_rewrites() {
     let analysis = analyze_query(
         "WITH base AS (SELECT amount FROM orders) SELECT amount FROM base",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1052,6 +1148,7 @@ fn analyze_query_reports_set_operations() {
     let analysis = analyze_query(
         "SELECT a FROM x UNION ALL SELECT b FROM y",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1099,6 +1196,7 @@ fn analyze_query_reports_set_operations() {
         let analysis = analyze_query(
             &format!("SELECT a FROM x {operator} SELECT b FROM y"),
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::Generic,
                 schema: Some(schema()),
             },
@@ -1125,6 +1223,7 @@ fn analyze_query_reports_name_aligned_set_operation_outputs() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect,
                 schema: None,
             },
@@ -1187,6 +1286,7 @@ fn analyze_query_reports_bigquery_name_alignment_modes() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::BigQuery,
                 schema: None,
             },
@@ -1210,6 +1310,7 @@ fn analyze_query_rejects_non_query_statements() {
     let err = analyze_query(
         "CREATE TABLE t (a INT)",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: None,
         },
@@ -1224,6 +1325,7 @@ fn analyze_query_preserves_physical_table_aliases_in_lineage() {
     let analysis = analyze_query(
         "SELECT o.id FROM orders AS o",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1245,6 +1347,7 @@ fn analyze_query_limits_qualified_star_to_matching_source() {
     let analysis = analyze_query(
         "SELECT o.* FROM orders AS o JOIN customers AS c ON o.customer_id = c.id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1288,6 +1391,7 @@ fn analyze_query_resolves_unique_unqualified_columns_with_alias_schema() {
     let analysis = analyze_query(
         "SELECT amount FROM orders AS o JOIN customers AS c ON o.customer_id = c.id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1321,6 +1425,7 @@ fn analyze_query_resolves_natural_join_merged_column_with_schema() {
         "SELECT shared_key AS output_key FROM source_table \
          NATURAL JOIN (SELECT shared_key FROM source_table) derived",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(natural_join_schema),
         },
@@ -1365,6 +1470,7 @@ fn analyze_query_propagates_schema_type_through_anonymous_derived_table() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(derived_table_schema.clone()),
             },
@@ -1392,6 +1498,7 @@ fn analyze_query_preserves_precise_schema_type_hints() {
     let analysis = analyze_query(
         "SELECT amount FROM orders",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1409,6 +1516,7 @@ fn analyze_query_expands_unqualified_star_with_schema() {
     let analysis = analyze_query(
         "SELECT * FROM orders",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1445,6 +1553,7 @@ fn analyze_query_classifies_typed_aggregates() {
     let analysis = analyze_query(
         "SELECT COUNT(*) AS rows, SUM(amount) AS amount_sum FROM orders",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1467,6 +1576,7 @@ fn analyze_query_classifies_typed_aggregates() {
     let duckdb_analysis = analyze_query(
         "SELECT COUNT_IF(numeric_value > 0), MEDIAN(numeric_value), FIRST(numeric_value), ARG_MAX_NULL(label, numeric_value), ARG_MIN_NULL(label, numeric_value) FROM source_table",
         AnalyzeQueryOptions {
+complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -1493,6 +1603,7 @@ fn analyze_query_infers_duckdb_median_type_issue_425() {
     let analysis = analyze_query(
         "SELECT MEDIAN(x) AS median_x FROM values_table",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(median_schema),
         },
@@ -1508,6 +1619,272 @@ fn analyze_query_infers_duckdb_median_type_issue_425() {
 }
 
 #[test]
+fn analyze_query_preserves_nullability_through_query_scopes() {
+    for dialect in [
+        DialectType::Snowflake,
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::BigQuery,
+    ] {
+        for (nullable, expected) in [
+            (Some(false), ProjectionNullability::NonNull),
+            (Some(true), ProjectionNullability::Nullable),
+            (None, ProjectionNullability::Unknown),
+        ] {
+            let schema: ValidationSchema = serde_json::from_value(json!({"tables": [{"name": "orders", "columns": [{"name": "amount", "type": "INTEGER", "nullable": nullable}]}]})).unwrap();
+            for sql in [
+                "SELECT amount FROM orders",
+                "WITH typed AS (SELECT amount FROM orders) SELECT amount FROM typed",
+                "WITH a AS (SELECT amount FROM orders), b AS (SELECT amount FROM a) SELECT amount FROM b",
+                "WITH typed AS (SELECT amount AS value FROM orders) SELECT value FROM typed",
+                "WITH typed(value) AS (SELECT amount FROM orders) SELECT value FROM typed",
+                "WITH a(n) AS (SELECT amount FROM orders), b(m) AS (SELECT n FROM a) SELECT m FROM b",
+                "WITH typed AS (SELECT amount FROM orders) SELECT t.amount FROM typed AS t",
+                "SELECT amount FROM (SELECT amount FROM orders) AS typed",
+                "SELECT value FROM (SELECT amount FROM orders) AS typed(value)",
+                "WITH typed AS (SELECT * FROM orders) SELECT amount FROM typed",
+                "WITH typed AS (SELECT amount FROM orders) SELECT amount FROM (SELECT * FROM typed) AS d",
+                "WITH unused AS (SELECT NULL AS amount), typed AS (SELECT amount FROM orders) SELECT amount FROM typed",
+            ] {
+                let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None, dialect, schema: Some(schema.clone()) }).unwrap();
+                assert_eq!(analysis.projections[0].nullability, expected, "{dialect:?}, {nullable:?}: {sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn analyze_query_propagates_expression_nullability_without_schema() {
+    for (body, expected) in [
+        ("1", ProjectionNullability::NonNull),
+        ("NULL", ProjectionNullability::Nullable),
+        ("COUNT(*)", ProjectionNullability::NonNull),
+        ("CAST(1 AS INT)", ProjectionNullability::NonNull),
+        ("CAST(NULL AS INT)", ProjectionNullability::Nullable),
+        ("COALESCE(NULL, 0)", ProjectionNullability::NonNull),
+        ("COALESCE(NULL, NULL)", ProjectionNullability::Nullable),
+        ("TRY_CAST('bad' AS INT)", ProjectionNullability::Unknown),
+        ("unknown_function(1)", ProjectionNullability::Unknown),
+    ] {
+        for sql in [
+            format!("WITH a AS (SELECT {body} AS x), b AS (SELECT x FROM a) SELECT x FROM b"),
+            format!("SELECT x FROM (SELECT {body} AS x) AS d"),
+        ] {
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    complexity_guard: None,
+                    dialect: DialectType::DuckDB,
+                    schema: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(analysis.projections[0].nullability, expected, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn analyze_query_nullability_respects_cte_shadowing_and_output_positions() {
+    for (sql, expected) in [
+        ("WITH orders AS (SELECT NULL AS id) SELECT id FROM orders", ProjectionNullability::Nullable),
+        ("WITH orders AS (SELECT id FROM orders) SELECT id FROM orders", ProjectionNullability::NonNull),
+        ("WITH a AS (SELECT 1 AS x), b AS (WITH a AS (SELECT NULL AS x) SELECT x FROM a) SELECT x FROM b", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT NULL AS x), b AS (WITH a AS (SELECT 1 AS x) SELECT x FROM a) SELECT x FROM b", ProjectionNullability::NonNull),
+        ("WITH a AS (SELECT NULL AS x), b AS (SELECT x FROM a), c AS (WITH a AS (SELECT 1 AS x) SELECT x FROM b) SELECT x FROM c", ProjectionNullability::Nullable),
+        ("WITH a(x,y) AS (SELECT id, amount FROM orders) SELECT y FROM a", ProjectionNullability::Nullable),
+        ("WITH a(x,y) AS (SELECT id, amount FROM orders) SELECT x FROM a", ProjectionNullability::NonNull),
+        ("WITH a AS (SELECT NULL AS x), b AS (SELECT 1 AS x) SELECT x FROM b", ProjectionNullability::NonNull),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None, dialect: DialectType::DuckDB, schema: Some(schema()) }).unwrap();
+        assert_eq!(analysis.projections[0].nullability, expected, "{sql}");
+    }
+    let analysis = analyze_query(
+        "WITH a AS (SELECT 1 AS \"x\", NULL AS \"X\") SELECT \"x\", \"X\" FROM a",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::Snowflake,
+            schema: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        analysis
+            .projections
+            .iter()
+            .map(|p| p.nullability)
+            .collect::<Vec<_>>(),
+        vec![
+            ProjectionNullability::NonNull,
+            ProjectionNullability::Nullable
+        ]
+    );
+}
+
+#[test]
+fn analyze_query_nullability_resolves_quoted_source_names() {
+    for (sql, expected) in [
+        ("WITH d AS (SELECT 1 AS x) SELECT \"D\".x FROM d", ProjectionNullability::NonNull),
+        ("SELECT a.x FROM (SELECT NULL AS x) AS \"a\" CROSS JOIN (SELECT 1 AS x) AS \"A\"", ProjectionNullability::NonNull),
+        ("SELECT \"a\".x FROM (SELECT NULL AS x) AS \"a\" CROSS JOIN (SELECT 1 AS x) AS \"A\"", ProjectionNullability::Nullable),
+        ("SELECT \"A\".x FROM (SELECT 1 AS x) AS \"A\" LEFT JOIN (SELECT 2 AS x) AS \"a\" ON TRUE", ProjectionNullability::NonNull),
+        ("SELECT \"a\".x FROM (SELECT 1 AS x) AS \"A\" LEFT JOIN (SELECT 2 AS x) AS \"a\" ON TRUE", ProjectionNullability::Nullable),
+        ("WITH \"a\" AS (SELECT NULL AS x), \"A\" AS (SELECT 1 AS x) SELECT x FROM a", ProjectionNullability::NonNull),
+        ("WITH \"a\" AS (SELECT NULL AS x), \"A\" AS (SELECT 1 AS x) SELECT x FROM \"a\"", ProjectionNullability::Nullable),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None, dialect: DialectType::Snowflake, schema: None }).unwrap();
+        assert_eq!(analysis.projections[0].nullability, expected, "{sql}");
+    }
+}
+
+#[test]
+fn analyze_query_nullability_preserves_nested_outer_join_effects() {
+    for (sql, expected) in [
+        ("WITH a AS (SELECT o.id FROM users u LEFT JOIN orders o ON TRUE) SELECT id FROM a", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT u.id FROM users u RIGHT JOIN orders o ON TRUE) SELECT id FROM a", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT o.id FROM users u FULL JOIN orders o ON TRUE) SELECT id FROM a", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT o.id FROM users u INNER JOIN orders o ON TRUE) SELECT id FROM a", ProjectionNullability::NonNull),
+        ("WITH a AS (SELECT id FROM orders) SELECT a.id FROM users u LEFT JOIN a ON TRUE", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT COALESCE(o.id, 0) AS id FROM users u LEFT JOIN orders o ON TRUE) SELECT id FROM a", ProjectionNullability::NonNull),
+        ("WITH a AS (SELECT COALESCE(amount, 0) AS id FROM orders) SELECT a.id FROM users u LEFT JOIN a ON TRUE", ProjectionNullability::Nullable),
+        ("WITH a AS (SELECT o.id FROM users u LEFT JOIN orders o ON TRUE) SELECT COALESCE(id, 0) FROM a", ProjectionNullability::NonNull),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions {
+complexity_guard: None, dialect: DialectType::DuckDB, schema: Some(schema()) }).unwrap();
+        assert_eq!(analysis.projections[0].nullability, expected, "{sql}");
+    }
+}
+
+#[test]
+fn analyze_query_nullability_keeps_uncertain_sources_conservative() {
+    for sql in [
+        "WITH a AS (SELECT missing FROM orders) SELECT missing FROM a",
+        "WITH a AS (SELECT id FROM missing_table) SELECT id FROM a",
+        "WITH a AS (SELECT id FROM orders o JOIN users u ON TRUE) SELECT id FROM a",
+        "WITH a AS (SELECT id FROM orders o JOIN missing_table m ON TRUE) SELECT id FROM a",
+        "WITH a AS (SELECT 1 AS x, NULL AS x) SELECT x FROM a",
+        "WITH RECURSIVE a(x) AS (SELECT 1 UNION ALL SELECT x FROM a) SELECT x FROM a",
+        "WITH a AS (SELECT (SELECT id FROM orders) AS id) SELECT id FROM a",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                complexity_guard: None,
+                dialect: DialectType::DuckDB,
+                schema: Some(schema()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            analysis.projections[0].nullability,
+            ProjectionNullability::Unknown,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn analyze_query_nullability_accounts_for_all_set_operation_branches() {
+    for (body, expected) in [
+        (
+            "SELECT id AS x FROM orders UNION ALL SELECT NULL AS x",
+            ProjectionNullability::Nullable,
+        ),
+        (
+            "SELECT NULL AS x UNION ALL SELECT id AS x FROM orders",
+            ProjectionNullability::Nullable,
+        ),
+        (
+            "SELECT id AS x FROM orders UNION ALL SELECT id AS x FROM users",
+            ProjectionNullability::NonNull,
+        ),
+        (
+            "SELECT id AS x FROM orders UNION ALL SELECT total AS x FROM orders",
+            ProjectionNullability::Unknown,
+        ),
+        (
+            "SELECT 1 AS x UNION ALL BY NAME SELECT 2 AS y",
+            ProjectionNullability::Nullable,
+        ),
+        (
+            "SELECT 1 AS x, NULL AS y UNION ALL BY NAME SELECT 2 AS y, NULL AS x",
+            ProjectionNullability::Nullable,
+        ),
+        (
+            "SELECT id AS x FROM orders EXCEPT SELECT NULL AS x",
+            ProjectionNullability::NonNull,
+        ),
+        (
+            "SELECT id AS x FROM orders INTERSECT SELECT NULL AS x",
+            ProjectionNullability::NonNull,
+        ),
+    ] {
+        for sql in [
+            body.to_string(),
+            format!("WITH a AS ({body}) SELECT x FROM a"),
+        ] {
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    complexity_guard: None,
+                    dialect: DialectType::DuckDB,
+                    schema: Some(schema()),
+                },
+            )
+            .unwrap();
+            assert_eq!(analysis.projections[0].nullability, expected, "{sql}");
+        }
+    }
+    let analysis = analyze_query(
+        "WITH a AS (SELECT id FROM orders) SELECT id FROM a UNION ALL SELECT amount FROM orders",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        analysis.set_operations[0].branches[0].projections[0].nullability,
+        ProjectionNullability::NonNull
+    );
+    assert_eq!(
+        analysis.set_operations[0].branches[1].projections[0].nullability,
+        ProjectionNullability::Nullable
+    );
+}
+
+#[test]
+fn analyze_query_nullability_bounds_deep_dependencies_and_reuses_outputs() {
+    for (length, expected) in [
+        (8, ProjectionNullability::NonNull),
+        (140, ProjectionNullability::Unknown),
+    ] {
+        let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_string()];
+        for index in 1..length {
+            ctes.push(format!("c{index} AS (SELECT x FROM c{})", index - 1));
+        }
+        let sql = format!(
+            "WITH {} SELECT x, x AS again FROM c{}",
+            ctes.join(", "),
+            length - 1
+        );
+        let analysis = analyze_query(&sql, AnalyzeQueryOptions::default()).unwrap();
+        assert_eq!(
+            analysis
+                .projections
+                .iter()
+                .map(|p| p.nullability)
+                .collect::<Vec<_>>(),
+            vec![expected, expected]
+        );
+    }
+}
+
+#[test]
 fn analyze_query_reports_projection_nullability() {
     let analysis = analyze_query(
         "SELECT \
@@ -1520,6 +1897,7 @@ fn analyze_query_reports_projection_nullability() {
          FROM orders AS o \
          LEFT JOIN customers AS c ON o.customer_id = c.id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1550,6 +1928,7 @@ fn analyze_query_marks_outer_join_source_columns_nullable() {
     let right_join = analyze_query(
         "SELECT u.id FROM users AS u RIGHT JOIN orders AS o ON u.id = o.user_id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1563,6 +1942,7 @@ fn analyze_query_marks_outer_join_source_columns_nullable() {
     let full_join = analyze_query(
         "SELECT u.id, o.id FROM users AS u FULL JOIN orders AS o ON u.id = o.user_id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1581,6 +1961,7 @@ fn analyze_query_reports_transitive_base_tables() {
          SELECT c.name FROM customers AS c \
          JOIN (SELECT customer_id FROM paid) AS p ON c.id = p.customer_id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::Generic,
             schema: Some(schema()),
         },
@@ -1608,6 +1989,7 @@ fn analyze_query_reports_structured_physical_table_identity() {
     let analysis = analyze_query(
         r#"SELECT id FROM "my.catalog"."my.schema"."orders.table" AS o"#,
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -1637,6 +2019,7 @@ fn analyze_query_reports_structured_table_identity_for_qualified_and_derived_sou
     let analysis = analyze_query(
         "SELECT x FROM (SELECT id AS x FROM mycatalog.myschema.orders) d",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -1666,6 +2049,7 @@ fn analyze_query_reports_base_tables_inside_derived_table() {
     let analysis = analyze_query(
         "SELECT x FROM (SELECT id AS x FROM orders) d",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -1689,6 +2073,7 @@ fn analyze_query_reports_base_tables_inside_derived_table_set_operation() {
     let analysis = analyze_query(
         "SELECT s FROM (SELECT a AS s FROM orders UNION ALL SELECT a AS s FROM users) u",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -1752,6 +2137,7 @@ fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
         "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) \
          UNION ALL SELECT v FROM t3) u",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(single_column_schema(&["t1", "t2", "t3"], "v")),
         },
@@ -1781,6 +2167,7 @@ fn analyze_query_resolves_mixed_nested_set_operation_arm_inside_derived_table() 
         "SELECT v FROM (SELECT v FROM t0 UNION ALL \
          (SELECT v FROM t1 UNION ALL SELECT v FROM t2)) u",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(single_column_schema(&["t0", "t1", "t2"], "v")),
         },
@@ -1803,6 +2190,7 @@ fn analyze_query_resolves_nested_set_operation_inside_cte_with_schema() {
         "WITH c AS (SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) \
          UNION ALL SELECT v FROM t3) u) SELECT v FROM c",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(single_column_schema(&["t1", "t2", "t3"], "v")),
         },
@@ -1829,6 +2217,7 @@ fn analyze_query_resolves_unnest_virtual_output_aliases_with_schema() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(unnest_analysis_schema()),
             },
@@ -1869,6 +2258,7 @@ fn analyze_query_resolves_struct_fields_and_types_issue_408() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(struct_field_analysis_schema()),
             },
@@ -1909,6 +2299,7 @@ fn analyze_query_propagates_unnest_element_types_through_query_scopes() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(schema.clone()),
             },
@@ -1939,6 +2330,7 @@ fn analyze_query_infers_unnest_type_from_case_array_constructor() {
         "SELECT UNNEST(CASE WHEN closed_at IS NULL THEN ARRAY[created_at] \
          ELSE ARRAY[created_at, closed_at] END) AS event_at FROM events",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(schema),
         },
@@ -1975,6 +2367,7 @@ fn analyze_query_preserves_type_through_parenthesized_case() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(schema.clone()),
             },
@@ -2024,6 +2417,7 @@ fn analyze_query_keeps_reused_unnest_alias_types_isolated_between_ctes() {
         let analysis = analyze_query(
             sql,
             AnalyzeQueryOptions {
+                complexity_guard: None,
                 dialect: DialectType::DuckDB,
                 schema: Some(schema.clone()),
             },
@@ -2040,6 +2434,7 @@ fn analyze_query_tolerates_partial_schema_for_unknown_columns() {
     let analysis = analyze_query(
         "SELECT order_id, amount FROM t",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(single_column_schema(&["t"], "amount")),
         },
@@ -2054,7 +2449,7 @@ fn analyze_query_tolerates_partial_schema_for_unknown_columns() {
     assert!(
         order_id.iter().any(|reference| {
             reference.column == "order_id"
-                && reference.confidence == ReferenceConfidence::Resolved
+                && reference.confidence == ReferenceConfidence::Unknown
                 && reference.source_name.as_deref() == Some("t")
                 && reference.table.as_deref() == Some("t")
         }),
@@ -2077,6 +2472,7 @@ fn analyze_query_tolerates_partial_schema_for_qualified_unknown_columns() {
     let analysis = analyze_query(
         "SELECT t.order_id, t.amount FROM t",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(single_column_schema(&["t"], "amount")),
         },
@@ -2086,7 +2482,7 @@ fn analyze_query_tolerates_partial_schema_for_qualified_unknown_columns() {
     assert!(
         analysis.projections[0].upstream.iter().any(|reference| {
             reference.column == "order_id"
-                && reference.confidence == ReferenceConfidence::Resolved
+                && reference.confidence == ReferenceConfidence::Unknown
                 && reference.table.as_deref() == Some("t")
         }),
         "expected qualified unknown column to stay as best-effort t.order_id, got {:?}",
@@ -2120,6 +2516,7 @@ fn analyze_query_tolerates_partial_schema_for_join_conditions() {
     let analysis = analyze_query(
         "SELECT a.order_id, b.amount FROM t a JOIN u b ON a.id = b.id",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: Some(schema),
         },
@@ -2152,6 +2549,7 @@ fn analyze_query_resolves_same_select_alias_reference() {
     let analysis = analyze_query(
         "WITH c AS (SELECT x FROM t) SELECT c.x AS a, a + 1 AS b FROM c",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },
@@ -2175,6 +2573,7 @@ fn analyze_query_resolves_pivot_alias_columns_and_generated_outputs() {
         "SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) \
          PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
         AnalyzeQueryOptions {
+            complexity_guard: None,
             dialect: DialectType::DuckDB,
             schema: None,
         },

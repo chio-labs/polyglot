@@ -1,8 +1,61 @@
 use crate::dialects::DialectType;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Declarative, per-dialect input for the existing runtime catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FunctionCatalogSpec {
+    #[serde(default)]
+    pub name_case: FunctionNameCase,
+    pub functions: Vec<FunctionCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FunctionCatalogEntry {
+    pub name: String,
+    pub signatures: Vec<FunctionSignature>,
+    #[serde(default)]
+    pub name_case: Option<FunctionNameCase>,
+}
+
+impl FunctionCatalogSpec {
+    /// Compile a specification for the call's dialect. An explicit catalog
+    /// replaces, rather than supplements, the embedded catalog.
+    pub fn build(&self, dialect: DialectType) -> Result<HashMapFunctionCatalog, String> {
+        let mut catalog = HashMapFunctionCatalog::default();
+        catalog.set_dialect_name_case(dialect, self.name_case);
+        let mut cases = HashMap::new();
+        for function in &self.functions {
+            if function.name.trim().is_empty() || function.signatures.is_empty() {
+                return Err("Catalog functions require a nonempty name and signatures".into());
+            }
+            for signature in &function.signatures {
+                if signature
+                    .max_arity
+                    .is_some_and(|max| max < signature.min_arity)
+                {
+                    return Err(format!("Invalid arity range for '{}'", function.name));
+                }
+            }
+            let case = function.name_case.unwrap_or(self.name_case);
+            if cases
+                .insert(function.name.to_lowercase(), case)
+                .is_some_and(|old| old != case)
+            {
+                return Err(format!("Conflicting nameCase for '{}'", function.name));
+            }
+            catalog.set_function_name_case(dialect, &function.name, case);
+            catalog.register(dialect, &function.name, function.signatures.clone());
+        }
+        Ok(catalog)
+    }
+}
+
 /// Function-name casing behavior for lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FunctionNameCase {
     /// Function names are compared case-insensitively.
     #[default]
@@ -12,7 +65,8 @@ pub enum FunctionNameCase {
 }
 
 /// Function signature metadata used by semantic validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FunctionSignature {
     /// Minimum number of positional arguments.
     pub min_arity: usize,

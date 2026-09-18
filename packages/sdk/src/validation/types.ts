@@ -51,8 +51,8 @@ export interface ValidationResult {
 export interface ValidationOptions {
   /**
    * Enable semantic validation in addition to syntax checking.
-   * Semantic validation checks for issues like SELECT * usage,
-   * aggregate functions without GROUP BY, etc.
+   * Reports correctness errors E230-E232 for invalid grouping and misplaced
+   * aggregate/window functions, plus query-quality warnings W001-W004.
    * @default false
    */
   semantic?: boolean;

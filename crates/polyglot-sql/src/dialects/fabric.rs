@@ -14,7 +14,8 @@
 //! - Certain legacy types (MONEY, SMALLMONEY, etc.) are not supported
 //! - Unicode types (NCHAR, NVARCHAR) are mapped to non-unicode equivalents
 
-use super::{DialectImpl, DialectType, TSQLDialect};
+use super::tsql::TSQLDialect;
+use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{BinaryOp, Cast, DataType, Expression, Function, Identifier, Literal};
 #[cfg(feature = "generate")]

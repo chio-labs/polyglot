@@ -6741,85 +6741,55 @@ impl DuckDBDialect {
     /// Handles both uppercase Snowflake originals (YYYY, MM, DD) and normalized lowercase forms (yyyy, mm, DD).
     fn snowflake_to_strptime(s: &str) -> String {
         let mut result = String::new();
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-        while i < len {
-            let remaining = &s[i..];
-            let remaining_upper: String =
-                remaining.chars().take(8).collect::<String>().to_uppercase();
-
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(s);
+        while let Some(ch) = cursor.peek() {
             // Compound patterns first
-            if remaining_upper.starts_with("HH24MISS") {
+            if cursor.consume_prefix("HH24MISS", true) {
                 result.push_str("%H%M%S");
-                i += 8;
-            } else if remaining_upper.starts_with("MMMM") {
+            } else if cursor.consume_prefix("MMMM", true) {
                 result.push_str("%B");
-                i += 4;
-            } else if remaining_upper.starts_with("YYYY") {
+            } else if cursor.consume_prefix("YYYY", true) {
                 result.push_str("%Y");
-                i += 4;
-            } else if remaining_upper.starts_with("YY") {
+            } else if cursor.consume_prefix("YY", true) {
                 result.push_str("%y");
-                i += 2;
-            } else if remaining_upper.starts_with("MON") {
+            } else if cursor.consume_prefix("MON", true) {
                 result.push_str("%b");
-                i += 3;
-            } else if remaining_upper.starts_with("HH24") {
+            } else if cursor.consume_prefix("HH24", true) {
                 result.push_str("%H");
-                i += 4;
-            } else if remaining_upper.starts_with("HH12") {
+            } else if cursor.consume_prefix("HH12", true) {
                 result.push_str("%I");
-                i += 4;
-            } else if remaining_upper.starts_with("HH") {
+            } else if cursor.consume_prefix("HH", true) {
                 result.push_str("%I");
-                i += 2;
-            } else if remaining_upper.starts_with("MISS") {
+            } else if cursor.consume_prefix("MISS", true) {
                 result.push_str("%M%S");
-                i += 4;
-            } else if remaining_upper.starts_with("MI") {
+            } else if cursor.consume_prefix("MI", true) {
                 result.push_str("%M");
-                i += 2;
-            } else if remaining_upper.starts_with("MM") {
+            } else if cursor.consume_prefix("MM", true) {
                 result.push_str("%m");
-                i += 2;
-            } else if remaining_upper.starts_with("DD") {
+            } else if cursor.consume_prefix("DD", true) {
                 result.push_str("%d");
-                i += 2;
-            } else if remaining_upper.starts_with("DY") {
+            } else if cursor.consume_prefix("DY", true) {
                 result.push_str("%a");
-                i += 2;
-            } else if remaining_upper.starts_with("SS") {
+            } else if cursor.consume_prefix("SS", true) {
                 result.push_str("%S");
-                i += 2;
-            } else if remaining_upper.starts_with("FF") {
-                // FF with optional digit (FF, FF1-FF9)
-                // %f = microseconds (6 digits, FF1-FF6), %n = nanoseconds (9 digits, FF7-FF9)
-                let ff_pos = i + 2;
-                if ff_pos < len && chars[ff_pos].is_ascii_digit() {
-                    let digit = chars[ff_pos].to_digit(10).unwrap_or(6);
-                    if digit >= 7 {
-                        result.push_str("%n");
-                    } else {
-                        result.push_str("%f");
-                    }
-                    i += 3; // skip FF + digit
+            } else if cursor.consume_prefix("FF", true) {
+                // Preserve the existing one-digit precision rule: FF7-FF9 use
+                // nanoseconds; FF0-FF6 and bare FF use microseconds.
+                if let Some(digit) = cursor.peek().filter(|c| c.is_ascii_digit()) {
+                    result.push_str(if digit >= '7' { "%n" } else { "%f" });
+                    cursor.next_char();
                 } else {
                     result.push_str("%f");
-                    i += 2;
                 }
-            } else if remaining_upper.starts_with("PM") || remaining_upper.starts_with("AM") {
+            } else if cursor.consume_prefix("PM", true) || cursor.consume_prefix("AM", true) {
                 result.push_str("%p");
-                i += 2;
-            } else if remaining_upper.starts_with("TZH") {
+            } else if cursor.consume_prefix("TZH", true) {
                 result.push_str("%z");
-                i += 3;
-            } else if remaining_upper.starts_with("TZM") {
+            } else if cursor.consume_prefix("TZM", true) {
                 // TZM is part of timezone, skip
-                i += 3;
             } else {
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result
@@ -7503,6 +7473,33 @@ mod tests {
     use super::*;
     use crate::dialects::Dialect;
     use crate::expressions::JoinKind;
+
+    #[test]
+    fn test_date_time_format_conversion_preserves_unicode() {
+        for literal in ["é", "年", "🦀", "e\u{301}", "ß", "ſ"] {
+            assert_eq!(DuckDBDialect::snowflake_to_strptime(literal), literal);
+            assert_eq!(
+                DuckDBDialect::snowflake_to_strptime(&format!("{literal}YYYY{literal}mM{literal}")),
+                format!("{literal}%Y{literal}%m{literal}")
+            );
+        }
+        for (input, expected) in [
+            ("", ""),
+            (
+                "HH24MISS MMMM YYYY YY MON HH24 HH12 HH MISS MI MM DD DY SS PM AM TZH TZM",
+                "%H%M%S %B %Y %y %b %H %I %I %M%S %M %m %d %a %S %p %p %z ",
+            ),
+            ("FF FF0 FF1 FF6 FF7 FF9 FF69", "%f %f %f %f %n %n %f9"),
+            ("éFF7年YYYY", "é%n年%Y"),
+            ("\"年\"YYYY %q", "\"年\"%Y %q"),
+        ] {
+            assert_eq!(
+                DuckDBDialect::snowflake_to_strptime(input),
+                expected,
+                "{input}"
+            );
+        }
+    }
 
     fn transpile_to_duckdb(sql: &str) -> String {
         transpile_to_duckdb_from(sql, DialectType::Generic)

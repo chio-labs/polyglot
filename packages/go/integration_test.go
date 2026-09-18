@@ -26,6 +26,30 @@ func integrationClient(t *testing.T) *Client {
 	return client
 }
 
+func TestIntegrationNullOrderingPreservation(t *testing.T) {
+	client := integrationClient(t)
+	for _, dialect := range []string{"snowflake", "duckdb", "postgres"} {
+		for _, ordering := range []string{
+			"category NULLS LAST, created_at DESC NULLS FIRST",
+			"category, created_at DESC",
+		} {
+			sql := "SELECT id FROM items ORDER BY " + ordering
+			for _, options := range [][]FormatOptions{nil, {{}}} {
+				result, err := client.Format(sql, dialect, options...)
+				if err != nil || len(result) != 1 || strings.Join(strings.Fields(result[0]), " ") != sql {
+					t.Fatalf("format %s: %v, %v", dialect, result, err)
+				}
+			}
+			if dialect != "postgres" {
+				result, err := client.Transpile(sql, dialect, dialect)
+				if err != nil || len(result) != 1 || result[0] != sql {
+					t.Fatalf("transpile %s: %v, %v", dialect, result, err)
+				}
+			}
+		}
+	}
+}
+
 func TestIntegrationParserDepthGuard(t *testing.T) {
 	client := integrationClient(t)
 	sql := "SELECT " + strings.Repeat("~ ", 12) + "1"
@@ -49,6 +73,61 @@ func TestIntegrationParserDepthGuard(t *testing.T) {
 	}
 	if _, err := client.Transpile("SELECT "+strings.Repeat("~ ", 4000)+"1", "generic", "generic"); err == nil || !strings.Contains(err.Error(), "E_GUARD_PARSER_DEPTH_EXCEEDED") {
 		t.Fatalf("default guard: %v", err)
+	}
+	if _, err := client.Parse("SELECT 1", "generic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationParseValidationAnalysisGuardOptions(t *testing.T) {
+	client := integrationClient(t)
+	schema := ValidationSchema{Tables: []SchemaTable{{Name: "records", Columns: []SchemaColumn{{Name: "value", Type: "INTEGER"}}}}}
+	for _, depth := range []int{64, 65} {
+		sql := "SELECT " + strings.Repeat("COALESCE(", depth) + "value" + strings.Repeat(", 0)", depth) + " FROM records"
+		for _, tc := range []struct {
+			guard    *ComplexityGuardOptions
+			accepted bool
+		}{
+			{nil, depth == 64}, {&ComplexityGuardOptions{}, depth == 64},
+			{&ComplexityGuardOptions{MaxFunctionCallDepth: NewGuardLimit(128)}, true},
+			{&ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit()}, true},
+		} {
+			for _, parse := range []func(string, string, ...ParseOptions) (json.RawMessage, error){client.Parse, client.ParseOne} {
+				_, err := parse(sql, "snowflake", ParseOptions{ComplexityGuard: tc.guard})
+				if (err == nil) != tc.accepted {
+					t.Fatalf("depth=%d, accepted=%v: %v", depth, tc.accepted, err)
+				}
+				if err != nil && !strings.Contains(err.Error(), "E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED") {
+					t.Fatal(err)
+				}
+			}
+			result, err := client.Validate(sql, "snowflake", ValidationOptions{ComplexityGuard: tc.guard})
+			if err != nil || result.Valid != tc.accepted {
+				t.Fatalf("validate: %#v, %v", result, err)
+			}
+			result, err = client.ValidateWithSchema(sql, schema, "snowflake", SchemaValidationOptions{ComplexityGuard: tc.guard})
+			if err != nil || result.Valid != tc.accepted {
+				t.Fatalf("validate schema: %#v, %v", result, err)
+			}
+			_, err = client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "snowflake", ComplexityGuard: tc.guard})
+			if (err == nil) != tc.accepted {
+				t.Fatalf("analyze: %v", err)
+			}
+		}
+	}
+	_, err := client.Parse("SELECT 1", "generic", ParseOptions{ComplexityGuard: &ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit(), MaxInputBytes: NewGuardLimit(1)}})
+	if err == nil || !strings.Contains(err.Error(), "E_GUARD_INPUT_TOO_LARGE") {
+		t.Fatalf("independent guard: %v", err)
+	}
+	_, err = client.ParseDataType("DECIMAL(10, 2)", "snowflake", ParseOptions{ComplexityGuard: &ComplexityGuardOptions{MaxASTNodes: NewGuardLimit(0)}})
+	if err == nil || !strings.Contains(err.Error(), "E_GUARD_AST_BUDGET_EXCEEDED") {
+		t.Fatalf("data type guard: %v", err)
+	}
+	if _, err := client.ParseDataType("DECIMAL(10, 2)", "snowflake"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ParseOne("SELECT 1; SELECT 2", "generic", ParseOptions{}); err == nil {
+		t.Fatal("accepted multiple statements")
 	}
 	if _, err := client.Parse("SELECT 1", "generic"); err != nil {
 		t.Fatal(err)
@@ -194,6 +273,20 @@ func TestIntegrationValidateWithSchema(t *testing.T) {
 	result, err = client.ValidateWithSchema("SELECT * FROM orders LIMIT 10", schema, "", SchemaValidationOptions{Semantic: true})
 	if err != nil || !result.Valid || len(result.Errors) != 2 {
 		t.Fatalf("semantic warnings: %+v, %v", result, err)
+	}
+	for _, test := range []struct{ sql, code string }{
+		{"SELECT order_id, SUM(active) FROM orders", "E230"},
+		{"SELECT order_id FROM orders WHERE SUM(order_id)>0", "E231"},
+		{"SELECT order_id FROM orders WHERE ROW_NUMBER() OVER()=1", "E232"},
+	} {
+		result, err = client.ValidateWithSchema(test.sql, schema, "snowflake", SchemaValidationOptions{Semantic: true, Strict: &strict})
+		found := false
+		for _, finding := range result.Errors {
+			found = found || (finding.Code == test.code && finding.Severity == "error")
+		}
+		if err != nil || result.Valid || !found {
+			t.Fatalf("semantic correctness %s: %+v, %v", test.sql, result, err)
+		}
 	}
 	for _, columns := range [][]SchemaColumn{nil, {{Name: "*"}}} {
 		schema.Tables[0].Columns = columns
@@ -898,6 +991,11 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	if !hasUpstream(analysis.Projections[0].Upstream, "t", "order_id") {
 		t.Fatalf("unexpected AnalyzeQuery unknown-column upstream: %#v", analysis.Projections[0].Upstream)
+	}
+	for _, reference := range analysis.Projections[0].Upstream {
+		if reference.Confidence != "unknown" {
+			t.Fatalf("missing column claimed resolved: %#v", reference)
+		}
 	}
 	if !hasUpstream(analysis.Projections[1].Upstream, "t", "amount") {
 		t.Fatalf("unexpected AnalyzeQuery known-column upstream: %#v", analysis.Projections[1].Upstream)

@@ -41,6 +41,7 @@ const MAX_TSQL_GROUPING_SETS: usize = 4096;
 /// Flatten nested GROUPING SETS and structural grouping tuples into syntax accepted by
 /// T-SQL and Fabric. Unlike GROUP BY DISTINCT expansion, this preserves duplicate sets
 /// and leaves ROLLUP/CUBE items unexpanded.
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 pub(crate) fn normalize_grouping_sets_for_tsql(expr: Expression) -> Result<Expression> {
     transform_recursive(expr, &|expr| {
         let Expression::Select(mut select) = expr else {
@@ -58,6 +59,7 @@ pub(crate) fn normalize_grouping_sets_for_tsql(expr: Expression) -> Result<Expre
     })
 }
 
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 fn normalize_tsql_grouping_element(expression: Expression) -> Expression {
     match expression {
         Expression::Function(mut function)
@@ -100,6 +102,7 @@ fn normalize_tsql_grouping_element(expression: Expression) -> Expression {
     }
 }
 
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 fn normalize_tsql_grouping_sets(expressions: Vec<Expression>) -> Vec<Expression> {
     let mut normalized = Vec::new();
 
@@ -126,6 +129,7 @@ fn normalize_tsql_grouping_sets(expressions: Vec<Expression>) -> Vec<Expression>
     normalized
 }
 
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 fn normalize_tsql_grouping_unit(expression: Expression) -> Expression {
     let Expression::Tuple(tuple) = expression else {
         return expression;
@@ -139,6 +143,7 @@ fn normalize_tsql_grouping_unit(expression: Expression) -> Expression {
     Expression::Tuple(Box::new(Tuple { expressions }))
 }
 
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 fn append_tsql_grouping_unit(expression: Expression, expressions: &mut Vec<Expression>) {
     match expression {
         Expression::Tuple(tuple) => {

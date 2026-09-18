@@ -1,11 +1,11 @@
 use crate::errors::map_transpile_error;
 use crate::helpers::{
-    normalize_error_level, normalize_unsupported_level, resolve_dialect, run_detached,
+    decode_complexity_guard, normalize_error_level, normalize_unsupported_level, resolve_dialect,
+    run_detached,
 };
 use polyglot_sql::dialects::{Dialect, TranspileOptions};
-use polyglot_sql::ComplexityGuardOptions;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyInt};
+use pyo3::types::PyDict;
 
 #[pyfunction(signature = (sql, read = None, write = None, *, identity = true, error_level = None, unsupported_level = None, pretty = false, max_unsupported = None, complexity_guard = None))]
 #[allow(clippy::too_many_arguments)]
@@ -21,32 +21,7 @@ pub fn transpile(
     max_unsupported: Option<usize>,
     complexity_guard: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<String>> {
-    // Reject Python coercions before conversion: bool is an int subclass, and
-    // non-finite floats become JSON null (which would disable a guard).
-    let complexity_guard: Option<ComplexityGuardOptions> = complexity_guard
-        .map(|value| {
-            for (_, limit) in value.iter() {
-                if !limit.is_none()
-                    && (limit.is_instance_of::<PyBool>() || !limit.is_instance_of::<PyInt>())
-                {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "Complexity guard limits must be nonnegative integers or None",
-                    ));
-                }
-            }
-            // The shared serde contract still handles defaults and integer ranges.
-            let value: serde_json::Value = pythonize::depythonize(value).map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid complexity guard options: {error}"
-                ))
-            })?;
-            serde_json::from_value(value).map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid complexity guard options: {error}"
-                ))
-            })
-        })
-        .transpose()?;
+    let complexity_guard = decode_complexity_guard(complexity_guard)?;
     let _ = normalize_error_level(error_level)?;
     let unsupported_level = normalize_unsupported_level(unsupported_level)?;
     let read = read.unwrap_or("generic");
