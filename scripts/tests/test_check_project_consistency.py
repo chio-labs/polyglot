@@ -1,6 +1,11 @@
 import json
+import os
+import re
+import subprocess
 import tempfile
+import textwrap
 import unittest
+from itertools import product
 from pathlib import Path
 
 from scripts import check_project_consistency as consistency
@@ -269,6 +274,68 @@ class ConsistencyCheckerTests(unittest.TestCase):
                 }
             ],
         }
+
+
+class RustCiConsistencyTests(unittest.TestCase):
+    """Keep the parallel CI suites consistent with local verification."""
+
+    @staticmethod
+    def _make_plan(*targets: str) -> str:
+        return subprocess.check_output(
+            ["make", "--no-print-directory", "-n", *targets],
+            cwd=consistency.PROJECT_ROOT,
+            text=True,
+        )
+
+    def test_ci_suites_preserve_local_verification_commands(self):
+        local = self._make_plan("test-rust-verify")
+        ci = self._make_plan(
+            "test-rust-ci-core", "test-rust-ci-release-fixtures",
+            "test-rust-ci-bindings", "test-rust-ci-feature-gates",
+        )
+        def commands(plan: str) -> set[str]:
+            return {line for line in plan.splitlines() if line.startswith("cargo ")}
+
+        self.assertLessEqual(commands(local), commands(ci))
+        for target in (
+            "sqlglot_identity", "sqlglot_dialect_identity", "sqlglot_transpilation",
+            "sqlglot_transpile", "sqlglot_parser", "sqlglot_pretty",
+            "custom_dialect_tests", "custom_clickhouse_parser", "custom_clickhouse_coverage",
+            "deep_nesting_regression",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(len(re.findall(rf"--test {target}(?: |$)", ci, re.M)), 1)
+        self.assertIn("cargo check --manifest-path examples/rust/Cargo.toml", ci)
+        self.assertIn("cargo test -p polyglot-sql-wasm --lib -- --nocapture", ci)
+        self.assertIn("cargo build -p polyglot-sql-ffi --profile ffi_release", ci)
+
+    def test_release_suite_preserves_stack_and_profile(self):
+        plan = self._make_plan("test-rust-ci-release-fixtures")
+        self.assertIn("RUST_MIN_STACK=16777216", plan)
+        commands = [line for line in plan.splitlines() if line.startswith("cargo ")]
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(all("--release" in command for command in commands))
+
+    def test_ci_gate_rejects_failed_skipped_cancelled_or_missing_results(self):
+        workflow = (consistency.PROJECT_ROOT / ".github/workflows/ci.yml").read_text()
+        # Extract this job's literal shell block without adding a YAML dependency
+        # to the standard-library-only consistency checks. YAML syntax is linted
+        # separately; execute the actual gate rather than a copy of its logic.
+        match = re.search(r"(?ms)^  rust-test:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)
+        self.assertIsNotNone(match)
+        job = match.group(1)
+        self.assertIn("if: always()", job)
+        self.assertIn("needs: [quality, rust-test-suite]", job)
+        script = textwrap.dedent(job.split("        run: |\n", 1)[1])
+        for quality, suites in product(("success", "failure", "skipped", "cancelled", ""), repeat=2):
+            with self.subTest(quality=quality, suites=suites):
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                    env={**os.environ, "QUALITY_RESULT": quality, "SUITES_RESULT": suites},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, quality == suites == "success")
 
 
 if __name__ == "__main__":

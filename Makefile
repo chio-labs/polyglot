@@ -4,6 +4,8 @@
         test-rust test-rust-all test-rust-identity test-rust-dialect \
         test-rust-transpile test-rust-pretty test-rust-roundtrip test-rust-matrix \
         test-rust-compat test-rust-errors test-rust-functions test-rust-custom test-rust-lib test-rust-feature-gates test-rust-verify \
+        test-rust-verify-core test-rust-verify-release \
+        test-rust-ci-core test-rust-ci-release-fixtures test-rust-ci-bindings test-rust-ci-feature-gates \
         test-rust-transpile-generic test-rust-parser test-rust-check \
         test-rust-clickhouse-parser test-rust-clickhouse-coverage \
         test-ffi build-go test-go test-go-integration \
@@ -53,6 +55,10 @@ help:
 	@echo "  make test-rust-feature-gates - Check optional Cargo feature combinations"
 	@echo "  make test-rust-check     - Compile Rust test targets without running them"
 	@echo "  make test-rust-verify    - Check benchmarks and run full Rust verification incl. FFI"
+	@echo "  make test-rust-ci-core   - CI core/debug suite, including the standalone example"
+	@echo "  make test-rust-ci-release-fixtures - CI pretty-print and ClickHouse release tests"
+	@echo "  make test-rust-ci-bindings - CI WASM/FFI tests and FFI release build"
+	@echo "  make test-rust-ci-feature-gates - CI capability and single-dialect WASM checks"
 	@echo ""
 	@echo "  SQLGlot Fixture Tests:"
 	@echo "  make test-rust-identity         - Generic identity tests"
@@ -262,7 +268,14 @@ test-rust-all:
 		--test sqlglot_transpile --test sqlglot_parser -- --nocapture
 
 # Compile benchmarks and run lib + fixtures + custom dialects + ClickHouse + FFI tests.
+# Keep local verification sequential; CI gives each suite its own runner/target directory.
 test-rust-verify:
+	@$(MAKE) test-rust-verify-core
+	@$(MAKE) test-rust-verify-release
+	@$(MAKE) test-ffi
+
+# Shared recipes keep local verification and the CI suite selections in sync.
+test-rust-verify-core:
 	@echo "=== Compile performance benchmarks ==="
 	@cargo check -p polyglot-sql --benches
 	@echo ""
@@ -285,20 +298,36 @@ test-rust-verify:
 	@echo "=== Parser tests ==="
 	@cargo test --test sqlglot_parser test_sqlglot_parser_all -p polyglot-sql -- --nocapture
 	@echo ""
-	@echo "=== Pretty-print tests ==="
-	@cargo test --test sqlglot_pretty test_sqlglot_pretty_all -p polyglot-sql --release -- --nocapture
-	@echo ""
 	@echo "=== Custom dialect tests ==="
 	@cargo test --test custom_dialect_tests -p polyglot-sql -- --nocapture
+
+test-rust-verify-release:
+	@echo "=== Pretty-print tests ==="
+	@cargo test --test sqlglot_pretty test_sqlglot_pretty_all -p polyglot-sql --release -- --nocapture
 	@echo ""
 	@echo "=== ClickHouse parser tests ==="
 	@cargo test --test custom_clickhouse_parser -p polyglot-sql --release -- --nocapture
 	@echo ""
 	@echo "=== ClickHouse coverage tests ==="
 	@cargo test --test custom_clickhouse_coverage -p polyglot-sql --release -- --nocapture
-	@echo ""
-	@echo "=== FFI tests ==="
-	@cargo test -p polyglot-sql-ffi -- --nocapture
+
+# Four suites used by the CI matrix on both release and non-release events.
+# Fixture extraction remains explicit so these targets also work with local fixtures.
+test-rust-ci-core:
+	@$(MAKE) test-rust-verify-core
+	cargo check --manifest-path examples/rust/Cargo.toml
+
+test-rust-ci-release-fixtures:
+	RUST_MIN_STACK=16777216 $(MAKE) test-rust-verify-release
+
+test-rust-ci-bindings:
+	cargo test -p polyglot-sql-wasm --lib -- --nocapture
+	@$(MAKE) test-ffi
+	@$(MAKE) build-ffi
+
+test-rust-ci-feature-gates:
+	@$(MAKE) test-rust-feature-gates
+	cargo check -p polyglot-sql-wasm --no-default-features --features "console_error_panic_hook,dialect-clickhouse"
 
 # Run normalization/transpile tests from test_transpile.py
 test-rust-transpile-generic:

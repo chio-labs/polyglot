@@ -415,6 +415,19 @@ Optional dialect function catalogs are provided via `crates/polyglot-sql-functio
 
 ## Testing
 
+CI runs four Rust suites in parallel for pull requests, pushes to `main`, and
+`v*` release tags: core/debug, release fixtures, bindings, and feature gates.
+The required `rust-test` check succeeds only when every suite and the quality
+job pass. Go integration tests reuse the bindings suite's FFI release library;
+published multi-platform FFI archives remain separate.
+
+To reproduce one suite locally, run `make test-rust-ci-core`,
+`make test-rust-ci-release-fixtures`, `make test-rust-ci-bindings`, or
+`make test-rust-ci-feature-gates`. Extract fixtures first with
+`make extract-fixtures` for core or `make extract-all-fixtures` for release
+fixtures. `make test-rust-verify` remains the sequential local verification
+command and shares its test recipes with CI.
+
 Polyglot currently runs **11,333 SQLGlot fixture cases** plus additional project-specific suites. All strict pass/fail suites are at **100%** in the latest verification run.
 
 | Category | Count | Pass Rate |
