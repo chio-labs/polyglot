@@ -3407,6 +3407,20 @@ fn source_display_name(scope: &crate::scope::Scope, source_name: &str) -> String
         .unwrap_or_else(|| lower(source_name))
 }
 
+fn shallow_resolution_scope(
+    scope: &crate::scope::Scope,
+    expression: Expression,
+) -> crate::scope::Scope {
+    let mut result = crate::scope::Scope::new(expression);
+    result.scope_type = scope.scope_type;
+    result.sources = scope.sources.clone();
+    result.lateral_sources = scope.lateral_sources.clone();
+    result.cte_sources = scope.cte_sources.clone();
+    result.outer_columns = scope.outer_columns.clone();
+    result.can_be_correlated = scope.can_be_correlated;
+    result
+}
+
 fn validate_select_columns_with_schema(
     select: &crate::expressions::Select,
     scope: &crate::scope::Scope,
@@ -3419,8 +3433,7 @@ fn validate_select_columns_with_schema(
     let mut normalized_select = select.clone();
     let _ = normalize_dotted_columns(&mut normalized_select, resolver_schema, true);
     let select_expr = Expression::Select(Box::new(normalized_select));
-    let mut normalized_scope = scope.clone();
-    normalized_scope.expression = select_expr.clone();
+    let normalized_scope = shallow_resolution_scope(scope, select_expr.clone());
     let mut resolver = Resolver::new(&normalized_scope, resolver_schema, true);
     let source_names: Vec<String> = normalized_scope.sources.keys().cloned().collect();
 
@@ -3621,7 +3634,7 @@ fn validate_scope_columns_with_schema(
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let empty_sources = HashMap::new();
-    let mut effective_scope = scope.clone();
+    let mut effective_sources = scope.sources.clone();
     if scope.can_be_correlated {
         for node in walk_in_scope(&scope.expression, false) {
             let Expression::Column(column) = node else {
@@ -3630,19 +3643,25 @@ fn validate_scope_columns_with_schema(
             let Some(table) = &column.table else {
                 continue;
             };
-            if resolve_scope_source_name(&effective_scope, &table.name).is_some() {
+            if effective_sources
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(&table.name))
+            {
                 continue;
             }
             if let Some((name, source)) = outer_sources
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case(&table.name))
             {
-                effective_scope.sources.insert(name.clone(), source.clone());
+                effective_sources.insert(name.clone(), source.clone());
             }
         }
     }
 
     if let Some(select) = select_for_scope_expression(&scope.expression) {
+        let mut effective_scope =
+            shallow_resolution_scope(scope, Expression::Select(Box::new(select.clone())));
+        effective_scope.sources = effective_sources.clone();
         errors.extend(validate_select_columns_with_schema(
             select,
             &effective_scope,
@@ -3700,7 +3719,7 @@ fn validate_scope_columns_with_schema(
     for child in &scope.subquery_scopes {
         errors.extend(validate_scope_columns_with_schema(
             child,
-            &effective_scope.sources,
+            &effective_sources,
             schema_map,
             resolver_schema,
             strict,
