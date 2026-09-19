@@ -5,7 +5,6 @@
 //!
 //! Ported from sqlglot's optimizer/qualify_columns.py
 
-use crate::dialects::transform_recursive;
 use crate::dialects::DialectType;
 use crate::expressions::{
     Alias, BinaryOp, Column, DotAccess, Expression, Identifier, Join, JoinKind, LateralView,
@@ -13,7 +12,9 @@ use crate::expressions::{
 };
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
-use crate::scope::{build_scope, traverse_scope, Scope};
+use crate::scope::{
+    build_scope_with_ctes, selected_reference_scope, traverse_scope, Scope, SourceInfo, SourceKind,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -117,104 +118,266 @@ pub fn qualify_columns(
     schema: &dyn Schema,
     options: &QualifyColumnsOptions,
 ) -> QualifyColumnsResult<Expression> {
+    qualify_query(expression, schema, options, &HashMap::new(), &[])
+}
+
+/// Transform scalar syntax bottom-up, stopping at query boundaries. Query
+/// children are handled exactly once with their own lexical environment.
+fn transform_in_scope<E>(
+    expression: Expression,
+    mut transform: impl FnMut(Expression) -> Result<Expression, E>,
+) -> Result<Expression, E> {
+    enum Task {
+        Visit(Expression),
+        Finish(Expression, usize),
+    }
+    let mut tasks = vec![Task::Visit(expression)];
+    let mut results = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(mut expression) => {
+                if matches!(
+                    expression,
+                    Expression::Select(_)
+                        | Expression::Union(_)
+                        | Expression::Intersect(_)
+                        | Expression::Except(_)
+                ) {
+                    results.push(transform(expression)?);
+                    continue;
+                }
+                let mut children = Vec::new();
+                crate::ast_children::for_each_child_mut(&mut expression, |child| {
+                    children.push(std::mem::replace(
+                        child,
+                        Expression::Null(crate::expressions::Null),
+                    ));
+                });
+                tasks.push(Task::Finish(expression, children.len()));
+                tasks.extend(children.into_iter().rev().map(Task::Visit));
+            }
+            Task::Finish(mut expression, count) => {
+                let mut children = results.split_off(results.len() - count).into_iter();
+                crate::ast_children::for_each_child_mut(&mut expression, |child| {
+                    *child = children.next().expect("scope transform child");
+                });
+                results.push(transform(expression)?);
+            }
+        }
+    }
+    Ok(results.pop().expect("scope transform result"))
+}
+
+fn qualify_nested_queries(
+    expression: Expression,
+    schema: &dyn Schema,
+    options: &QualifyColumnsOptions,
+    ctes: &HashMap<String, SourceInfo>,
+    outer: &[Scope],
+) -> QualifyColumnsResult<Expression> {
+    transform_in_scope(expression, |node| match node {
+        Expression::Select(_)
+        | Expression::Union(_)
+        | Expression::Intersect(_)
+        | Expression::Except(_) => qualify_query(node, schema, options, ctes, outer),
+        other => Ok(other),
+    })
+}
+
+fn qualify_query(
+    expression: Expression,
+    schema: &dyn Schema,
+    options: &QualifyColumnsOptions,
+    inherited_ctes: &HashMap<String, SourceInfo>,
+    outer: &[Scope],
+) -> QualifyColumnsResult<Expression> {
+    #[cfg(feature = "stacker")]
+    {
+        let red_zone = if cfg!(debug_assertions) {
+            4 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
+        stacker::maybe_grow(red_zone, 8 * 1024 * 1024, || {
+            qualify_query_inner(expression, schema, options, inherited_ctes, outer)
+        })
+    }
+    #[cfg(not(feature = "stacker"))]
+    qualify_query_inner(expression, schema, options, inherited_ctes, outer)
+}
+
+fn is_lateral_source(expression: &Expression) -> bool {
+    match expression {
+        Expression::Lateral(_) => true,
+        Expression::Subquery(subquery) => subquery.lateral,
+        Expression::Alias(alias) => is_lateral_source(&alias.this),
+        Expression::Paren(paren) => is_lateral_source(&paren.this),
+        _ => false,
+    }
+}
+
+fn qualify_query_inner(
+    mut expression: Expression,
+    schema: &dyn Schema,
+    options: &QualifyColumnsOptions,
+    inherited_ctes: &HashMap<String, SourceInfo>,
+    outer: &[Scope],
+) -> QualifyColumnsResult<Expression> {
     let infer_schema = options.infer_schema.unwrap_or(schema.is_empty());
     let dialect = options.dialect.or_else(|| schema.dialect());
-    let first_error: RefCell<Option<QualifyColumnsError>> = RefCell::new(None);
-
-    let transformed = transform_recursive(expression, &|node| {
-        if first_error.borrow().is_some() {
-            return Ok(node);
-        }
-
-        match node {
-            Expression::Select(mut select) => {
-                if let Some(with) = &mut select.with {
-                    pushdown_cte_alias_columns_with(with);
-                }
-
-                let scope_expr = Expression::Select(select.clone());
-                let scope = build_scope(&scope_expr);
-                let mut resolver = Resolver::new(&scope, schema, infer_schema);
-
-                // 1. Expand USING → ON before column qualification
-                let column_tables = if first_error.borrow().is_none() {
-                    match expand_using(&mut select, &scope, &mut resolver) {
-                        Ok(ct) => ct,
-                        Err(err) => {
-                            *first_error.borrow_mut() = Some(err);
-                            HashMap::new()
-                        }
-                    }
-                } else {
-                    HashMap::new()
-                };
-
-                // 2. Expand alias references before qualification so same-select
-                // aliases do not get treated as unresolved physical columns.
-                if first_error.borrow().is_none() && options.expand_alias_refs {
-                    if let Err(err) = expand_alias_refs(&mut select, &mut resolver, dialect) {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 3. A parsed `column.field` is indistinguishable from `table.column`.
-                // Normalize an apparent qualifier that resolves as a column before
-                // regular qualification rejects it as an unknown table.
-                if first_error.borrow().is_none() {
-                    if let Err(err) =
-                        normalize_dotted_columns_in_scope(&mut select, &scope, &mut resolver)
-                    {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 4. Qualify columns (add table qualifiers)
-                if first_error.borrow().is_none() {
-                    if let Err(err) = qualify_columns_in_scope(
-                        &mut select,
-                        &scope,
-                        &mut resolver,
-                        options.allow_partial_qualification,
-                    ) {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 5. Expand star expressions (with USING deduplication)
-                if first_error.borrow().is_none() && options.expand_stars {
-                    if let Err(err) =
-                        expand_stars(&mut select, &scope, &mut resolver, &column_tables)
-                    {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 6. Qualify outputs
-                if first_error.borrow().is_none() {
-                    if let Err(err) = qualify_outputs_select(&mut select) {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 7. Expand GROUP BY positional refs
-                if first_error.borrow().is_none() {
-                    if let Err(err) = expand_group_by(&mut select, dialect) {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                Ok(Expression::Select(select))
+    let mut ctes = inherited_ctes.clone();
+    let with = match &mut expression {
+        Expression::Select(query) => query.with.take(),
+        Expression::Union(query) => query.with.take(),
+        Expression::Intersect(query) => query.with.take(),
+        Expression::Except(query) => query.with.take(),
+        _ => return qualify_nested_queries(expression, schema, options, inherited_ctes, outer),
+    };
+    let mut with = with;
+    if let Some(with) = &mut with {
+        pushdown_cte_alias_columns_with(with);
+        for cte in &mut with.ctes {
+            let name = cte.alias.name.clone();
+            if with.recursive {
+                ctes.retain(|existing, _| {
+                    normalize_name(existing, dialect, true, true)
+                        != normalize_name(&name, dialect, true, true)
+                });
+                ctes.insert(
+                    name.clone(),
+                    SourceInfo::new(
+                        Expression::Cte(Box::new(cte.clone())),
+                        true,
+                        SourceKind::Cte,
+                    ),
+                );
             }
-            _ => Ok(node),
+            // A CTE cannot capture sources of its containing SELECT, but it may
+            // reference a genuinely enclosing correlated query.
+            cte.this = qualify_nested_queries(cte.this.clone(), schema, options, &ctes, outer)?;
+            ctes.retain(|existing, _| {
+                normalize_name(existing, dialect, true, true)
+                    != normalize_name(&name, dialect, true, true)
+            });
+            ctes.insert(
+                name,
+                SourceInfo::new(
+                    Expression::Cte(Box::new(cte.clone())),
+                    true,
+                    SourceKind::Cte,
+                ),
+            );
         }
-    })
-    .map_err(|err| QualifyColumnsError::CannotAutoJoin(err.to_string()))?;
-
-    if let Some(err) = first_error.into_inner() {
-        return Err(err);
     }
 
-    Ok(transformed)
+    if let Expression::Select(select) = &mut expression {
+        // Derived relations are qualified before consumers of their outputs.
+        // A normal derived table cannot capture the containing SELECT's sources.
+        let joins = std::mem::take(&mut select.joins);
+        if let Some(from) = &mut select.from {
+            let sources = std::mem::take(&mut from.expressions);
+            for source in sources {
+                let mut visible_outer = outer.to_vec();
+                if is_lateral_source(&source) {
+                    visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
+                        &Expression::Select(select.clone()),
+                        &ctes,
+                    )));
+                }
+                let qualified =
+                    qualify_nested_queries(source, schema, options, &ctes, &visible_outer)?;
+                select.from.as_mut().unwrap().expressions.push(qualified);
+            }
+        }
+        for mut join in joins {
+            let mut visible_outer = outer.to_vec();
+            if is_lateral_source(&join.this)
+                || matches!(
+                    join.kind,
+                    JoinKind::Lateral
+                        | JoinKind::LeftLateral
+                        | JoinKind::CrossApply
+                        | JoinKind::OuterApply
+                )
+            {
+                visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
+                    &Expression::Select(select.clone()),
+                    &ctes,
+                )));
+            }
+            join.this = qualify_nested_queries(join.this, schema, options, &ctes, &visible_outer)?;
+            select.joins.push(join);
+        }
+    }
+
+    if matches!(expression, Expression::Select(_)) {
+        let scope = selected_reference_scope(&build_scope_with_ctes(&expression, &ctes));
+        let mut nested_outer = outer.to_vec();
+        nested_outer.push(scope.clone());
+        // Temporarily detach relation queries: they were already visited, and
+        // unlike scalar subqueries must not see this SELECT as a parent.
+        let Expression::Select(select) = &mut expression else {
+            unreachable!()
+        };
+        let from = select.from.take();
+        let mut joins = std::mem::take(&mut select.joins);
+        let mut error = None;
+        crate::ast_children::for_each_child_mut(&mut expression, |child| {
+            if error.is_none() {
+                match qualify_nested_queries(child.clone(), schema, options, &ctes, &nested_outer) {
+                    Ok(qualified) => *child = qualified,
+                    Err(err) => error = Some(err),
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        for join in &mut joins {
+            if let Some(on) = &mut join.on {
+                *on = qualify_nested_queries(on.clone(), schema, options, &ctes, &nested_outer)?;
+            }
+        }
+        let Expression::Select(select) = &mut expression else {
+            unreachable!()
+        };
+        select.from = from;
+        select.joins = joins;
+        let mut resolver = Resolver::new(&scope, schema, infer_schema).with_outer_scopes(outer);
+        let column_tables = expand_using(select, &scope, &mut resolver)?;
+        if options.expand_alias_refs {
+            expand_alias_refs(select, &mut resolver, dialect)?;
+        }
+        normalize_dotted_columns_in_scope(select, &scope, &mut resolver)?;
+        qualify_columns_in_scope(
+            select,
+            &scope,
+            &mut resolver,
+            options.allow_partial_qualification,
+        )?;
+        if options.expand_stars {
+            expand_stars(select, &scope, &mut resolver, &column_tables)?;
+        }
+        qualify_outputs_select(select)?;
+        expand_group_by(select, dialect)?;
+        select.with = with;
+    } else {
+        let (left, right) = match &mut expression {
+            Expression::Union(query) => (&mut query.left, &mut query.right),
+            Expression::Intersect(query) => (&mut query.left, &mut query.right),
+            Expression::Except(query) => (&mut query.left, &mut query.right),
+            _ => unreachable!(),
+        };
+        *left = qualify_nested_queries(left.clone(), schema, options, &ctes, outer)?;
+        *right = qualify_nested_queries(right.clone(), schema, options, &ctes, outer)?;
+        match &mut expression {
+            Expression::Union(query) => query.with = with,
+            Expression::Intersect(query) => query.with = with,
+            Expression::Except(query) => query.with = with,
+            _ => unreachable!(),
+        }
+    }
+    Ok(expression)
 }
 
 /// Validate that all columns in an expression are qualified.
@@ -661,7 +824,7 @@ fn rewrite_using_columns_in_expression(
     column_tables: &HashMap<String, Vec<String>>,
     dialect: Option<DialectType>,
 ) {
-    let transformed = transform_recursive(expr.clone(), &|node| match node {
+    let transformed: crate::Result<_> = transform_in_scope(expr.clone(), |node| match node {
         Expression::Column(col) if col.table.is_none() => {
             let normalized = normalize_column_name(&col.name.name, dialect);
             if let Some(tables) = column_tables.get(&normalized) {
@@ -685,18 +848,7 @@ fn rewrite_using_columns_in_expression(
 /// unambiguous column in the current scope, rewrite it to a [`DotAccess`] rooted
 /// at the qualified source column. Validation calls this same helper so it uses
 /// exactly the same interpretation as schema-aware analysis and lineage.
-pub(crate) fn normalize_dotted_columns(
-    select: &mut Select,
-    schema: &dyn Schema,
-    infer_schema: bool,
-) -> QualifyColumnsResult<()> {
-    let scope_expression = Expression::Select(Box::new(select.clone()));
-    let scope = build_scope(&scope_expression);
-    let mut resolver = Resolver::new(&scope, schema, infer_schema);
-    normalize_dotted_columns_in_scope(select, &scope, &mut resolver)
-}
-
-fn normalize_dotted_columns_in_scope(
+pub(crate) fn normalize_dotted_columns_in_scope(
     select: &mut Select,
     scope: &Scope,
     resolver: &mut Resolver,
@@ -732,13 +884,13 @@ fn normalize_dotted_columns_in_scope(
     Ok(())
 }
 
-fn normalize_dotted_columns_in_expression(
+pub(crate) fn normalize_dotted_columns_in_expression(
     expression: &mut Expression,
     scope: &Scope,
     resolver: &mut Resolver,
 ) -> QualifyColumnsResult<()> {
     let resolver = RefCell::new(resolver);
-    let transformed = transform_recursive(expression.clone(), &|node| {
+    let transformed = transform_in_scope(expression.clone(), |node| {
         let Expression::Column(column) = node else {
             return Ok(node);
         };
@@ -750,7 +902,7 @@ fn normalize_dotted_columns_in_expression(
             .sources
             .keys()
             .any(|source| source.eq_ignore_ascii_case(&root.name));
-        if root_is_source {
+        if root_is_source || resolver.borrow().outer_source_exists(&root.name) {
             return Ok(Expression::Column(column));
         }
 
@@ -773,7 +925,7 @@ fn normalize_dotted_columns_in_expression(
             inferred_type: None,
         })))
     })
-    .map_err(|error| QualifyColumnsError::CannotAutoJoin(error.to_string()))?;
+    .map_err(|error: crate::Error| QualifyColumnsError::CannotAutoJoin(error.to_string()))?;
 
     *expression = transformed;
     Ok(())
@@ -1071,7 +1223,7 @@ fn qualify_columns_in_expression(
     let first_error: RefCell<Option<QualifyColumnsError>> = RefCell::new(None);
     let resolver_cell: RefCell<&mut Resolver> = RefCell::new(resolver);
 
-    let transformed = transform_recursive(expr.clone(), &|node| {
+    let transformed = transform_in_scope(expr.clone(), |node| {
         if first_error.borrow().is_some() {
             return Ok(node);
         }
@@ -1091,7 +1243,7 @@ fn qualify_columns_in_expression(
             _ => Ok(node),
         }
     })
-    .map_err(|err| QualifyColumnsError::CannotAutoJoin(err.to_string()))?;
+    .map_err(|err: crate::Error| QualifyColumnsError::CannotAutoJoin(err.to_string()))?;
 
     if let Some(err) = first_error.into_inner() {
         return Err(err);
@@ -1113,17 +1265,18 @@ fn qualify_single_column(
 
     if let Some(table) = &col.table {
         let table_name = &table.name;
-        if !scope.sources.contains_key(table_name) {
-            // Allow correlated references: if the table exists in the schema
-            // but not in the current scope, it may be referencing an outer scope
-            // (e.g., in a correlated scalar subquery).
-            if resolver.table_exists_in_schema(table_name) {
+        let source_name = scope.sources.keys().find(|source| {
+            normalize_name(source, resolver.dialect, true, true)
+                == normalize_name(table_name, resolver.dialect, true, true)
+        });
+        let Some(source_name) = source_name else {
+            if resolver.outer_source_exists(table_name) {
                 return Ok(());
             }
             return Err(QualifyColumnsError::UnknownTable(table_name.clone()));
-        }
+        };
 
-        if let Ok(source_columns) = resolver.get_source_columns(table_name) {
+        if let Ok(source_columns) = resolver.get_source_columns(source_name) {
             let normalized_column_name = normalize_column_name(&col.name.name, resolver.dialect);
             if !allow_partial
                 && !source_columns.is_empty()
@@ -1138,14 +1291,18 @@ fn qualify_single_column(
         return Ok(());
     }
 
+    if resolver.is_ambiguous(&col.name.name) {
+        if allow_partial {
+            return Ok(());
+        }
+        return Err(QualifyColumnsError::AmbiguousColumn(col.name.name.clone()));
+    }
     if let Some(table_name) = resolver.get_table(&col.name.name) {
         col.table = Some(Identifier::new(table_name));
         return Ok(());
     }
 
-    // Check for correlated reference: column might belong to an outer scope table.
-    // Search all schema tables not in the current scope for this column.
-    if let Some(outer_table) = resolver.find_column_in_outer_schema_tables(&col.name.name) {
+    if let Some(outer_table) = resolver.find_column_in_outer_scopes(&col.name.name) {
         col.table = Some(Identifier::new(outer_table));
         return Ok(());
     }
@@ -1166,7 +1323,7 @@ fn replace_alias_refs_in_expression(
     alias_to_expression: &HashMap<String, (Expression, usize)>,
     literal_index: bool,
 ) {
-    let transformed = transform_recursive(expr.clone(), &|node| match node {
+    let transformed: crate::Result<_> = transform_in_scope(expr.clone(), |node| match node {
         Expression::Column(col) if col.table.is_none() => {
             if let Some((alias_expr, index)) = alias_to_expression.get(&col.name.name) {
                 if literal_index && matches!(alias_expr, Expression::Literal(_)) {
@@ -2946,6 +3103,67 @@ mod tests {
         assert!(!options.expand_stars);
         assert_eq!(options.dialect, Some(DialectType::PostgreSQL));
         assert!(options.allow_partial_qualification);
+    }
+
+    #[test]
+    fn test_qualify_cte_chain_uses_lexically_selected_sources() {
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table("raw_orders", &[("amount".into(), DataType::Text)], None)
+            .unwrap();
+        let sql = "WITH transformed AS (SELECT CAST(amount AS INT) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final";
+        let qualified =
+            qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new()).unwrap();
+        assert_eq!(gen(&qualified), "WITH transformed AS (SELECT CAST(raw_orders.amount AS INT) AS amount FROM raw_orders), final AS (SELECT transformed.amount AS amount FROM transformed) SELECT final.amount AS amount FROM final");
+    }
+
+    #[test]
+    fn test_qualify_does_not_capture_unrelated_schema_tables() {
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table("unrelated", &[("n".into(), DataType::Text)], None)
+            .unwrap();
+        for sql in ["SELECT n FROM missing", "SELECT unrelated.n FROM missing"] {
+            assert!(
+                qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new()).is_err(),
+                "{sql}"
+            );
+        }
+        let sql = "SELECT n FROM missing";
+        let qualified = qualify_columns(
+            parse(sql),
+            &schema,
+            &QualifyColumnsOptions::new().with_allow_partial(true),
+        )
+        .unwrap();
+        assert_eq!(gen(&qualified), "SELECT n AS n FROM missing");
+        assert!(matches!(
+            qualify_columns(
+                parse(
+                    "WITH a AS (SELECT 1 AS n), b AS (SELECT 2 AS n) SELECT n FROM a CROSS JOIN b"
+                ),
+                &schema,
+                &QualifyColumnsOptions::new()
+            ),
+            Err(QualifyColumnsError::AmbiguousColumn(_))
+        ));
+    }
+
+    #[test]
+    fn test_qualify_correlated_cte_alias_and_nested_shadowing() {
+        let schema = MappingSchema::new();
+        for (sql, expected) in [
+            ("WITH a AS (SELECT 1 AS n) SELECT (SELECT n) AS result FROM a AS outer_a", "(SELECT outer_a.n AS n)"),
+            ("WITH a AS (SELECT 1 AS n) SELECT (SELECT (SELECT n)) AS result FROM a AS outer_a", "(SELECT outer_a.n AS n)"),
+            ("WITH a AS (SELECT 1 AS n) SELECT (WITH b AS (SELECT n) SELECT n FROM b) AS result FROM a AS outer_a", "WITH b AS (SELECT outer_a.n AS n) SELECT b.n AS n FROM b"),
+            ("WITH a AS (SELECT 1 AS n) SELECT (WITH a AS (SELECT 2 AS m) SELECT m FROM a) AS result FROM a", "SELECT a.m AS m FROM a"),
+            ("WITH a AS (SELECT 1 AS n) SELECT b.n FROM a JOIN LATERAL (SELECT a.n) AS b ON TRUE", "SELECT a.n AS n"),
+            ("WITH a AS (SELECT 1 AS n) SELECT b.n FROM a, LATERAL (SELECT a.n) AS b", "SELECT a.n AS n"),
+        ] {
+            let qualified = qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new())
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert!(gen(&qualified).contains(expected), "{}", gen(&qualified));
+        }
     }
 
     #[test]

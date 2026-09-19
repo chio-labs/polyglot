@@ -41,6 +41,11 @@ const expressionVariantNames: ExactExpressionVariantRegistry =
   EXPRESSION_VARIANT_NAMES;
 const expressionVariantNameSet = new Set<string>(expressionVariantNames);
 
+export type ExpressionBySingleKey<K extends ExpressionType> = Extract<
+  Expression,
+  Record<K, unknown>
+>;
+
 /**
  * Extract a specific Expression variant by its key name.
  *
@@ -50,10 +55,18 @@ const expressionVariantNameSet = new Set<string>(expressionVariantNames);
  * // => { "select": Select }
  * ```
  */
-export type ExpressionByKey<K extends ExpressionType> = Extract<
-  Expression,
-  Record<K, unknown>
->;
+export type ExpressionByKey<K extends ExpressionType> = K extends unknown
+  ? ExpressionBySingleKey<K>
+  : never;
+
+type IsUnionExpressionType<T, Whole = T> = T extends unknown
+  ? [Whole] extends [T]
+    ? false
+    : true
+  : never;
+
+export type SingleExpressionType<T extends ExpressionType> = T &
+  (IsUnionExpressionType<T> extends true ? never : unknown);
 
 /**
  * Extract the inner data type of a specific Expression variant.
@@ -64,20 +77,45 @@ export type ExpressionByKey<K extends ExpressionType> = Extract<
  * // => Select
  * ```
  */
-export type ExpressionInner<K extends ExpressionType> =
-  ExpressionByKey<K> extends Record<K, infer V> ? V : never;
+export type ExpressionInner<K extends ExpressionType> = K extends unknown
+  ? ExpressionByKey<K> extends Record<K, infer V>
+    ? V
+    : never
+  : never;
+
+/**
+ * Extract the payload type from one or more Expression variants.
+ *
+ * A completely unnarrowed Expression returns unknown to avoid materializing
+ * the entire generated payload union. Narrowed expressions retain their exact
+ * generated payload type.
+ */
+export type ExpressionData<E extends Expression> = [Expression] extends [E]
+  ? unknown
+  : E extends unknown
+    ? E[keyof E]
+    : never;
+
+/** Extract the variant key from one or more Expression variants. */
+export type ExpressionTypeOf<E extends Expression> = E extends unknown
+  ? Extract<keyof E, string>
+  : never;
 
 /**
  * Get the type tag (variant key) of an Expression at runtime.
  *
  * @example
  * ```typescript
- * const expr = parse("SELECT 1")[0];
- * getExprType(expr) // => "select"
+ * const result = parse("SELECT 1");
+ * if (result.success) {
+ *   getExprType(result.ast[0]); // => "select"
+ * }
  * ```
  */
-export function getExprType(expr: Expression): ExpressionType {
-  return Object.keys(expr)[0] as ExpressionType;
+export function getExprType<E extends Expression>(
+  expr: E,
+): ExpressionTypeOf<E> {
+  return Object.keys(expr)[0] as ExpressionTypeOf<E>;
 }
 
 /**
@@ -85,14 +123,16 @@ export function getExprType(expr: Expression): ExpressionType {
  *
  * @example
  * ```typescript
- * const expr = parse("SELECT 1")[0];
- * const selectData = getExprData(expr);
- * // selectData.expressions, selectData.from, etc.
+ * const result = parse("SELECT 1");
+ * if (result.success && isExpressionType(result.ast[0], 'select')) {
+ *   const selectData = getExprData(result.ast[0]);
+ *   // selectData.expressions, selectData.from, etc.
+ * }
  * ```
  */
-export function getExprData(expr: Expression): Record<string, unknown> {
+export function getExprData<E extends Expression>(expr: E): ExpressionData<E> {
   const key = Object.keys(expr)[0];
-  return (expr as Record<string, unknown>)[key] as Record<string, unknown>;
+  return (expr as Record<string, unknown>)[key] as ExpressionData<E>;
 }
 
 /**
@@ -102,6 +142,9 @@ export function getExprData(expr: Expression): Record<string, unknown> {
  * key is one of the variants generated from Rust's `Expression` enum.
  * Checking the exact variant registry prevents one-field payload structs such
  * as `{ this: expression }` from being exposed as phantom expression nodes.
+ * DataType's own `data_type` discriminator also matches an Expression variant:
+ * `{ data_type: 'date' }` is a descriptor, whereas the expression envelope is
+ * `{ data_type: { data_type: 'date' } }`.
  */
 export function isExpressionValue(value: unknown): value is Expression {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -109,7 +152,16 @@ export function isExpressionValue(value: unknown): value is Expression {
   }
   const keys = Object.keys(value);
   if (keys.length !== 1) return false;
-  return expressionVariantNameSet.has(keys[0]);
+  const key = keys[0];
+  if (!expressionVariantNameSet.has(key)) return false;
+  if (key === 'data_type') {
+    const payload = (value as Record<string, unknown>)[key];
+    return (
+      typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+    );
+  }
+  // Other variants can legitimately carry scalars, e.g. column_position: 'First'.
+  return true;
 }
 
 /**
@@ -151,5 +203,13 @@ export function getInferredType(expr: Expression): DataType | undefined {
       return it as DataType;
     }
   }
+
+  if ('paren' in expr || 'annotated' in expr) {
+    const nestedExpression = getExprData(expr).this;
+    if (isExpressionValue(nestedExpression)) {
+      return getInferredType(nestedExpression);
+    }
+  }
+
   return undefined;
 }

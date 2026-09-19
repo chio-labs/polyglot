@@ -68,6 +68,8 @@ export interface TranspileOptions {
 }
 
 export interface ComplexityGuardOptions {
+  /** Logical parser nesting limit (WASM default 32). Raising it or using null can permit stack exhaustion. */
+  maxParserDepth?: number | null;
   /** Maximum SQL input size in bytes */
   maxInputBytes?: number | null;
   /** Maximum token count after tokenization */
@@ -93,28 +95,43 @@ export interface TranspileResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
-/**
- * Result of a parse operation
- */
-export interface ParseResult {
-  success: boolean;
-  ast?: any;
-  error?: string;
+interface ParseResultMetadata {
   /** 1-based line number where the error occurred */
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
+
+/** Result of a successful parse operation. */
+export interface ParseSuccessResult extends ParseResultMetadata {
+  success: true;
+  ast: Expression[];
+  error?: null;
+}
+
+/** Result of a failed parse operation. */
+export interface ParseFailureResult extends ParseResultMetadata {
+  success: false;
+  ast?: null;
+  error: string;
+}
+
+/** Result of a parse operation. */
+export type ParseResult = ParseSuccessResult | ParseFailureResult;
+
+type SerializedParseResult =
+  | (Omit<ParseSuccessResult, 'ast'> & { ast: string })
+  | ParseFailureResult;
 
 /**
  * Result of a standalone data type parse operation
@@ -127,9 +144,9 @@ export interface DataTypeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -144,9 +161,9 @@ export interface GenerateDataTypeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -182,9 +199,9 @@ export interface TokenizeResult {
   errorLine?: number;
   /** 1-based column number where the error occurred */
   errorColumn?: number;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range */
   errorStart?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   errorEnd?: number;
 }
 
@@ -304,6 +321,45 @@ export interface QueryAnalysis {
   baseTables: RelationFact[];
   starProjections: StarProjectionFact[];
   setOperations: SetOperationFact[];
+  /** Present in current runtimes; optional for compatibility with older WASM builds. */
+  columnUses?: ColumnUseFact[];
+}
+
+/** Half-open offsets in original SQL, measured in Unicode characters, not UTF-16 units. */
+export interface QuerySourceSpan {
+  start: number;
+  end: number;
+}
+
+export type ColumnUseContext =
+  | 'join'
+  | 'filter'
+  | 'group'
+  | 'having'
+  | 'qualify'
+  | 'window_partition'
+  | 'window_order'
+  | 'window_frame'
+  | 'order'
+  | 'aggregate_order'
+  | 'set_operation_filter';
+
+export interface ColumnUseReferenceFact extends ColumnReferenceFact {
+  /** Original occurrence, not the upstream column definition. */
+  span?: QuerySourceSpan;
+}
+
+export interface ColumnUseFact {
+  context: ColumnUseContext;
+  /** Deterministic scope path, including CTE/subquery/set-operation branch indices. */
+  scopePath: string;
+  /** AST field/index path relative to the scope. Not a persistent ID across edits. */
+  expressionPath: string;
+  /** Dialect-rendered SQL, not necessarily the original source text. */
+  expressionSql: string;
+  /** Only present when a complete original expression range is available. */
+  span?: QuerySourceSpan;
+  references: ColumnUseReferenceFact[];
 }
 
 export interface QueryAnalysisResult {
@@ -549,9 +605,14 @@ export function parse(
       return decodeWasmPayload<ParseResult>(wasm.parse_value(sql, dialect));
     }
 
-    const result = JSON.parse(wasm.parse(sql, dialect)) as ParseResult;
-    if (result.success && typeof result.ast === 'string') {
-      result.ast = JSON.parse(result.ast);
+    const result = JSON.parse(
+      wasm.parse(sql, dialect),
+    ) as SerializedParseResult;
+    if (result.success) {
+      return {
+        ...result,
+        ast: JSON.parse(result.ast) as Expression[],
+      };
     }
     return result;
   } catch (error) {

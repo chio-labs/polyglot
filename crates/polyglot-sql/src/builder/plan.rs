@@ -4,7 +4,8 @@
 //! provides a serializable, immutable expression plan so language bindings can
 //! share coercion, parsing, and AST-editing semantics without duplicating them.
 
-use crate::builder::{self, engine, Expr};
+use crate::ast_mutation as engine;
+use crate::builder::{self, Expr};
 use crate::dialects::Dialect;
 use crate::error::{Error, Result};
 use crate::expressions::*;

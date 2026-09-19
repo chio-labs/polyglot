@@ -7,22 +7,27 @@
 
 use crate::ast_transforms::get_output_column_names_for_dialect;
 use crate::dialects::{Dialect, DialectType};
-use crate::expressions::{DataType, Expression, JoinKind, TableRef, With};
-use crate::lineage::{lineage_by_index_from_expression, LineageNode};
+use crate::expressions::{DataType, Expression, Identifier, JoinKind, TableRef, With};
+use crate::lineage::{LineageNode, ScopedLineage};
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_schema_aware_expression;
 use crate::schema::{MappingSchema, Schema};
 use crate::scope::{build_scope, Scope, SourceInfo, SourceKind};
 use crate::traversal::{contains_aggregate, ExpressionWalk};
 use crate::validation::{mapping_schema_from_validation_schema_with_dialect, ValidationSchema};
-use crate::{parse_one, Error, Result};
+use crate::{parse_one_with_options, ComplexityGuardOptions, Error, ParseOptions, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+mod column_uses;
 
 /// Options for [`analyze_query`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AnalyzeQueryOptions {
+    /// Per-call limits used for parsing and rendering analysis facts.
+    pub complexity_guard: Option<ComplexityGuardOptions>,
     /// SQL dialect used for parsing and dialect-aware rendering.
     pub dialect: DialectType,
     /// Optional validation schema used for qualification and type annotation.
@@ -41,6 +46,60 @@ pub struct QueryAnalysis {
     pub base_tables: Vec<RelationFact>,
     pub star_projections: Vec<StarProjectionFact>,
     pub set_operations: Vec<SetOperationFact>,
+    /// Clause-specific uses, separate from output projection lineage.
+    #[serde(default)]
+    pub column_uses: Vec<ColumnUseFact>,
+}
+
+/// A half-open range in the original SQL, measured in Unicode characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuerySourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The syntactic role of a column-containing expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnUseContext {
+    Join,
+    Filter,
+    Group,
+    Having,
+    Qualify,
+    WindowPartition,
+    WindowOrder,
+    WindowFrame,
+    Order,
+    AggregateOrder,
+    SetOperationFilter,
+}
+
+/// One resolved dependency of an original column occurrence. Several terminal
+/// dependencies can share a span (for example, a reference to a computed CTE
+/// column). Spans identify the use, not the upstream column's definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnUseReferenceFact {
+    #[serde(flatten)]
+    pub reference: ColumnReferenceFact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<QuerySourceSpan>,
+}
+
+/// One containing expression, with references in occurrence order. Paths are
+/// deterministic within an analysis, not persistent IDs across SQL edits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnUseFact {
+    pub context: ColumnUseContext,
+    pub scope_path: String,
+    pub expression_path: String,
+    /// Dialect-rendered SQL; not necessarily the original source substring.
+    pub expression_sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<QuerySourceSpan>,
+    pub references: Vec<ColumnUseReferenceFact>,
 }
 
 /// Top-level query shape.
@@ -182,9 +241,16 @@ pub enum ProjectionNullability {
 
 /// Analyze a single SELECT or set-operation query.
 pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAnalysis> {
-    let mut expression = parse_one(sql, options.dialect)?;
+    let mut expression = parse_one_with_options(
+        sql,
+        options.dialect,
+        &ParseOptions {
+            complexity_guard: options.complexity_guard,
+        },
+    )?;
     expression = effective_query(expression);
     ensure_query(&expression)?;
+    expression = crate::binding::bind_lambdas(expression, options.dialect);
     let original_expression = expression.clone();
 
     let mapping_schema = options
@@ -192,7 +258,11 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         .as_ref()
         .map(|schema| analysis_mapping_schema(schema, options.dialect));
     let schema_info = options.schema.as_ref().map(AnalysisSchemaInfo::from_schema);
-    let cte_facts = top_level_cte_facts(&original_expression, options.dialect)?;
+    let cte_facts = top_level_cte_facts(
+        &original_expression,
+        options.dialect,
+        options.complexity_guard,
+    )?;
     let star_projections = star_projection_facts(
         &original_expression,
         mapping_schema.as_ref(),
@@ -200,25 +270,55 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     );
 
     if let Some(schema) = mapping_schema.as_ref() {
-        expression = qualify_schema_aware_expression(expression, schema, Some(options.dialect))
-            .map_err(|e| Error::internal(format!("query analysis qualification failed: {e}")))?;
+        use crate::optimizer::qualify_columns::QualifyColumnsError;
+        expression = match qualify_schema_aware_expression(
+            expression.clone(),
+            schema,
+            Some(options.dialect),
+        ) {
+            Ok(qualified) => qualified,
+            // Analysis is not validation. Incomplete schemas and unresolved
+            // lexical references must still yield conservative usage facts.
+            Err(
+                QualifyColumnsError::UnknownTable(_)
+                | QualifyColumnsError::UnknownColumn(_)
+                | QualifyColumnsError::AmbiguousColumn(_)
+                | QualifyColumnsError::ColumnNotResolved { .. },
+            ) => expression,
+            Err(error) => {
+                return Err(Error::internal(format!(
+                    "query analysis qualification failed: {error}"
+                )))
+            }
+        };
     }
 
+    crate::lineage::expand_cte_stars(
+        &mut expression,
+        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
+    );
     annotate_types(
         &mut expression,
         mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
         Some(options.dialect),
     );
-    crate::lineage::expand_cte_stars(
-        &mut expression,
-        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
-    );
 
     let scope = build_scope(&expression);
-    let nullability_context = NullabilityContext {
-        schema: schema_info.as_ref(),
-        nullable_sources: nullable_source_names(&expression),
-    };
+    let original_scope = build_scope(&original_expression);
+    let empty_schema = MappingSchema::with_dialect(options.dialect);
+    let mut uncertain_columns = HashMap::new();
+    column_uses::collect_uncertain_occurrences(
+        &original_scope,
+        mapping_schema.as_ref().unwrap_or(&empty_schema),
+        &mut uncertain_columns,
+    );
+    let nullability_context = NullabilityContext::new(
+        &scope,
+        schema_info.as_ref(),
+        mapping_schema.as_ref(),
+        options.dialect,
+        &uncertain_columns,
+    );
     let shape = if is_set_operation(&expression) {
         QueryShape::SetOperation
     } else {
@@ -238,7 +338,20 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         relations: relation_facts(&scope, mapping_schema.as_ref(), options.dialect),
         base_tables: base_table_facts(&scope, mapping_schema.as_ref(), options.dialect),
         star_projections,
-        set_operations: set_operation_facts(&expression, &scope, options.dialect),
+        set_operations: set_operation_facts(
+            &expression,
+            &scope,
+            options.dialect,
+            &nullability_context,
+        ),
+        column_uses: column_uses::collect(
+            &original_scope,
+            &scope,
+            mapping_schema.as_ref(),
+            options.dialect,
+            &uncertain_columns,
+            options.complexity_guard,
+        ),
     })
 }
 
@@ -318,11 +431,121 @@ impl AnalysisSchemaInfo {
 }
 
 struct NullabilityContext<'a> {
+    lineage: RefCell<HashMap<*const Scope, ScopedLineage>>,
     schema: Option<&'a AnalysisSchemaInfo>,
+    mapping_schema: Option<&'a MappingSchema>,
+    empty_schema: MappingSchema,
+    dialect: DialectType,
+    scopes: Vec<NullabilityScope<'a>>,
+    scope_ids: HashMap<*const Scope, usize>,
+    outputs: RefCell<HashMap<(usize, usize), ProjectionNullability>>,
+    resolving: RefCell<HashSet<(usize, usize)>>,
+    uncertain_columns: &'a HashMap<(usize, usize), ReferenceConfidence>,
+}
+
+struct NullabilityScope<'a> {
+    scope: &'a Scope,
+    selected: Scope,
+    bindings: HashMap<String, &'a Expression>,
+    ctes: HashMap<String, usize>,
+    derived: Vec<usize>,
+    branches: Vec<usize>,
     nullable_sources: HashSet<String>,
 }
 
-fn top_level_cte_facts(expression: &Expression, dialect: DialectType) -> Result<Vec<CteFact>> {
+impl<'a> NullabilityContext<'a> {
+    fn new(
+        scope: &'a Scope,
+        schema: Option<&'a AnalysisSchemaInfo>,
+        mapping_schema: Option<&'a MappingSchema>,
+        dialect: DialectType,
+        uncertain_columns: &'a HashMap<(usize, usize), ReferenceConfidence>,
+    ) -> Self {
+        let mut context = Self {
+            lineage: RefCell::new(HashMap::new()),
+            schema,
+            mapping_schema,
+            empty_schema: MappingSchema::with_dialect(dialect),
+            dialect,
+            scopes: Vec::new(),
+            scope_ids: HashMap::new(),
+            outputs: RefCell::new(HashMap::new()),
+            resolving: RefCell::new(HashSet::new()),
+            uncertain_columns,
+        };
+        context.index_scope(scope, HashMap::new(), None);
+        context
+    }
+
+    // Keep each CTE's definition environment, rather than resolving it in the
+    // environment of a later consumer that may shadow the same names.
+    fn index_scope(
+        &mut self,
+        scope: &'a Scope,
+        mut ctes: HashMap<String, usize>,
+        recursive_name: Option<&Identifier>,
+    ) -> usize {
+        let id = self.scopes.len();
+        self.scope_ids.insert(scope, id);
+        if let Some(name) = recursive_name {
+            ctes.insert(
+                crate::set_operation::identifier_key(name, Some(self.dialect)),
+                id,
+            );
+        }
+        let query = crate::scope::scope_query(&scope.expression);
+        let bindings: HashMap<_, _> = if let Expression::Select(select) = query {
+            select
+                .from
+                .iter()
+                .flat_map(|from| &from.expressions)
+                .chain(select.joins.iter().map(|join| &join.this))
+                .filter_map(|expression| {
+                    expression_source_name(expression).map(|name| (name, expression))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        self.scopes.push(NullabilityScope {
+            scope,
+            selected: crate::scope::selected_reference_scope(scope),
+            bindings,
+            ctes: HashMap::new(),
+            derived: Vec::new(),
+            branches: Vec::new(),
+            nullable_sources: nullable_source_names(query, self.dialect),
+        });
+        let recursive = with_clause(crate::scope::scope_query(&scope.expression))
+            .is_some_and(|with| with.recursive);
+        for child in &scope.cte_scopes {
+            if let Expression::Cte(cte) = &child.expression {
+                let name = &cte.alias;
+                let child_id = self.index_scope(child, ctes.clone(), recursive.then_some(name));
+                ctes.insert(
+                    crate::set_operation::identifier_key(name, Some(self.dialect)),
+                    child_id,
+                );
+            }
+        }
+        self.scopes[id].ctes = ctes.clone();
+        for child in &scope.derived_table_scopes {
+            let child_id = self.index_scope(child, ctes.clone(), None);
+            self.scopes[id].derived.push(child_id);
+        }
+        for child in &scope.union_scopes {
+            let child_id = self.index_scope(child, ctes.clone(), None);
+            self.scopes[id].branches.push(child_id);
+        }
+        id
+    }
+}
+
+fn top_level_cte_facts(
+    expression: &Expression,
+    dialect: DialectType,
+    guard: Option<ComplexityGuardOptions>,
+) -> Result<Vec<CteFact>> {
     let Some(with_clause) = with_clause(expression) else {
         return Ok(Vec::new());
     };
@@ -338,7 +561,7 @@ fn top_level_cte_facts(expression: &Expression, dialect: DialectType) -> Result<
                     .iter()
                     .map(|column| column.name.clone())
                     .collect(),
-                body_sql: Dialect::get(dialect).generate(&cte.this)?,
+                body_sql: Dialect::get(dialect).generate_with_guard(&cte.this, guard)?,
                 output_columns: get_output_column_names_for_dialect(&cte.this, Some(dialect)),
             })
         })
@@ -454,41 +677,48 @@ fn ordered_source_names_for_select(select: &crate::expressions::Select) -> Vec<S
     sources
 }
 
-fn nullable_source_names(expression: &Expression) -> HashSet<String> {
+fn nullable_source_names(expression: &Expression, dialect: DialectType) -> HashSet<String> {
     match expression {
-        Expression::Select(select) => nullable_source_names_for_select(select),
-        Expression::Union(union) => nullable_source_names(&union.left),
-        Expression::Intersect(intersect) => nullable_source_names(&intersect.left),
-        Expression::Except(except) => nullable_source_names(&except.left),
-        Expression::Subquery(subquery) => nullable_source_names(&subquery.this),
+        Expression::Select(select) => nullable_source_names_for_select(select, dialect),
+        Expression::Union(union) => nullable_source_names(&union.left, dialect),
+        Expression::Intersect(intersect) => nullable_source_names(&intersect.left, dialect),
+        Expression::Except(except) => nullable_source_names(&except.left, dialect),
+        Expression::Subquery(subquery) => nullable_source_names(&subquery.this, dialect),
         _ => HashSet::new(),
     }
 }
 
-fn nullable_source_names_for_select(select: &crate::expressions::Select) -> HashSet<String> {
+fn nullable_source_names_for_select(
+    select: &crate::expressions::Select,
+    dialect: DialectType,
+) -> HashSet<String> {
     let mut nullable = HashSet::new();
     let mut left_sources = Vec::new();
 
     if let Some(from) = &select.from {
         for expression in &from.expressions {
-            if let Some(source_name) = expression_source_name(expression) {
-                left_sources.push(source_name);
+            if let Some(identifier) = expression_source_identifier(expression) {
+                left_sources.push(crate::set_operation::identifier_key(
+                    identifier,
+                    Some(dialect),
+                ));
             }
         }
     }
 
     for join in &select.joins {
-        let right_source = expression_source_name(&join.this);
+        let right_source = expression_source_identifier(&join.this)
+            .map(|identifier| crate::set_operation::identifier_key(identifier, Some(dialect)));
 
         if join_nullable_left(join.kind) {
             for source_name in &left_sources {
-                nullable.insert(normalize_lookup_name(source_name));
+                nullable.insert(source_name.clone());
             }
         }
 
         if join_nullable_right(join.kind) {
             if let Some(source_name) = &right_source {
-                nullable.insert(normalize_lookup_name(source_name));
+                nullable.insert(source_name.clone());
             }
         }
 
@@ -528,15 +758,15 @@ fn join_nullable_right(kind: JoinKind) -> bool {
 }
 
 fn expression_source_name(expression: &Expression) -> Option<String> {
+    expression_source_identifier(expression).map(|identifier| identifier.name.clone())
+}
+
+fn expression_source_identifier(expression: &Expression) -> Option<&Identifier> {
     match expression {
-        Expression::Table(table) => table
-            .alias
-            .as_ref()
-            .map(|alias| alias.name.clone())
-            .or_else(|| Some(table.name.name.clone())),
-        Expression::Subquery(subquery) => subquery.alias.as_ref().map(|alias| alias.name.clone()),
-        Expression::Alias(alias) => Some(alias.alias.name.clone()),
-        Expression::Cte(cte) => Some(cte.alias.name.clone()),
+        Expression::Table(table) => Some(table.alias.as_ref().unwrap_or(&table.name)),
+        Expression::Subquery(subquery) => subquery.alias.as_ref(),
+        Expression::Alias(alias) => Some(&alias.alias),
+        Expression::Cte(cte) => Some(&cte.alias),
         _ => None,
     }
 }
@@ -793,34 +1023,136 @@ fn projection_fact(
     index: usize,
     name: Option<String>,
     projection: &Expression,
-    query: &Expression,
+    _query: &Expression,
     scope: &Scope,
     dialect: DialectType,
     nullability_context: &NullabilityContext<'_>,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
-    let upstream = lineage_by_index_from_expression(index, query, Some(dialect), false)
-        .map(|node| terminal_references_from_lineage(&node))
+    let mut lineage = nullability_context.lineage.borrow_mut();
+    let prepared = lineage
+        .entry(scope as *const Scope)
+        .or_insert_with(|| ScopedLineage::new(scope.clone(), &[], dialect));
+    let mut upstream = prepared
+        .output(index)
+        .map(|node| {
+            let uncertain = lineage_uncertainty(&node, nullability_context.uncertain_columns);
+            let mut references = terminal_references_from_lineage(&node);
+            if let Some(confidence) = uncertain {
+                for reference in &mut references {
+                    reference.confidence = confidence;
+                }
+            }
+            references
+        })
         .ok()
         .filter(|refs| !refs.is_empty())
         .unwrap_or_else(|| fallback_column_references(inner, scope));
+    if let Some(confidence) = expression_uncertainty(inner, nullability_context.uncertain_columns) {
+        for reference in &mut upstream {
+            reference.confidence = confidence;
+        }
+    }
+    if let Some(schema) = nullability_context.mapping_schema {
+        for reference in &mut upstream {
+            if let Some(table) = &reference.table {
+                if let Ok(columns) = schema.column_names(table) {
+                    if !columns.is_empty()
+                        && !columns.iter().any(|column| {
+                            column == "*"
+                                || crate::schema::normalize_name(column, Some(dialect), false, true)
+                                    == crate::schema::normalize_name(
+                                        &reference.column,
+                                        Some(dialect),
+                                        false,
+                                        true,
+                                    )
+                        })
+                    {
+                        reference.confidence = ReferenceConfidence::Unknown;
+                    }
+                }
+            }
+        }
+    }
 
+    let mut transform_function = transform_function_fact(inner, scope, dialect);
+    if let Some(function) = &mut transform_function {
+        for reference in &mut function.column_args {
+            if let Some(upstream) = upstream.iter().find(|upstream| {
+                upstream.column == reference.column && upstream.table == reference.table
+            }) {
+                reference.confidence = upstream.confidence;
+            } else if upstream
+                .iter()
+                .any(|upstream| upstream.confidence != ReferenceConfidence::Resolved)
+            {
+                reference.confidence = ReferenceConfidence::Unknown;
+            }
+        }
+    }
     ProjectionFact {
         index,
         name,
         is_star,
         star_table: projection_star_table(inner),
         transform_kind: transform_kind(inner),
-        transform_function: transform_function_fact(inner, scope, dialect),
+        transform_function,
         cast_type: cast_type(inner, dialect),
         type_hint: projection
             .inferred_type()
             .or_else(|| inner.inferred_type())
             .and_then(|data_type| render_data_type(data_type, dialect)),
-        nullability: projection_nullability(inner, scope, nullability_context),
+        nullability: nullability_context
+            .scope_ids
+            .get(&(scope as *const Scope))
+            .map(|id| nullability_context.output(*id, index, 0))
+            .unwrap_or(ProjectionNullability::Unknown),
         upstream,
     }
+}
+
+fn expression_uncertainty(
+    expression: &Expression,
+    uncertain: &HashMap<(usize, usize), ReferenceConfidence>,
+) -> Option<ReferenceConfidence> {
+    combine_uncertainty(
+        crate::scope::walk_in_scope(expression, false).filter_map(|node| match node {
+            Expression::Column(column) => column
+                .span
+                .or(column.name.span)
+                .and_then(|span| uncertain.get(&(span.start, span.end)))
+                .copied(),
+            _ => None,
+        }),
+    )
+}
+
+fn combine_uncertainty(
+    confidences: impl Iterator<Item = ReferenceConfidence>,
+) -> Option<ReferenceConfidence> {
+    confidences.fold(None, |current, confidence| {
+        Some(
+            if current == Some(ReferenceConfidence::Ambiguous)
+                || confidence == ReferenceConfidence::Ambiguous
+            {
+                ReferenceConfidence::Ambiguous
+            } else {
+                confidence
+            },
+        )
+    })
+}
+
+fn lineage_uncertainty(
+    node: &LineageNode,
+    uncertain: &HashMap<(usize, usize), ReferenceConfidence>,
+) -> Option<ReferenceConfidence> {
+    combine_uncertainty(
+        node.walk()
+            .filter_map(|node| expression_uncertainty(&node.expression, uncertain)),
+    )
 }
 
 fn transform_function_fact(
@@ -1080,106 +1412,275 @@ fn is_simple_constant(expression: &Expression) -> bool {
     }
 }
 
-fn projection_nullability(
-    expression: &Expression,
-    scope: &Scope,
-    context: &NullabilityContext<'_>,
-) -> ProjectionNullability {
-    match expression {
-        Expression::Alias(alias) => projection_nullability(&alias.this, scope, context),
-        Expression::Annotated(annotated) => projection_nullability(&annotated.this, scope, context),
-        Expression::Paren(paren) => projection_nullability(&paren.this, scope, context),
-        Expression::Literal(_) | Expression::Boolean(_) => ProjectionNullability::NonNull,
-        Expression::Null(_) => ProjectionNullability::Nullable,
-        Expression::Count(_) | Expression::CountIf(_) => ProjectionNullability::NonNull,
-        Expression::Cast(cast) => projection_nullability(&cast.this, scope, context),
-        Expression::TryCast(_) | Expression::SafeCast(_) => ProjectionNullability::Unknown,
-        Expression::Column(column) => column_nullability(
-            &column.name.name,
-            column.table.as_ref().map(|table| table.name.as_str()),
-            scope,
-            context,
-        ),
-        Expression::Identifier(identifier) => {
-            column_nullability(&identifier.name, None, scope, context)
-        }
-        Expression::Coalesce(func) => coalesce_nullability(&func.expressions, scope, context),
-        _ => ProjectionNullability::Unknown,
-    }
-}
+impl NullabilityContext<'_> {
+    // Inference is optional metadata: cycles and excessive dependency depth
+    // must yield Unknown, not recurse indefinitely or claim non-nullability.
+    const MAX_DEPTH: usize = 128;
 
-fn column_nullability(
-    column_name: &str,
-    source_name: Option<&str>,
-    scope: &Scope,
-    context: &NullabilityContext<'_>,
-) -> ProjectionNullability {
-    let resolved_source_name = source_name
-        .map(str::to_string)
-        .or_else(|| single_scope_source_name(scope));
-
-    if let Some(source_name) = &resolved_source_name {
-        if context
-            .nullable_sources
-            .contains(&normalize_lookup_name(source_name))
-        {
-            return ProjectionNullability::Nullable;
+    fn output(&self, scope_id: usize, ordinal: usize, depth: usize) -> ProjectionNullability {
+        let key = (scope_id, ordinal);
+        if let Some(value) = self.outputs.borrow().get(&key) {
+            return *value;
         }
+        if depth >= Self::MAX_DEPTH || !self.resolving.borrow_mut().insert(key) {
+            return ProjectionNullability::Unknown;
+        }
+        let value = self.output_inner(scope_id, ordinal, depth + 1);
+        self.resolving.borrow_mut().remove(&key);
+        self.outputs.borrow_mut().insert(key, value);
+        value
     }
 
-    let Some(schema) = context.schema else {
-        return ProjectionNullability::Unknown;
-    };
-
-    let table_name = resolved_source_name
-        .as_ref()
-        .and_then(|name| scope.sources.get(name).and_then(source_table_name))
-        .or(resolved_source_name);
-
-    let Some(table_name) = table_name else {
-        return ProjectionNullability::Unknown;
-    };
-
-    match schema.column(&table_name, column_name) {
-        Some(info) if info.primary_key || info.nullable == Some(false) => {
-            ProjectionNullability::NonNull
+    fn output_inner(&self, scope_id: usize, ordinal: usize, depth: usize) -> ProjectionNullability {
+        use ProjectionNullability::*;
+        let frame = &self.scopes[scope_id];
+        let query = crate::scope::scope_query(&frame.scope.expression);
+        if let Expression::Select(select) = query {
+            return select
+                .expressions
+                .get(ordinal)
+                .map(|expression| self.expression(scope_id, expression, depth))
+                .unwrap_or(Unknown);
         }
-        Some(info) if info.nullable == Some(true) => ProjectionNullability::Nullable,
-        Some(_) | None => ProjectionNullability::Unknown,
+        if !is_set_operation(query) || frame.branches.len() != 2 {
+            return Unknown;
+        }
+        let (left, right) =
+            match crate::set_operation::set_operation_layout(query, Some(self.dialect)) {
+                Ok(Some(layout)) => match layout.outputs.get(ordinal) {
+                    Some(output) => (output.left_ordinal, output.right_ordinal),
+                    None => return Unknown,
+                },
+                Ok(None) => (Some(ordinal), Some(ordinal)),
+                Err(_) => return Unknown,
+            };
+        let branch = |id, ordinal: Option<usize>| {
+            ordinal
+                .map(|ordinal| self.output(id, ordinal, depth))
+                .unwrap_or(Nullable)
+        };
+        let left = branch(frame.branches[0], left);
+        if matches!(query, Expression::Except(_)) {
+            return left;
+        }
+        let right = branch(frame.branches[1], right);
+        if matches!(query, Expression::Intersect(_)) {
+            return match (left, right) {
+                (NonNull, _) | (_, NonNull) => NonNull,
+                (Nullable, Nullable) => Nullable,
+                _ => Unknown,
+            };
+        }
+        match (left, right) {
+            (NonNull, NonNull) => NonNull,
+            (Nullable, _) | (_, Nullable) => Nullable,
+            _ => Unknown,
+        }
     }
-}
 
-fn single_scope_source_name(scope: &Scope) -> Option<String> {
-    if scope.sources.len() == 1 {
-        scope.sources.keys().next().cloned()
-    } else {
+    fn expression(
+        &self,
+        scope_id: usize,
+        expression: &Expression,
+        depth: usize,
+    ) -> ProjectionNullability {
+        use ProjectionNullability::*;
+        if depth >= Self::MAX_DEPTH {
+            return Unknown;
+        }
+        let depth = depth + 1;
+        match expression {
+            Expression::Alias(alias) => self.expression(scope_id, &alias.this, depth),
+            Expression::Annotated(annotated) => self.expression(scope_id, &annotated.this, depth),
+            Expression::Paren(paren) => self.expression(scope_id, &paren.this, depth),
+            Expression::Literal(_)
+            | Expression::Boolean(_)
+            | Expression::Count(_)
+            | Expression::CountIf(_) => NonNull,
+            Expression::Null(_) => Nullable,
+            Expression::Cast(cast) => self.expression(scope_id, &cast.this, depth),
+            Expression::Column(column) => {
+                if column.span.or(column.name.span).is_some_and(|span| {
+                    self.uncertain_columns.contains_key(&(span.start, span.end))
+                }) {
+                    Unknown
+                } else {
+                    self.column(scope_id, &column.name, column.table.as_ref(), depth)
+                }
+            }
+            Expression::Identifier(identifier) => self.column(scope_id, identifier, None, depth),
+            Expression::Coalesce(func) => {
+                let mut all_nullable = !func.expressions.is_empty();
+                for expression in &func.expressions {
+                    match self.expression(scope_id, expression, depth) {
+                        NonNull => return NonNull,
+                        Nullable => {}
+                        Unknown => all_nullable = false,
+                    }
+                }
+                if all_nullable {
+                    Nullable
+                } else {
+                    Unknown
+                }
+            }
+            _ => Unknown,
+        }
+    }
+
+    fn source_scope(
+        &self,
+        frame: &NullabilityScope<'_>,
+        name: &str,
+        source: &SourceInfo,
+    ) -> Option<usize> {
+        if let Some(Expression::Table(table)) = frame.bindings.get(name).copied() {
+            if table.schema.is_none() && table.catalog.is_none() {
+                return frame
+                    .ctes
+                    .get(&crate::set_operation::identifier_key(
+                        &table.name,
+                        Some(self.dialect),
+                    ))
+                    .copied();
+            }
+        }
+        if source.kind == SourceKind::DerivedTable && source.is_scope {
+            return frame.derived.iter().copied().find(|id| {
+                crate::scope::scope_query(&self.scopes[*id].scope.expression)
+                    == crate::scope::scope_query(&source.expression)
+            });
+        }
         None
     }
-}
 
-fn coalesce_nullability(
-    expressions: &[Expression],
-    scope: &Scope,
-    context: &NullabilityContext<'_>,
-) -> ProjectionNullability {
-    if expressions.is_empty() {
-        return ProjectionNullability::Unknown;
-    }
-
-    let mut all_nullable = true;
-
-    for expression in expressions {
-        match projection_nullability(unwrap_projection_alias(expression), scope, context) {
-            ProjectionNullability::NonNull => return ProjectionNullability::NonNull,
-            ProjectionNullability::Nullable => {}
-            ProjectionNullability::Unknown => all_nullable = false,
+    fn source_columns(
+        &self,
+        frame: &NullabilityScope<'_>,
+        name: &str,
+        source: &SourceInfo,
+    ) -> Option<Vec<Identifier>> {
+        if let Some(id) = self.source_scope(frame, name, source) {
+            let expression = if matches!(
+                frame.bindings.get(name).copied(),
+                Some(Expression::Table(_))
+            ) {
+                &self.scopes[id].scope.expression
+            } else {
+                &source.expression
+            };
+            return crate::set_operation::query_output_identifiers(expression, Some(self.dialect))
+                .ok();
+        }
+        if source.kind == SourceKind::Table {
+            let mut resolver = crate::resolver::Resolver::new(
+                &frame.selected,
+                self.mapping_schema.unwrap_or(&self.empty_schema),
+                false,
+            );
+            let columns = resolver.get_source_columns(name).ok()?;
+            if columns.is_empty() || columns.iter().any(|name| name == "*") {
+                return None;
+            }
+            Some(columns.into_iter().map(Identifier::new).collect())
+        } else {
+            crate::set_operation::query_output_identifiers(&source.expression, Some(self.dialect))
+                .ok()
         }
     }
 
-    if all_nullable {
-        ProjectionNullability::Nullable
-    } else {
-        ProjectionNullability::Unknown
+    fn column(
+        &self,
+        scope_id: usize,
+        column: &Identifier,
+        qualifier: Option<&Identifier>,
+        depth: usize,
+    ) -> ProjectionNullability {
+        use ProjectionNullability::*;
+        let frame = &self.scopes[scope_id];
+        let column_key = crate::set_operation::identifier_key(column, Some(self.dialect));
+        let same_column = |name: &Identifier| {
+            crate::set_operation::identifier_key(name, Some(self.dialect)) == column_key
+        };
+        let binding = if let Some(qualifier) = qualifier {
+            let key = crate::set_operation::identifier_key(qualifier, Some(self.dialect));
+            let mut matches = frame
+                .bindings
+                .iter()
+                .filter(|(_, expression)| {
+                    expression_source_identifier(expression).is_some_and(|identifier| {
+                        crate::set_operation::identifier_key(identifier, Some(self.dialect)) == key
+                    })
+                })
+                .filter_map(|(name, _)| frame.selected.sources.get_key_value(name));
+            let binding = matches.next();
+            if matches.next().is_some() {
+                return Unknown;
+            }
+            binding
+        } else {
+            let mut binding = None;
+            for (name, source) in &frame.selected.sources {
+                // An open source can also provide this column. Do not pick a
+                // known source just because the other source lacks metadata.
+                let Some(columns) = self.source_columns(frame, name, source) else {
+                    return Unknown;
+                };
+                if columns.iter().any(&same_column) {
+                    if binding.is_some() {
+                        return Unknown;
+                    }
+                    binding = Some((name, source));
+                }
+            }
+            binding
+        };
+        let Some((name, source)) = binding else {
+            return Unknown;
+        };
+        if frame
+            .bindings
+            .get(name)
+            .and_then(|expression| expression_source_identifier(expression))
+            .is_some_and(|identifier| {
+                frame
+                    .nullable_sources
+                    .contains(&crate::set_operation::identifier_key(
+                        identifier,
+                        Some(self.dialect),
+                    ))
+            })
+        {
+            return Nullable;
+        }
+        let target = self.source_scope(frame, name, source);
+        if target.is_none() && source.kind == SourceKind::Table {
+            let info = self.schema.and_then(|schema| {
+                source_table_name(source).and_then(|table| schema.column(&table, &column.name))
+            });
+            return match info {
+                Some(info) if info.primary_key || info.nullable == Some(false) => NonNull,
+                Some(info) if info.nullable == Some(true) => Nullable,
+                _ => Unknown,
+            };
+        }
+        let Some(columns) = self.source_columns(frame, name, source) else {
+            return Unknown;
+        };
+        let mut ordinals = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| same_column(name))
+            .map(|(ordinal, _)| ordinal);
+        let Some(ordinal) = ordinals.next() else {
+            return Unknown;
+        };
+        if ordinals.next().is_some() {
+            return Unknown;
+        }
+        target
+            .map(|id| self.output(id, ordinal, depth))
+            .unwrap_or(Unknown)
     }
 }
 
@@ -1540,9 +2041,10 @@ fn set_operation_facts(
     expression: &Expression,
     scope: &Scope,
     dialect: DialectType,
+    nullability: &NullabilityContext<'_>,
 ) -> Vec<SetOperationFact> {
     let mut facts = Vec::new();
-    collect_set_operation_facts(expression, scope, dialect, &mut facts);
+    collect_set_operation_facts(expression, scope, dialect, nullability, &mut facts);
     facts
 }
 
@@ -1550,6 +2052,7 @@ fn collect_set_operation_facts(
     expression: &Expression,
     scope: &Scope,
     dialect: DialectType,
+    nullability: &NullabilityContext<'_>,
     facts: &mut Vec<SetOperationFact>,
 ) {
     match expression {
@@ -1565,10 +2068,23 @@ fn collect_set_operation_facts(
                     scope,
                     dialect,
                     SetOperationBranchRole::Value,
+                    nullability,
                 ),
             });
-            collect_set_operation_facts(&union.left, scope, dialect, facts);
-            collect_set_operation_facts(&union.right, scope, dialect, facts);
+            collect_set_operation_facts(
+                &union.left,
+                scope.union_scopes.first().unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
+            collect_set_operation_facts(
+                &union.right,
+                scope.union_scopes.get(1).unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
         }
         Expression::Intersect(intersect) => {
             facts.push(SetOperationFact {
@@ -1582,10 +2098,23 @@ fn collect_set_operation_facts(
                     scope,
                     dialect,
                     SetOperationBranchRole::Filter,
+                    nullability,
                 ),
             });
-            collect_set_operation_facts(&intersect.left, scope, dialect, facts);
-            collect_set_operation_facts(&intersect.right, scope, dialect, facts);
+            collect_set_operation_facts(
+                &intersect.left,
+                scope.union_scopes.first().unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
+            collect_set_operation_facts(
+                &intersect.right,
+                scope.union_scopes.get(1).unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
         }
         Expression::Except(except) => {
             facts.push(SetOperationFact {
@@ -1599,13 +2128,26 @@ fn collect_set_operation_facts(
                     scope,
                     dialect,
                     SetOperationBranchRole::Filter,
+                    nullability,
                 ),
             });
-            collect_set_operation_facts(&except.left, scope, dialect, facts);
-            collect_set_operation_facts(&except.right, scope, dialect, facts);
+            collect_set_operation_facts(
+                &except.left,
+                scope.union_scopes.first().unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
+            collect_set_operation_facts(
+                &except.right,
+                scope.union_scopes.get(1).unwrap_or(scope),
+                dialect,
+                nullability,
+                facts,
+            );
         }
         Expression::Subquery(subquery) => {
-            collect_set_operation_facts(&subquery.this, scope, dialect, facts);
+            collect_set_operation_facts(&subquery.this, scope, dialect, nullability, facts);
         }
         _ => {}
     }
@@ -1617,37 +2159,30 @@ fn set_operation_branches(
     scope: &Scope,
     dialect: DialectType,
     right_role: SetOperationBranchRole,
+    nullability: &NullabilityContext<'_>,
 ) -> Vec<SetOperationBranchFact> {
     vec![
         SetOperationBranchFact {
             index: 0,
             role: SetOperationBranchRole::Value,
-            projections: projection_facts_for_branch(left, scope, dialect),
+            projections: projection_facts_for_query(
+                left,
+                scope.union_scopes.first().unwrap_or(scope),
+                dialect,
+                nullability,
+            ),
         },
         SetOperationBranchFact {
             index: 1,
             role: right_role,
-            projections: projection_facts_for_branch(right, scope, dialect),
+            projections: projection_facts_for_query(
+                right,
+                scope.union_scopes.get(1).unwrap_or(scope),
+                dialect,
+                nullability,
+            ),
         },
     ]
-}
-
-fn projection_facts_for_branch(
-    expression: &Expression,
-    root_scope: &Scope,
-    dialect: DialectType,
-) -> Vec<ProjectionFact> {
-    let branch_scope = build_scope(expression);
-    let scope = if branch_scope.sources.is_empty() {
-        root_scope
-    } else {
-        &branch_scope
-    };
-    let nullability_context = NullabilityContext {
-        schema: None,
-        nullable_sources: nullable_source_names(expression),
-    };
-    projection_facts_for_query(expression, scope, dialect, &nullability_context)
 }
 
 fn non_empty_string(value: String) -> Option<String> {

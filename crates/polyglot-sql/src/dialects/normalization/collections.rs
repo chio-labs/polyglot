@@ -197,6 +197,7 @@ pub(super) fn rewrite(
                             expressions: arr.expressions,
                             bracket_notation: true,
                             use_list_keyword: false,
+                            inferred_type: arr.inferred_type,
                         })),
                     ),
                     // ARRAY(y) function style -> ArrayFunc for target dialect
@@ -215,6 +216,7 @@ pub(super) fn rewrite(
                                 expressions: f.args,
                                 bracket_notation: bracket,
                                 use_list_keyword: false,
+                                inferred_type: None,
                             },
                         )))
                     }
@@ -264,6 +266,7 @@ pub(super) fn rewrite(
                                     expressions: af.expressions,
                                     bracket_notation: true,
                                     use_list_keyword: false,
+                                    inferred_type: af.inferred_type,
                                 },
                             )),
                             other => other,
@@ -400,6 +403,7 @@ pub(super) fn rewrite(
                                     expressions: arr.expressions,
                                     bracket_notation: false,
                                     use_list_keyword: false,
+                                    inferred_type: arr.inferred_type,
                                 },
                             )))
                         }
@@ -1282,6 +1286,7 @@ pub(super) fn rewrite(
                                     expressions: vec![subquery],
                                     bracket_notation: false,
                                     use_list_keyword: false,
+                                    inferred_type: None,
                                 },
                             )))
                         }

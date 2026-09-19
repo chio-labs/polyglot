@@ -238,8 +238,22 @@ pub fn transpile_with_options_value(
 ) -> JsValue {
     set_panic_hook();
 
+    // serde-wasm-bindgen maps both undefined and null to Option::None. For this
+    // optional limit, undefined must behave like JSON omission, not disabling.
+    let parser_depth_undefined =
+        js_sys::Reflect::get(&options, &JsValue::from_str("complexityGuard"))
+            .and_then(|guard| js_sys::Reflect::get(&guard, &JsValue::from_str("maxParserDepth")))
+            .map(|value| value.is_undefined())
+            .unwrap_or(false);
     let result = match serde_wasm_bindgen::from_value::<TranspileOptions>(options) {
-        Ok(options) => transpile_internal_with_options(sql, read_dialect, write_dialect, options),
+        Ok(mut options) => {
+            if parser_depth_undefined {
+                options.complexity_guard.max_parser_depth = TranspileOptions::default()
+                    .complexity_guard
+                    .max_parser_depth;
+            }
+            transpile_internal_with_options(sql, read_dialect, write_dialect, options)
+        }
         Err(e) => TranspileResult {
             success: false,
             sql: None,
@@ -1080,7 +1094,7 @@ fn validate_internal(sql: &str, dialect: &str) -> CoreValidationResult {
     polyglot_sql::validate(sql, dialect_type)
 }
 
-/// Validate SQL syntax and optional query-quality semantic warnings.
+/// Validate SQL syntax and optional semantic correctness/quality checks.
 ///
 /// # Arguments
 /// * `sql` - The SQL string to validate
@@ -1136,7 +1150,7 @@ fn validate_with_options_internal(
     polyglot_sql::validate_with_options(sql, dialect_type, &options)
 }
 
-/// Validate SQL syntax + schema-aware checks (+ optional semantic warnings).
+/// Validate SQL syntax + schema-aware checks (+ optional semantic checks).
 ///
 /// # Arguments
 /// * `sql` - The SQL string to validate
@@ -2838,6 +2852,28 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_data_type_quotes_constructed_field_names() {
+        let data_type = serde_json::json!({
+            "data_type": "struct", "nested": false,
+            "fields": [{"name": "a\"b", "data_type": {"data_type": "text"}}]
+        });
+        let generated: serde_json::Value =
+            serde_json::from_str(&generate_data_type(&data_type.to_string(), "duckdb")).unwrap();
+        assert_eq!(generated["success"], true);
+        assert_eq!(generated["sql"], "STRUCT(\"a\"\"b\" TEXT)");
+        let parsed: serde_json::Value = serde_json::from_str(&parse_data_type(
+            generated["sql"].as_str().unwrap(),
+            "duckdb",
+        ))
+        .unwrap();
+        assert_eq!(parsed["success"], true);
+        let data_type: serde_json::Value =
+            serde_json::from_str(parsed["dataType"].as_str().unwrap()).unwrap();
+        assert_eq!(data_type["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(data_type["fields"][0]["name"], "\"a\"\"b\"");
+    }
+
+    #[test]
     fn test_parse_data_type_rejects_trailing_sql() {
         let result = parse_data_type("DECIMAL(10, 2) SELECT 1", "duckdb");
         let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -2917,6 +2953,28 @@ mod tests {
         let result = validate_with_options("SELECT name, FROM employees", "generic", options);
         assert!(result.contains("\"valid\":false"), "Result: {}", result);
         assert!(result.contains("\"code\":\"E005\""), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_validation_semantic_correctness_contract() {
+        for (sql, code) in [
+            ("SELECT id, SUM(amount) FROM t", "E230"),
+            ("SELECT id FROM t WHERE SUM(amount)>0", "E231"),
+            ("SELECT id FROM t WHERE ROW_NUMBER() OVER()=1", "E232"),
+        ] {
+            let result: serde_json::Value = serde_json::from_str(&validate_with_options(
+                sql,
+                "snowflake",
+                r#"{"semantic":true}"#,
+            ))
+            .unwrap();
+            assert_eq!(result["valid"], false);
+            assert!(result["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error["code"] == code && error["severity"] == "error"));
+        }
     }
 
     #[test]
@@ -3341,6 +3399,45 @@ mod tests {
     }
 
     #[test]
+    fn test_transpile_unicode_date_time_formats() {
+        for (sql, read, write, expected) in [
+            (
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+                "snowflake",
+                "snowflake",
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+                "duckdb",
+                "duckdb",
+                "SELECT STRPTIME(x, 'é%Y')",
+            ),
+            (
+                "SELECT TO_CHAR(x, 'éYYYY')",
+                "oracle",
+                "presto",
+                "SELECT DATE_FORMAT(x, 'éYYYY')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP(x, 'YYYY年MM月DD日')",
+                "snowflake",
+                "duckdb",
+                "SELECT STRPTIME(x, '%Y年%m月%d日')",
+            ),
+        ] {
+            let result: serde_json::Value =
+                serde_json::from_str(&transpile(sql, read, write)).expect("valid JSON");
+            assert_eq!(result["success"], true, "{result}");
+            assert_eq!(
+                result["sql"],
+                serde_json::json!([expected]),
+                "{read} -> {write}: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_unicode() {
         let result = parse("SELECT '日本語'", "generic");
         assert!(result.contains("\"success\":true"), "Result: {}", result);
@@ -3355,6 +3452,30 @@ mod tests {
         let result = format_sql("SELECT a,b,c FROM t WHERE x=1", "generic");
         assert!(result.contains("\"success\":true"), "Result: {}", result);
         assert!(result.contains("sql"), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_format_preserves_null_ordering() {
+        for dialect in ["snowflake", "duckdb", "postgres"] {
+            for ordering in [
+                "category NULLS LAST, created_at DESC NULLS FIRST",
+                "category, created_at DESC",
+            ] {
+                let sql = format!("SELECT id FROM items ORDER BY {ordering}");
+                for output in [
+                    format_sql(&sql, dialect),
+                    format_sql_with_options(&sql, dialect, "{}"),
+                ] {
+                    let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+                    assert_eq!(result["success"], true, "{result}");
+                    let formatted = result["sql"][0].as_str().unwrap();
+                    assert_eq!(
+                        formatted.split_whitespace().collect::<Vec<_>>().join(" "),
+                        sql
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3939,7 +4060,7 @@ mod tests {
             .any(|reference| {
                 reference["column"] == "order_id"
                     && reference["table"] == "t"
-                    && reference["confidence"] == "resolved"
+                    && reference["confidence"] == "unknown"
             }));
         assert!(projections[1]["upstream"]
             .as_array()

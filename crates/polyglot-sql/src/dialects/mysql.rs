@@ -800,6 +800,13 @@ impl MySQLDialect {
             DataType::Boolean => DataType::Custom {
                 name: "SIGNED".to_string(),
             },
+            // First-class counterparts of the legacy unsigned Custom types below.
+            // UINT128 is intentionally excluded: MySQL UNSIGNED is only 64 bits.
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                DataType::Custom {
+                    name: "UNSIGNED".to_string(),
+                }
+            }
 
             // Custom types that need mapping
             DataType::Custom { name } => {

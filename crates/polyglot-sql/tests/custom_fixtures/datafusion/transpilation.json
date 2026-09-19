@@ -237,38 +237,38 @@
     {
       "sql": "SELECT * FROM t ORDER BY x ASC NULLS LAST",
       "write": {
-        "duckdb": "SELECT * FROM t ORDER BY x ASC",
+        "duckdb": "SELECT * FROM t ORDER BY x ASC NULLS LAST",
         "postgresql": "SELECT * FROM t ORDER BY x ASC",
-        "snowflake": "SELECT * FROM t ORDER BY x ASC",
+        "snowflake": "SELECT * FROM t ORDER BY x ASC NULLS LAST",
         "mysql": "SELECT * FROM t ORDER BY x ASC",
         "spark": "SELECT * FROM t ORDER BY x ASC NULLS LAST",
         "tsql": "SELECT * FROM t ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, x ASC"
       },
-      "description": "ASC NULLS LAST: redundant for DuckDB/PostgreSQL/Snowflake/MySQL"
+      "description": "ASC NULLS LAST: preserve explicit ordering for configurable DuckDB/Snowflake defaults"
     },
     {
       "sql": "SELECT * FROM t ORDER BY x DESC NULLS FIRST",
       "write": {
         "postgresql": "SELECT * FROM t ORDER BY x DESC",
-        "snowflake": "SELECT * FROM t ORDER BY x DESC",
+        "snowflake": "SELECT * FROM t ORDER BY x DESC NULLS FIRST",
         "duckdb": "SELECT * FROM t ORDER BY x DESC NULLS FIRST",
         "mysql": "SELECT * FROM t ORDER BY x DESC",
         "spark": "SELECT * FROM t ORDER BY x DESC NULLS FIRST",
         "tsql": "SELECT * FROM t ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END DESC, x DESC"
       },
-      "description": "DESC NULLS FIRST: redundant for PostgreSQL/Snowflake/MySQL"
+      "description": "DESC NULLS FIRST: preserve explicit ordering for configurable Snowflake defaults"
     },
     {
       "sql": "SELECT * FROM t ORDER BY x DESC NULLS LAST",
       "write": {
-        "duckdb": "SELECT * FROM t ORDER BY x DESC",
+        "duckdb": "SELECT * FROM t ORDER BY x DESC NULLS LAST",
         "postgresql": "SELECT * FROM t ORDER BY x DESC NULLS LAST",
         "mysql": "SELECT * FROM t ORDER BY x DESC",
         "snowflake": "SELECT * FROM t ORDER BY x DESC NULLS LAST",
         "spark": "SELECT * FROM t ORDER BY x DESC NULLS LAST",
         "tsql": "SELECT * FROM t ORDER BY x DESC"
       },
-      "description": "DESC NULLS LAST: redundant for DuckDB/MySQL"
+      "description": "DESC NULLS LAST: preserve explicit ordering for configurable DuckDB defaults"
     },
 
     {

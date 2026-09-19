@@ -29,6 +29,102 @@ fn snowflake_string_value(sql: &str) -> String {
         .text
 }
 
+#[test]
+fn test_configurable_null_ordering_roundtrips() {
+    // Issue #457: neither explicit requirements nor implicit server defaults
+    // may be lost in generation or same-dialect transpilation.
+    for dialect in [DialectType::Snowflake, DialectType::DuckDB] {
+        let positional = "SELECT * FROM x ORDER BY 1 NULLS LAST";
+        assert_eq!(
+            transpile(positional, dialect, dialect).unwrap(),
+            [positional]
+        );
+        for ordering in [
+            "category, created_at DESC",
+            "category NULLS LAST, created_at DESC NULLS FIRST",
+            "category NULLS FIRST, created_at DESC NULLS LAST",
+            "category ASC NULLS LAST, created_at DESC NULLS LAST",
+        ] {
+            for sql in [
+                format!("SELECT id FROM items ORDER BY {ordering}"),
+                format!("SELECT ROW_NUMBER() OVER (ORDER BY {ordering}) FROM items"),
+                format!("SELECT ARRAY_AGG(id) WITHIN GROUP (ORDER BY {ordering}) FROM items"),
+                format!("WITH q AS (SELECT id FROM items ORDER BY {ordering}) SELECT * FROM q"),
+                format!("SELECT id FROM items UNION ALL SELECT id FROM items ORDER BY {ordering}"),
+            ] {
+                let expr = parse_one(&sql, dialect).unwrap();
+                assert_eq!(
+                    generate(&expr, dialect).unwrap(),
+                    sql,
+                    "generate: {dialect:?}"
+                );
+                let output = transpile(&sql, dialect, dialect).unwrap().remove(0);
+                // DuckDB translates WITHIN GROUP into aggregate-local ORDER BY;
+                // compare clauses independently of that unrelated normalization.
+                assert!(
+                    output.contains(&format!("ORDER BY {ordering}")),
+                    "{dialect:?}: {output}"
+                );
+                assert_eq!(
+                    output.matches("NULLS").count(),
+                    sql.matches("NULLS").count(),
+                    "{output}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_null_ordering_cross_dialect_generation() {
+    let sql = "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC NULLS LAST, lname";
+    // Corrected expectations for every excluded null-ordering fixture mapping.
+    for source in [
+        DialectType::Generic,
+        DialectType::Hive,
+        DialectType::Spark,
+        DialectType::Snowflake,
+        DialectType::DuckDB,
+    ] {
+        for target in [DialectType::Snowflake, DialectType::DuckDB] {
+            let expected = if matches!(
+                source,
+                DialectType::Generic | DialectType::Hive | DialectType::Spark
+            ) {
+                format!("{sql} NULLS FIRST")
+            } else {
+                sql.to_string()
+            };
+            let result = transpile(sql, source, target).unwrap();
+            assert_eq!(result, [expected], "{source:?} -> {target:?}");
+        }
+    }
+    // Keep the existing source-default policy when translating Snowflake to a
+    // different dialect; don't accidentally remove required emulation on TSQL.
+    assert_eq!(
+        transpile(
+            "SELECT x FROM t ORDER BY x DESC",
+            DialectType::Snowflake,
+            DialectType::DuckDB
+        )
+        .unwrap(),
+        ["SELECT x FROM t ORDER BY x DESC NULLS FIRST"]
+    );
+    for target in [DialectType::TSQL, DialectType::Fabric] {
+        let result = transpile(
+            "SELECT x FROM t ORDER BY x NULLS LAST",
+            DialectType::Snowflake,
+            target,
+        )
+        .unwrap();
+        assert!(
+            result[0].contains("CASE WHEN x IS NULL THEN 1 ELSE 0 END"),
+            "{result:?}"
+        );
+        assert!(!result[0].contains("NULLS LAST"));
+    }
+}
+
 // =====================================================================
 // PRIOR identifier and CONNECT BY semantics
 // Related: https://github.com/tobilg/polyglot/issues/406

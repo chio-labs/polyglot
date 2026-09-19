@@ -18,21 +18,24 @@ const (
 
 // Result mirrors polyglot_result_t from crates/polyglot-sql-ffi.
 type Result struct {
-	Data   uintptr
-	Error  uintptr
+	Data   *byte
+	Error  *byte
 	Status int32
 }
 
 // ValidationResult mirrors polyglot_validation_result_t from crates/polyglot-sql-ffi.
 type ValidationResult struct {
 	Valid      int32
-	ErrorsJSON uintptr
-	Error      uintptr
+	ErrorsJSON *byte
+	Error      *byte
 	Status     int32
 }
 
-func CString(ptr uintptr) string {
-	if ptr == 0 {
+// CString copies a NUL-terminated native string. The caller must keep the
+// allocation alive until this function returns. Native pointers remain typed
+// pointers throughout the binding; no uintptr-to-pointer conversion is needed.
+func CString(ptr *byte) string {
+	if ptr == nil {
 		return ""
 	}
 

@@ -3,6 +3,39 @@ import pytest
 import polyglot_sql
 
 
+@pytest.mark.parametrize(
+    "name, identifier",
+    [
+        ("field name", '"field name"'),
+        ('a"b', '"a""b"'),
+        ("select", '"select"'),
+        ("a INT, b", '"a INT, b"'),
+    ],
+)
+def test_generate_constructed_struct_quotes_field_names(name, identifier):
+    ast = {
+        "data_type": {
+            "data_type": "struct",
+            "nested": False,
+            "fields": [{"name": name, "data_type": {"data_type": "text"}}],
+        }
+    }
+    sql = polyglot_sql.generate(ast, dialect="duckdb")[0]
+    assert sql == f"STRUCT({identifier} TEXT)"
+    parsed = polyglot_sql.parse_data_type(sql, dialect="duckdb")
+    fields = parsed.to_dict()["data_type"]["fields"]
+    assert len(fields) == 1
+    assert fields[0]["name"] == identifier
+    assert parsed.sql("duckdb") == sql
+
+
+def test_generate_parsed_struct_preserves_quotes_across_dialects():
+    sql = 'STRUCT("a""b" INT, "field name" INT)'
+    parsed = polyglot_sql.parse_data_type(sql, dialect="duckdb")
+    assert parsed.sql("duckdb") == sql
+    assert parsed.sql("spark") == 'STRUCT<`a"b`: INT, `field name`: INT>'
+
+
 def test_generate_roundtrip_from_parse_one():
     ast = polyglot_sql.parse_one("SELECT 1", dialect="postgres")
     out = polyglot_sql.generate(ast, dialect="postgres")

@@ -4,6 +4,108 @@ use polyglot_sql::expressions::{
 };
 use polyglot_sql::{ComplexityGuardOptions, TranspileOptions};
 
+#[test]
+fn parse_and_validation_share_per_call_guard_options() {
+    use polyglot_sql::{
+        parse_one_with_options, parse_with_options, validate_with_options, ParseOptions,
+        ValidationOptions,
+    };
+    let sql = |depth| {
+        format!(
+            "SELECT {}value{} FROM records",
+            "COALESCE(".repeat(depth),
+            ", 0)".repeat(depth)
+        )
+    };
+    let dialect = DialectType::Snowflake;
+    for depth in [64, 65] {
+        let sql = sql(depth);
+        assert_eq!(
+            parse_with_options(&sql, dialect, &ParseOptions::default()).is_ok(),
+            depth == 64
+        );
+        assert_eq!(
+            validate_with_options(&sql, dialect, &ValidationOptions::default()).valid,
+            depth == 64
+        );
+        for limit in [Some(128), None] {
+            let guard = ComplexityGuardOptions {
+                max_function_call_depth: limit,
+                ..Default::default()
+            };
+            let options = ParseOptions {
+                complexity_guard: Some(guard),
+            };
+            assert_eq!(
+                parse_with_options(&sql, dialect, &options).unwrap().len(),
+                1
+            );
+            assert!(parse_one_with_options(&sql, dialect, &options).is_ok());
+            assert!(
+                validate_with_options(
+                    &sql,
+                    dialect,
+                    &ValidationOptions {
+                        complexity_guard: Some(guard),
+                        ..Default::default()
+                    }
+                )
+                .valid
+            );
+        }
+    }
+    assert!(
+        parse_with_options(&sql(65), DialectType::ClickHouse, &ParseOptions::default()).is_ok()
+    );
+    let limited = ParseOptions {
+        complexity_guard: Some(ComplexityGuardOptions {
+            max_function_call_depth: None,
+            max_input_bytes: Some(1),
+            ..Default::default()
+        }),
+    };
+    assert!(parse_one_with_options(&sql(65), dialect, &limited)
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_INPUT_TOO_LARGE"));
+    assert!(
+        parse_one_with_options("SELECT 1; SELECT 2", dialect, &ParseOptions::default()).is_err()
+    );
+    assert!(parse_one_with_options("SELECT 1", dialect, &ParseOptions::default()).is_ok());
+}
+
+#[test]
+fn guard_json_rejects_invalid_limits_and_preserves_null() {
+    for name in [
+        "maxParserDepth",
+        "maxInputBytes",
+        "maxTokens",
+        "maxAstNodes",
+        "maxAstDepth",
+        "maxParenthesisDepth",
+        "maxFunctionCallDepth",
+    ] {
+        for value in ["-1", "true", "1.0", "\"128\"", "18446744073709551616"] {
+            assert!(serde_json::from_str::<ComplexityGuardOptions>(&format!(
+                "{{\"{name}\":{value}}}"
+            ))
+            .is_err());
+        }
+        for value in ["0", "128", "null"] {
+            let options: ComplexityGuardOptions =
+                serde_json::from_str(&format!("{{\"{name}\":{value}}}")).unwrap();
+            assert_eq!(
+                serde_json::to_value(options).unwrap()[name],
+                serde_json::from_str::<serde_json::Value>(value).unwrap()
+            );
+        }
+    }
+    assert!(
+        serde_json::from_str::<ComplexityGuardOptions>(r#"{"max_function_call_depth":128}"#)
+            .is_err()
+    );
+}
+
 fn select_star_from(source: Expression) -> Expression {
     Expression::Select(Box::new(
         Select::new().column(Expression::star()).from(source),
@@ -93,6 +195,7 @@ fn build_deep_nested_array_materialize(depth: usize) -> Expression {
     for _ in 0..depth {
         current = Expression::Array(Box::new(Array {
             expressions: vec![current],
+            inferred_type: None,
         }));
     }
 
@@ -331,4 +434,145 @@ fn transpile_options_can_raise_function_call_nesting_budget() {
         .transpile_with(&sql, DialectType::Fabric, options)
         .expect("raised function nesting budget should allow this query");
     assert_eq!(transpiled.len(), 1);
+}
+
+#[test]
+fn parser_depth_options_and_independent_guards() {
+    use polyglot_sql::parser::{Parser, ParserConfig};
+    use polyglot_sql::tokens::Tokenizer;
+    let parse = |sql: &str, limit| {
+        let tokens = Tokenizer::default().tokenize(sql).unwrap();
+        Parser::with_config(
+            tokens,
+            ParserConfig {
+                complexity_guard: ComplexityGuardOptions {
+                    max_parser_depth: limit,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .parse()
+    };
+    assert!(parse("SELECT 1", Some(0))
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+    let sql = format!("SELECT {}1", "~ ".repeat(12));
+    assert!(parse(&sql, Some(8))
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+    assert!(parse(&sql, Some(32)).is_ok());
+    assert!(parse(&sql, None).is_ok());
+    // Siblings and sequential statements release their depth allocations.
+    assert!(parse("SELECT ~1, ~2, ~3; SELECT ~4", Some(8)).is_ok());
+    assert!(parse("SELECT (1", None).is_err());
+    // Disabling parser depth does not disable function-nesting protection.
+    let nested = build_nested_unary_function_sql(100, "abs");
+    assert!(parse(&nested, None)
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED"));
+}
+
+#[test]
+fn parser_depth_guard_covers_nested_types_and_procedural_children() {
+    use polyglot_sql::parser::{Parser, ParserConfig};
+    let dialect = Dialect::get(DialectType::TSQL);
+    let mut sql = "SELECT 1".to_string();
+    for _ in 0..12 {
+        sql = format!("BEGIN TRY {sql} END TRY BEGIN CATCH SELECT 2 END CATCH");
+    }
+    let mut parser = Parser::with_config(
+        dialect.tokenize(&sql).unwrap(),
+        ParserConfig {
+            dialect: Some(DialectType::TSQL),
+            complexity_guard: ComplexityGuardOptions {
+                max_parser_depth: Some(8),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(parser
+        .parse()
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+    let dialect = Dialect::get(DialectType::DuckDB);
+    let mut sql = "INT".to_string();
+    for _ in 0..12 {
+        sql = format!("STRUCT(x {sql})");
+    }
+    let mut parser = Parser::with_config(
+        dialect.tokenize(&sql).unwrap(),
+        ParserConfig {
+            dialect: Some(DialectType::DuckDB),
+            complexity_guard: ComplexityGuardOptions {
+                max_parser_depth: Some(8),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(parser
+        .parse_standalone_data_type()
+        .unwrap_err()
+        .to_string()
+        .contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+}
+
+#[test]
+fn iterative_array_types_preserve_delimiters_and_suffixes() {
+    use polyglot_sql::expressions::DataType;
+    use polyglot_sql::parser::{Parser, ParserConfig};
+    let dialect = Dialect::get(DialectType::Materialize);
+    let parse = |sql: &str| {
+        Parser::with_config(
+            dialect.tokenize(sql).unwrap(),
+            ParserConfig {
+                dialect: Some(DialectType::Materialize),
+                ..Default::default()
+            },
+        )
+        .parse_standalone_data_type()
+    };
+    let array = |element, dimension| DataType::Array {
+        element_type: Box::new(element),
+        dimension,
+    };
+    let int = DataType::Int {
+        length: None,
+        integer_spelling: false,
+    };
+    for sql in [
+        "ARRAY<ARRAY<INT>>",
+        "ARRAY(ARRAY(INT))",
+        "ARRAY<ARRAY(INT)>",
+        "ARRAY<\"ARRAY\"<INT>>",
+    ] {
+        assert_eq!(parse(sql).unwrap(), array(array(int.clone(), None), None));
+    }
+    assert_eq!(
+        parse("ARRAY<ARRAY<INT>[3]>[2]").unwrap(),
+        array(
+            array(array(array(int.clone(), None), Some(3)), None),
+            Some(2)
+        )
+    );
+    assert_eq!(
+        parse("ARRAY<ARRAY<INT> LIST> LIST").unwrap(),
+        DataType::List {
+            element_type: Box::new(array(
+                DataType::List {
+                    element_type: Box::new(array(int, None)),
+                },
+                None,
+            )),
+        }
+    );
+    for sql in ["ARRAY<ARRAY<INT>", "ARRAY(ARRAY<INT))", "ARRAY<ARRAY(INT>>"] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
 }

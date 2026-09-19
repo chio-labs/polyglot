@@ -3979,6 +3979,73 @@ mod string_functions {
 mod date_functions {
     use super::*;
 
+    #[test]
+    fn test_unicode_date_time_issue_examples() {
+        for (sql, from, to, expected) in [
+            (
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+                DialectType::Snowflake,
+                DialectType::Snowflake,
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+                DialectType::DuckDB,
+                DialectType::DuckDB,
+                "SELECT STRPTIME(x, 'é%Y')",
+            ),
+            (
+                "SELECT TO_CHAR(x, 'éYYYY')",
+                DialectType::Oracle,
+                DialectType::Presto,
+                "SELECT DATE_FORMAT(x, 'éYYYY')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP(x, 'YYYY年MM月DD日')",
+                DialectType::Snowflake,
+                DialectType::DuckDB,
+                "SELECT STRPTIME(x, '%Y年%m月%d日')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP(x, 'ßYYYY')",
+                DialectType::Snowflake,
+                DialectType::Snowflake,
+                "SELECT TO_TIMESTAMP(x, 'ßyyyy')",
+            ),
+            (
+                "SELECT TO_CHAR(x, 'éyyyy年mm')",
+                DialectType::Oracle,
+                DialectType::Presto,
+                "SELECT DATE_FORMAT(x, 'é%Y年%m')",
+            ),
+        ] {
+            assert_eq!(
+                transpile(sql, from, to),
+                expected,
+                "{from:?} -> {to:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unicode_date_time_presto_conversion() {
+        use polyglot_sql::dialects::PrestoDialect;
+        for literal in ["é", "年", "🦀", "e\u{301}", "ß", "ſ"] {
+            assert_eq!(PrestoDialect::oracle_to_presto_format(literal), literal);
+            assert_eq!(
+                PrestoDialect::oracle_to_presto_format(&format!(
+                    "{literal}yyyy{literal}mm{literal}"
+                )),
+                format!("{literal}%Y{literal}%m{literal}")
+            );
+        }
+        assert_eq!(PrestoDialect::oracle_to_presto_format(""), "");
+        assert_eq!(
+            PrestoDialect::oracle_to_presto_format("yyyy yy hh24 hh mi mm dd ss YYYY %q"),
+            "%Y %y %H %H %i %m %d %s YYYY %q"
+        );
+    }
+
     // NOW() transformations
     #[test]
     fn test_now_to_postgres() {

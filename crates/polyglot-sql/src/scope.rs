@@ -55,6 +55,48 @@ impl Default for SourceKind {
     }
 }
 
+/// Unwrap query containers without creating a new lexical context.
+pub(crate) fn scope_query(expression: &Expression) -> &Expression {
+    match expression {
+        Expression::Cte(cte) => scope_query(&cte.this),
+        Expression::Subquery(subquery) => scope_query(&subquery.this),
+        Expression::Paren(paren) => scope_query(&paren.this),
+        Expression::Alias(alias) => scope_query(&alias.this),
+        Expression::Prepare(prepare) => scope_query(&prepare.statement),
+        Expression::CreateTable(create) if create.as_select.is_some() => {
+            scope_query(create.as_select.as_ref().unwrap())
+        }
+        _ => expression,
+    }
+}
+
+/// A lightweight resolution view containing only selected sources. CTE
+/// declarations remain available, but do not themselves cause ambiguity.
+pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
+    let query = scope_query(&scope.expression);
+    let aliases: HashSet<_> = walk_in_scope(query, false)
+        .filter_map(|node| match node {
+            Expression::Table(table) => {
+                Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut selected = Scope::new(query.clone());
+    selected.cte_sources = scope.cte_sources.clone();
+    selected.sources = scope
+        .sources
+        .iter()
+        .filter(|(name, source)| {
+            // Source keys use the spelling of the actual FROM/JOIN binding.
+            // Folding here can accidentally retain an unused, quoted CTE.
+            source.kind != SourceKind::Cte || aliases.contains(*name)
+        })
+        .map(|(name, source)| (name.clone(), source.clone()))
+        .collect();
+    selected
+}
+
 /// Information about a source (table or subquery) in a scope
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
@@ -605,7 +647,16 @@ fn collect_columns(expr: &Expression, columns: &mut Vec<ColumnRef>) {
 /// This traverses the expression tree and builds a hierarchy of Scope objects
 /// that track sources and column references at each level.
 pub fn build_scope(expression: &Expression) -> Scope {
+    build_scope_with_ctes(expression, &HashMap::new())
+}
+
+/// Build a query scope with CTE definitions inherited from its lexical parent.
+pub(crate) fn build_scope_with_ctes(
+    expression: &Expression,
+    ctes: &HashMap<String, SourceInfo>,
+) -> Scope {
     let mut root = Scope::new(expression.clone());
+    root.cte_sources = ctes.clone();
     build_scope_impl(expression, &mut root);
     root
 }
@@ -901,22 +952,21 @@ fn add_lateral_view_to_scope(lateral_view: &crate::expressions::LateralView, sco
 }
 
 fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
-    match expr {
-        Expression::Select(select) => {
-            // Check WHERE for subqueries
-            if let Some(where_clause) = &select.where_clause {
-                collect_subqueries_in_expr(&where_clause.this, parent_scope);
+    if matches!(expr, Expression::Select(_)) {
+        use crate::ast_children::ChildPathSegment::{Field, Index};
+
+        // Include JOIN predicates, ORDER BY and QUALIFY as well as projections
+        // and WHERE, but do not register FROM/JOIN queries again as scalar
+        // subqueries (including derived tables without aliases).
+        crate::ast_children::for_each_child(expr, |path, child| {
+            if !matches!(
+                path,
+                [Field("from" | "with" | "lateral_views"), ..]
+                    | [Field("joins"), Index(_), Field("this"), ..]
+            ) {
+                collect_subqueries_in_expr(child, parent_scope);
             }
-            // Check SELECT expressions for subqueries
-            for e in &select.expressions {
-                collect_subqueries_in_expr(e, parent_scope);
-            }
-            // Check HAVING for subqueries
-            if let Some(having) = &select.having {
-                collect_subqueries_in_expr(&having.this, parent_scope);
-            }
-        }
-        _ => {}
+        });
     }
 }
 
@@ -1030,10 +1080,15 @@ impl<'a> WalkInScopeIter<'a> {
                 }
                 // Walk JOINs (but their sources create new scopes)
                 for join in &select.joins {
+                    if !self.should_stop_at(&join.this, false) {
+                        children.push(&join.this);
+                    }
                     if let Some(on) = &join.on {
                         children.push(on);
                     }
-                    // Don't traverse join.this as it's a source (table or subquery)
+                    if let Some(condition) = &join.match_condition {
+                        children.push(condition);
+                    }
                 }
                 // Walk WHERE
                 if let Some(where_clause) = &select.where_clause {
@@ -1048,6 +1103,9 @@ impl<'a> WalkInScopeIter<'a> {
                 // Walk HAVING
                 if let Some(having) = &select.having {
                     children.push(&having.this);
+                }
+                if let Some(qualify) = &select.qualify {
+                    children.push(&qualify.this);
                 }
                 // Walk ORDER BY
                 if let Some(order_by) = &select.order_by {
@@ -1184,7 +1242,10 @@ impl<'a> WalkInScopeIter<'a> {
             // Subqueries and Exists create new scopes - don't traverse into them
             Expression::Subquery(_) | Expression::Exists(_) => {}
             _ => {
-                // For other expressions, we could add more cases as needed
+                // Use the canonical AST traversal for other scalar expressions
+                // (typed functions, field access, filters, etc.). Scope
+                // boundaries are still enforced by should_stop_at.
+                children.extend(expr.children());
             }
         }
 
@@ -1325,6 +1386,21 @@ mod tests {
         let derived = &mut scope.derived_table_scopes[0];
         assert!(derived.is_derived_table());
         assert!(derived.sources.contains_key("t"));
+    }
+
+    #[test]
+    fn test_subquery_collection_respects_relation_boundaries() {
+        let scope = parse_and_build_scope(
+            "SELECT t.a FROM t JOIN (SELECT a FROM s) ON t.a = 1 \
+             WHERE EXISTS (SELECT 1 FROM u) ORDER BY (SELECT MAX(a) FROM v)",
+        );
+        assert_eq!(scope.derived_table_scopes.len(), 1);
+        assert_eq!(scope.subquery_scopes.len(), 2);
+        let scope = parse_and_build_scope(
+            "SELECT t.a FROM t JOIN s ON EXISTS (SELECT 1 FROM u WHERE u.a = t.a)",
+        );
+        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert!(scope.subquery_scopes[0].sources.contains_key("u"));
     }
 
     #[test]

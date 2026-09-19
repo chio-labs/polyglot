@@ -482,9 +482,7 @@ pub(super) fn rewrite(
                             }
                         }
                         DataType::TinyInt { .. } => match target {
-                            DialectType::DuckDB => DataType::Custom {
-                                name: "UTINYINT".to_string(),
-                            },
+                            DialectType::DuckDB => DataType::UInt8,
                             DialectType::Hive | DialectType::Spark | DialectType::Databricks => {
                                 DataType::SmallInt { length: None }
                             }

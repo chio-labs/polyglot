@@ -73,7 +73,7 @@ func (c *Client) RuntimeVersion() (string, error) {
 	defer unlock()
 
 	ptr := lib.Version()
-	if ptr == 0 {
+	if ptr == nil {
 		return "", &Error{Operation: "version", Status: ffi.StatusInternalError, Message: "polyglot_version returned NULL"}
 	}
 	return ffi.CString(ptr), nil
@@ -154,35 +154,66 @@ func (c *Client) Validate(sql, dialect string, options ...ValidationOptions) (Va
 		return ValidationResult{}, err
 	}
 
-	lib, unlock, err := c.use()
-	if err != nil {
-		return ValidationResult{}, err
-	}
-	defer unlock()
-
 	dialect = defaultDialect(dialect)
-	var result ffi.ValidationResult
 	if len(options) > 0 && options[0] != (ValidationOptions{}) {
 		optionsJSON, err := marshalOptions(options[0])
 		if err != nil {
 			return ValidationResult{}, err
 		}
-		result = lib.ValidateWithOptions(sql, dialect, optionsJSON)
-	} else {
-		result = lib.Validate(sql, dialect)
+		return c.callValidation("validate", func(lib *ffi.Library) ffi.ValidationResult {
+			return lib.ValidateWithOptions(sql, dialect, optionsJSON)
+		})
 	}
+	return c.callValidation("validate", func(lib *ffi.Library) ffi.ValidationResult {
+		return lib.Validate(sql, dialect)
+	})
+}
+
+// ValidateWithSchema checks references and optional types using the shared Rust
+// validator. Invalid SQL is returned as diagnostics, not as a Go error.
+func (c *Client) ValidateWithSchema(sql string, schema ValidationSchema, dialect string, options ...SchemaValidationOptions) (ValidationResult, error) {
+	if err := rejectNUL(sql, dialect); err != nil {
+		return ValidationResult{}, err
+	}
+	if len(options) > 1 {
+		return ValidationResult{}, fmt.Errorf("polyglot: expected at most one schema validation options value")
+	}
+	schemaJSON, err := marshalOptions(schema)
+	if err != nil {
+		return ValidationResult{}, err
+	}
+	var option SchemaValidationOptions
+	if len(options) == 1 {
+		option = options[0]
+	}
+	optionsJSON, err := marshalOptions(option)
+	if err != nil {
+		return ValidationResult{}, err
+	}
+	return c.callValidation("validate_with_schema", func(lib *ffi.Library) ffi.ValidationResult {
+		return lib.ValidateWithSchema(sql, schemaJSON, defaultDialect(dialect), optionsJSON)
+	})
+}
+
+func (c *Client) callValidation(operation string, call func(*ffi.Library) ffi.ValidationResult) (ValidationResult, error) {
+	lib, unlock, err := c.use()
+	if err != nil {
+		return ValidationResult{}, err
+	}
+	defer unlock()
+	result := call(lib)
 	defer lib.FreeValidationResult(result)
 
 	message := ffi.CString(result.Error)
 	if result.Status != ffi.StatusSuccess && result.Status != ffi.StatusValidationError {
-		return ValidationResult{}, &Error{Operation: "validate", Status: result.Status, Message: message}
+		return ValidationResult{}, &Error{Operation: operation, Status: result.Status, Message: message}
 	}
 
 	errorsJSON := ffi.CString(result.ErrorsJSON)
 	var validationErrors []ValidationError
 	if errorsJSON != "" {
 		if err := json.Unmarshal([]byte(errorsJSON), &validationErrors); err != nil {
-			return ValidationResult{}, fmt.Errorf("polyglot validate: decode validation errors: %w", err)
+			return ValidationResult{}, fmt.Errorf("polyglot %s: decode validation errors: %w", operation, err)
 		}
 	}
 
@@ -200,7 +231,7 @@ func (c *Client) Dialects() ([]string, error) {
 	defer unlock()
 
 	ptr := lib.DialectList()
-	if ptr == 0 {
+	if ptr == nil {
 		return nil, &Error{Operation: "dialects", Status: ffi.StatusInternalError, Message: "polyglot_dialect_list returned NULL"}
 	}
 	payload := ffi.CString(ptr)
@@ -222,30 +253,45 @@ func (c *Client) DialectCount() (int, error) {
 	return int(lib.DialectCount()), nil
 }
 
-func (c *Client) Parse(sql, dialect string) (json.RawMessage, error) {
-	if err := rejectNUL(sql, dialect); err != nil {
-		return nil, err
-	}
-	return c.callRaw("parse", func(lib *ffi.Library) ffi.Result {
-		return lib.Parse(sql, defaultDialect(dialect))
-	})
+func (c *Client) Parse(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse", sql, dialect, options)
 }
 
-func (c *Client) ParseOne(sql, dialect string) (json.RawMessage, error) {
-	if err := rejectNUL(sql, dialect); err != nil {
-		return nil, err
-	}
-	return c.callRaw("parse_one", func(lib *ffi.Library) ffi.Result {
-		return lib.ParseOne(sql, defaultDialect(dialect))
-	})
+func (c *Client) ParseOne(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse_one", sql, dialect, options)
 }
 
-func (c *Client) ParseDataType(sql, dialect string) (json.RawMessage, error) {
+func (c *Client) ParseDataType(sql, dialect string, options ...ParseOptions) (json.RawMessage, error) {
+	return c.callParse("parse_data_type", sql, dialect, options)
+}
+
+func (c *Client) callParse(operation, sql, dialect string, options []ParseOptions) (json.RawMessage, error) {
 	if err := rejectNUL(sql, dialect); err != nil {
 		return nil, err
 	}
-	return c.callRaw("parse_data_type", func(lib *ffi.Library) ffi.Result {
-		return lib.ParseDataType(sql, defaultDialect(dialect))
+	if len(options) > 1 {
+		return nil, fmt.Errorf("polyglot: expected at most one parse options value")
+	}
+	var optionsJSON string
+	if len(options) == 1 {
+		var err error
+		optionsJSON, err = marshalOptions(options[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c.callRaw(operation, func(lib *ffi.Library) ffi.Result {
+		plain, configured := lib.Parse, lib.ParseWithOptions
+		switch operation {
+		case "parse_one":
+			plain, configured = lib.ParseOne, lib.ParseOneWithOptions
+		case "parse_data_type":
+			plain, configured = lib.ParseDataType, lib.ParseDataTypeWithOptions
+		}
+		if optionsJSON != "" {
+			return configured(sql, defaultDialect(dialect), optionsJSON)
+		}
+		return plain(sql, defaultDialect(dialect))
 	})
 }
 

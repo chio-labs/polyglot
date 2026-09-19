@@ -10,9 +10,147 @@ use polyglot_sql_ffi::{
     polyglot_parse_one, polyglot_qualify_tables, polyglot_rename_tables_with_options,
     polyglot_set_limit, polyglot_set_offset, polyglot_set_order_by, polyglot_source_tables,
     polyglot_tokenize, polyglot_transpile, polyglot_transpile_with_options, polyglot_validate,
-    polyglot_validate_with_options, polyglot_version, PolyglotResult, PolyglotValidationResult,
+    polyglot_validate_with_options, polyglot_validate_with_schema, polyglot_version,
+    PolyglotResult, PolyglotValidationResult,
+};
+use polyglot_sql_ffi::{
+    polyglot_parse_data_type_with_options, polyglot_parse_one_with_options,
+    polyglot_parse_with_options,
 };
 use serde_json::Value;
+
+#[test]
+fn test_parse_validation_and_analysis_complexity_options() {
+    let dialect = c("snowflake");
+    let schema =
+        c(r#"{"tables":[{"name":"records","columns":[{"name":"value","type":"INTEGER"}]}]}"#);
+    for depth in [64, 65] {
+        let sql = c(&format!(
+            "SELECT {}value{} FROM records",
+            "COALESCE(".repeat(depth),
+            ", 0)".repeat(depth)
+        ));
+        for (json, accepted) in [
+            ("{}", depth == 64),
+            (r#"{"complexityGuard":null}"#, depth == 64),
+            (r#"{"complexityGuard":{}}"#, depth == 64),
+            (r#"{"complexityGuard":{"maxFunctionCallDepth":128}}"#, true),
+            (r#"{"complexityGuard":{"maxFunctionCallDepth":null}}"#, true),
+        ] {
+            let options = c(json);
+            for parse in [polyglot_parse_with_options, polyglot_parse_one_with_options] {
+                let (status, _, error) =
+                    consume_result(parse(sql.as_ptr(), dialect.as_ptr(), options.as_ptr()));
+                assert_eq!(status, if accepted { 0 } else { 1 }, "{json}: {error:?}");
+                if !accepted {
+                    assert!(error
+                        .unwrap()
+                        .contains("E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED"));
+                }
+            }
+            for result in [
+                polyglot_validate_with_options(sql.as_ptr(), dialect.as_ptr(), options.as_ptr()),
+                polyglot_validate_with_schema(
+                    sql.as_ptr(),
+                    schema.as_ptr(),
+                    dialect.as_ptr(),
+                    options.as_ptr(),
+                ),
+            ] {
+                let (status, valid, errors, error) = consume_validation(result);
+                assert_eq!(valid == 1, accepted, "{json}: {errors:?} {error:?}");
+                assert_eq!(status, if accepted { 0 } else { 4 });
+            }
+            let mut analysis_options: Value = serde_json::from_str(json).unwrap();
+            analysis_options["dialect"] = Value::String("snowflake".into());
+            let analysis_options = c(&analysis_options.to_string());
+            let (status, _, error) = consume_result(polyglot_analyze_query(
+                sql.as_ptr(),
+                analysis_options.as_ptr(),
+            ));
+            assert_eq!(status, if accepted { 0 } else { 1 }, "{error:?}");
+        }
+    }
+}
+
+#[test]
+fn test_parse_options_invalid_input_and_independent_guards() {
+    let dialect = c("snowflake");
+    let sql = c("SELECT 1");
+    let data_type = c("DECIMAL(10, 2)");
+    for parse in [
+        polyglot_parse_with_options,
+        polyglot_parse_one_with_options,
+        polyglot_parse_data_type_with_options,
+    ] {
+        for json in [
+            "not-json",
+            "null",
+            r#"{"complexityGuard":{"maxFunctionCallDepth":-1}}"#,
+            r#"{"complexityGuard":{"maxFunctionCallDepth":true}}"#,
+            r#"{"complexityGuard":{"maxFunctionCallDepth":1.5}}"#,
+            r#"{"complexityGuard":{"max_function_call_depth":128}}"#,
+        ] {
+            assert_eq!(
+                consume_result(parse(sql.as_ptr(), dialect.as_ptr(), c(json).as_ptr())).0,
+                6,
+                "{json}"
+            );
+        }
+        assert_eq!(
+            consume_result(parse(sql.as_ptr(), dialect.as_ptr(), ptr::null())).0,
+            5
+        );
+        assert_eq!(
+            consume_result(parse(ptr::null(), dialect.as_ptr(), c("{}").as_ptr())).0,
+            5
+        );
+        assert_eq!(
+            consume_result(parse(
+                sql.as_ptr(),
+                c("not-a-dialect").as_ptr(),
+                c("{}").as_ptr()
+            ))
+            .0,
+            5
+        );
+        let options = c(r#"{"complexityGuard":{"maxFunctionCallDepth":null,"maxInputBytes":1}}"#);
+        let (status, _, error) =
+            consume_result(parse(sql.as_ptr(), dialect.as_ptr(), options.as_ptr()));
+        assert_eq!(status, 1);
+        assert!(error.unwrap().contains("E_GUARD_INPUT_TOO_LARGE"));
+    }
+    let options = c(r#"{"complexityGuard":{"maxAstNodes":0}}"#);
+    let (status, _, error) = consume_result(polyglot_parse_data_type_with_options(
+        data_type.as_ptr(),
+        dialect.as_ptr(),
+        options.as_ptr(),
+    ));
+    assert_eq!(status, 1);
+    assert!(error.unwrap().contains("E_GUARD_AST_BUDGET_EXCEEDED"));
+    assert_eq!(
+        consume_result(polyglot_parse_data_type_with_options(
+            data_type.as_ptr(),
+            dialect.as_ptr(),
+            c("{}").as_ptr()
+        ))
+        .0,
+        0
+    );
+    assert_eq!(
+        consume_result(polyglot_parse_one_with_options(
+            c("SELECT 1; SELECT 2").as_ptr(),
+            dialect.as_ptr(),
+            c("{}").as_ptr()
+        ))
+        .0,
+        1
+    );
+    assert_eq!(
+        consume_result(polyglot_parse_one(sql.as_ptr(), dialect.as_ptr())).0,
+        0
+    );
+}
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -142,6 +280,47 @@ fn test_transpile_invalid_sql() {
     assert_eq!(status, 3);
     assert!(data.is_none());
     assert!(error.is_some());
+}
+
+#[test]
+fn test_transpile_unicode_date_time_formats() {
+    for (sql, read, write, expected) in [
+        (
+            "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+            "snowflake",
+            "snowflake",
+            "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+        ),
+        (
+            "SELECT TO_TIMESTAMP(x, 'éyyyy')",
+            "duckdb",
+            "duckdb",
+            "SELECT STRPTIME(x, 'é%Y')",
+        ),
+        (
+            "SELECT TO_CHAR(x, 'éYYYY')",
+            "oracle",
+            "presto",
+            "SELECT DATE_FORMAT(x, 'éYYYY')",
+        ),
+        (
+            "SELECT TO_TIMESTAMP(x, 'YYYY年MM月DD日')",
+            "snowflake",
+            "duckdb",
+            "SELECT STRPTIME(x, '%Y年%m月%d日')",
+        ),
+    ] {
+        let (sql, read, write) = (c(sql), c(read), c(write));
+        let (status, data, error) = consume_result(polyglot_transpile(
+            sql.as_ptr(),
+            read.as_ptr(),
+            write.as_ptr(),
+        ));
+        assert_eq!(status, 0, "error={error:?}");
+        let statements: Vec<String> =
+            serde_json::from_str(&data.expect("missing data")).expect("valid JSON");
+        assert_eq!(statements, vec![expected]);
+    }
 }
 
 #[test]
@@ -275,6 +454,56 @@ fn test_transpile_with_options_invalid_json() {
 }
 
 #[test]
+fn test_parser_depth_guard_options() {
+    let dialect = c("generic");
+    let sql = c(&format!("SELECT {}1", "~ ".repeat(12)));
+    for (value, fails) in [("0", true), ("8", true), ("64", false), ("null", false)] {
+        let options = c(&format!(
+            "{{\"complexityGuard\":{{\"maxParserDepth\":{value}}}}}"
+        ));
+        let (status, _, error) = consume_result(polyglot_transpile_with_options(
+            sql.as_ptr(),
+            dialect.as_ptr(),
+            dialect.as_ptr(),
+            options.as_ptr(),
+        ));
+        if fails {
+            assert_ne!(status, 0);
+            assert!(error.unwrap().contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+        } else {
+            assert_eq!(status, 0, "{error:?}");
+        }
+    }
+    for value in ["-1", "1.5", "true"] {
+        let options = c(&format!(
+            "{{\"complexityGuard\":{{\"maxParserDepth\":{value}}}}}"
+        ));
+        let (status, _, _) = consume_result(polyglot_transpile_with_options(
+            sql.as_ptr(),
+            dialect.as_ptr(),
+            dialect.as_ptr(),
+            options.as_ptr(),
+        ));
+        assert_eq!(status, 6);
+    }
+    let deep = c(&format!("SELECT {}1", "~ ".repeat(4000)));
+    let (status, _, error) = consume_result(polyglot_transpile(
+        deep.as_ptr(),
+        dialect.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_ne!(status, 0);
+    assert!(error.unwrap().contains("E_GUARD_PARSER_DEPTH_EXCEEDED"));
+    let good = c("SELECT 1");
+    let (status, _, error) = consume_result(polyglot_transpile(
+        good.as_ptr(),
+        dialect.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "{error:?}");
+}
+
+#[test]
 fn test_transpile_with_options_null_options() {
     let sql = c("SELECT 1");
     let from = c("postgres");
@@ -382,6 +611,34 @@ fn test_parse_returns_json_array() {
 }
 
 #[test]
+fn test_parse_preserves_source_spans() {
+    for (input, index, expected) in [
+        ("SELECT customer_id FROM orders", 0, "customer_id"),
+        ("SELECT \"é😀\", \"a\".\"b\" FROM \"t\"", 1, "\"a\".\"b\""),
+    ] {
+        let (status, data, error) = consume_result(polyglot_parse_one(
+            c(input).as_ptr(),
+            c("snowflake").as_ptr(),
+        ));
+        assert_eq!(status, 0, "{error:?}");
+        let ast: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        let column = &ast["select"]["expressions"][index]["column"];
+        let span = &column["span"];
+        let start = span["start"].as_u64().unwrap() as usize;
+        let end = span["end"].as_u64().unwrap() as usize;
+        assert_eq!(
+            input
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>(),
+            expected
+        );
+        assert!(column["name"]["span"].is_object());
+    }
+}
+
+#[test]
 fn test_parse_one_multiple_statements_fails() {
     let sql = c("SELECT 1; SELECT 2");
     let dialect = c("generic");
@@ -422,6 +679,66 @@ fn test_generate_data_type_renders_sql() {
     ));
     assert_eq!(gen_status, 0, "gen_error={gen_error:?}");
     assert_eq!(gen_data.expect("missing generated type"), "VARCHAR(255)");
+}
+
+#[test]
+fn test_generate_named_type_fields_quotes_and_preserves_names() {
+    let dialect = c("duckdb");
+    for (name, identifier) in [
+        ("field name", r#""field name""#),
+        ("a\"b", r#""a""b""#),
+        ("a INT, b", r#""a INT, b""#),
+    ] {
+        let input = c(&serde_json::json!({
+            "data_type": "struct", "nested": false,
+            "fields": [{"name": name, "data_type": {"data_type": "var_char", "length": null}}]
+        })
+        .to_string());
+        let (status, data, error) = consume_result(polyglot_generate_data_type(
+            input.as_ptr(),
+            dialect.as_ptr(),
+        ));
+        assert_eq!(status, 0, "{error:?}");
+        let sql = data.unwrap();
+        assert_eq!(sql, format!("STRUCT({identifier} TEXT)"));
+        let sql = c(&sql);
+        let (status, data, error) =
+            consume_result(polyglot_parse_data_type(sql.as_ptr(), dialect.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let parsed: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        assert_eq!(parsed["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["fields"][0]["name"], identifier);
+    }
+}
+
+#[test]
+fn test_integer_data_types_cross_ffi_boundary() {
+    for (input, tag, output) in [
+        ("HUGEINT", "int128", "INT128"),
+        ("UTINYINT", "uint8", "UTINYINT"),
+        ("USMALLINT", "uint16", "USMALLINT"),
+        ("UINTEGER", "uint32", "UINTEGER"),
+        ("UBIGINT", "uint64", "UBIGINT"),
+        ("UHUGEINT", "uint128", "UINT128"),
+    ] {
+        let sql = c(input);
+        let dialect = c("duckdb");
+        let (status, data, error) =
+            consume_result(polyglot_parse_data_type(sql.as_ptr(), dialect.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let payload = data.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            serde_json::json!({"data_type": tag})
+        );
+        let payload = c(&payload);
+        let (status, data, error) = consume_result(polyglot_generate_data_type(
+            payload.as_ptr(),
+            dialect.as_ptr(),
+        ));
+        assert_eq!(status, 0, "{error:?}");
+        assert_eq!(data.as_deref(), Some(output));
+    }
 }
 
 #[test]
@@ -696,6 +1013,37 @@ fn test_format_sql_with_options_guard_trigger() {
 }
 
 #[test]
+fn test_format_preserves_null_ordering() {
+    for dialect in ["snowflake", "duckdb", "postgres"] {
+        let dialect = c(dialect);
+        let options = c("{}");
+        for ordering in [
+            "category NULLS LAST, created_at DESC NULLS FIRST",
+            "category, created_at DESC",
+        ] {
+            let input = format!("SELECT id FROM items ORDER BY {ordering}");
+            let sql = c(&input);
+            for result in [
+                polyglot_format(sql.as_ptr(), dialect.as_ptr()),
+                polyglot_format_with_options(sql.as_ptr(), dialect.as_ptr(), options.as_ptr()),
+            ] {
+                let (status, data, error) = consume_result(result);
+                assert_eq!(status, 0, "{error:?}");
+                let statements: Vec<String> = serde_json::from_str(&data.unwrap()).unwrap();
+                assert_eq!(statements.len(), 1);
+                assert_eq!(
+                    statements[0]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    input
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_format_sql_with_options_invalid_json() {
     let sql = c("SELECT 1");
     let dialect = c("generic");
@@ -707,6 +1055,32 @@ fn test_format_sql_with_options_invalid_json() {
     ));
     assert_eq!(status, 6);
     assert!(error.is_some());
+}
+
+#[test]
+fn test_validation_semantic_correctness_contract() {
+    let dialect = c("snowflake");
+    let options = c(r#"{"semantic":true}"#);
+    for (sql, code) in [
+        ("SELECT id, SUM(amount) FROM t", "E230"),
+        ("SELECT id FROM t WHERE SUM(amount)>0", "E231"),
+        ("SELECT id FROM t WHERE ROW_NUMBER() OVER()=1", "E232"),
+    ] {
+        let sql = c(sql);
+        let (status, valid, errors_json, top_error) = consume_validation(
+            polyglot_validate_with_options(sql.as_ptr(), dialect.as_ptr(), options.as_ptr()),
+        );
+        assert_eq!(status, 4, "{top_error:?}");
+        assert_eq!(valid, 0);
+        let errors: Vec<Value> = serde_json::from_str(&errors_json.unwrap()).unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error["code"] == code && error["severity"] == "error"));
+        assert_eq!(
+            consume_validation(polyglot_validate(sql.as_ptr(), dialect.as_ptr())).1,
+            1
+        );
+    }
 }
 
 #[test]
@@ -785,6 +1159,141 @@ fn test_validate_with_options_rejects_invalid_options() {
     ));
     assert_eq!(status, 5);
     assert!(error.expect("top-level error").contains("options_json"));
+}
+
+#[test]
+fn test_schema_validation_shared_behavior_and_spans() {
+    let schema = c(
+        r#"{"tables":[{"name":"orders","columns":[{"name":"order_id","type":"INT"},{"name":"active","type":"BOOLEAN"}]}]}"#,
+    );
+    let dialect = c("snowflake");
+    for (sql, options, valid, code) in [
+        (
+            "SELECT o.order_id FROM orders o WHERE o.missing_column = TRUE",
+            "{}",
+            0,
+            "E201",
+        ),
+        (
+            "SELECT missing FROM orders",
+            r#"{"strict":false}"#,
+            1,
+            "E201",
+        ),
+        (
+            "SELECT order_id + active FROM orders",
+            r#"{"check_types":true}"#,
+            0,
+            "E212",
+        ),
+        (
+            "SELECT order_id + active FROM orders",
+            r#"{"checkTypes":true}"#,
+            0,
+            "E212",
+        ),
+        (
+            "SELECT order_id FROM orders a JOIN orders b ON a.order_id=b.order_id",
+            r#"{"checkReferences":true}"#,
+            0,
+            "E221",
+        ),
+        (
+            "SELECT *, FROM orders",
+            r#"{"strictSyntax":true,"semantic":true}"#,
+            0,
+            "E005",
+        ),
+    ] {
+        let (sql, options) = (c(sql), c(options));
+        let (status, actual_valid, errors, error) =
+            consume_validation(polyglot_validate_with_schema(
+                sql.as_ptr(),
+                schema.as_ptr(),
+                dialect.as_ptr(),
+                options.as_ptr(),
+            ));
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(actual_valid, valid);
+        assert_eq!(status, if valid == 1 { 0 } else { 4 });
+        let errors: Vec<Value> = serde_json::from_str(&errors.unwrap()).unwrap();
+        assert!(errors.iter().any(|e| e["code"] == code), "{errors:?}");
+    }
+    let sql = "SELECT '😀', o.\"míssing\", o.\"míssing\" FROM orders o";
+    let sql_c = c(sql);
+    let options = c("{}");
+    let (status, _, errors, _) = consume_validation(polyglot_validate_with_schema(
+        sql_c.as_ptr(),
+        schema.as_ptr(),
+        dialect.as_ptr(),
+        options.as_ptr(),
+    ));
+    assert_eq!(status, 4);
+    let errors: Vec<Value> = serde_json::from_str(&errors.unwrap()).unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_ne!(errors[0]["start"], errors[1]["start"]);
+    for error in errors {
+        let start = error["start"].as_u64().unwrap() as usize;
+        let end = error["end"].as_u64().unwrap() as usize;
+        assert_eq!(
+            sql.chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>(),
+            "\"míssing\""
+        );
+    }
+    for sql in [
+        "WITH a AS (SELECT order_id AS id FROM orders), b AS (SELECT id FROM a) SELECT id FROM b",
+        "SELECT o.order_id FROM orders o WHERE EXISTS (SELECT 1 FROM orders i WHERE i.order_id=o.order_id)",
+    ] {
+        let sql = c(sql);
+        let (status, valid, errors, _) = consume_validation(polyglot_validate_with_schema(sql.as_ptr(), schema.as_ptr(), dialect.as_ptr(), options.as_ptr()));
+        assert_eq!((status, valid), (0, 1), "{errors:?}");
+    }
+}
+
+#[test]
+fn test_schema_validation_invalid_ffi_arguments() {
+    let args = [c("SELECT 1"), c(r#"{"tables":[]}"#), c("generic"), c("{}")];
+    let names = ["sql", "schema_json", "dialect", "options_json"];
+    let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+    for index in 0..args.len() {
+        for invalid in [ptr::null(), invalid_utf8.as_ptr()] {
+            let mut pointers = args.each_ref().map(|arg| arg.as_ptr());
+            pointers[index] = invalid;
+            let (status, valid, _, error) = consume_validation(polyglot_validate_with_schema(
+                pointers[0],
+                pointers[1],
+                pointers[2],
+                pointers[3],
+            ));
+            assert_eq!((status, valid), (5, 0));
+            assert!(error.unwrap().contains(names[index]));
+        }
+    }
+    for (schema, dialect, options, expected_status) in [
+        ("{}", "generic", "{}", 6),
+        (r#"{"tables":[]}"#, "bad_dialect", "{}", 5),
+        (r#"{"tables":[]}"#, "generic", "{bad", 6),
+        (r#"{"tables":[]}"#, "generic", r#"{"checkType":true}"#, 6),
+        (
+            r#"{"tables":[]}"#,
+            "generic",
+            r#"{"check_types":"true"}"#,
+            6,
+        ),
+    ] {
+        let (schema, dialect, options) = (c(schema), c(dialect), c(options));
+        let (status, valid, _, error) = consume_validation(polyglot_validate_with_schema(
+            args[0].as_ptr(),
+            schema.as_ptr(),
+            dialect.as_ptr(),
+            options.as_ptr(),
+        ));
+        assert_eq!((status, valid), (expected_status, 0));
+        assert!(error.is_some());
+    }
 }
 
 #[test]
@@ -1076,6 +1585,25 @@ fn test_source_tables_postgres_prepare_body() {
 }
 
 #[test]
+fn test_analyze_query_cte_cast_type() {
+    let sql = c("WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final");
+    for options in [
+        r#"{"dialect":"snowflake"}"#,
+        r#"{"dialect":"snowflake","schema":{"tables":[{"name":"raw_orders","columns":[{"name":"amount","type":"VARCHAR"}]}]}}"#,
+    ] {
+        let options = c(options);
+        let (status, data, error) =
+            consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let analysis: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        let projection = &analysis["projections"][0];
+        assert_eq!(projection["typeHint"], "INT");
+        assert_eq!(projection["transformKind"], "direct");
+        assert!(projection["castType"].is_null());
+    }
+}
+
+#[test]
 fn test_analyze_query_happy_path() {
     let sql = c("SELECT o.id, SUM(o.amount) AS amount_sum FROM orders AS o GROUP BY o.id");
     let options = c(r#"{
@@ -1111,6 +1639,38 @@ fn test_analyze_query_happy_path() {
     assert_eq!(analysis["projections"][1]["transformKind"], "aggregation");
     assert_eq!(analysis["projections"][1]["typeHint"], "DECIMAL(10, 2)");
     assert_eq!(analysis["projections"][0]["nullability"], "non_null");
+    assert_eq!(analysis["columnUses"][0]["context"], "group");
+    assert_eq!(analysis["columnUses"][0]["references"][0]["column"], "id");
+}
+
+#[test]
+fn test_analyze_query_column_uses_and_original_spans() {
+    let text = "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1";
+    let sql = c(text);
+    let options = c(r#"{"dialect":"duckdb"}"#);
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 0, "{error:?}");
+    let analysis: Value = serde_json::from_str(&data.unwrap()).unwrap();
+    let fact = &analysis["columnUses"][0];
+    assert_eq!(fact["context"], "filter");
+    assert_eq!(fact["scopePath"], "root");
+    let references = fact["references"].as_array().unwrap();
+    assert_eq!(references.len(), 2);
+    assert_ne!(references[0]["span"], references[1]["span"]);
+    for reference in references {
+        assert_eq!(reference["sourceName"], "orders");
+        assert_eq!(reference["confidence"], "resolved");
+        let start = reference["span"]["start"].as_u64().unwrap() as usize;
+        let end = reference["span"]["end"].as_u64().unwrap() as usize;
+        assert_eq!(
+            text.chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>(),
+            "o.amount"
+        );
+    }
 }
 
 #[test]
@@ -1252,7 +1812,7 @@ fn test_analyze_query_tolerates_partial_schema() {
         .any(|reference| {
             reference["column"] == "order_id"
                 && reference["table"] == "t"
-                && reference["confidence"] == "resolved"
+                && reference["confidence"] == "unknown"
         }));
     assert!(projections[1]["upstream"]
         .as_array()
@@ -1527,11 +2087,12 @@ fn test_public_api_matches_capability_contract() {
         "version" => { polyglot_version },
         "dialects" => { polyglot_dialect_list, polyglot_dialect_count },
         "transpile" => { polyglot_transpile, polyglot_transpile_with_options },
-        "parse" => { polyglot_parse, polyglot_parse_one },
-        "data_types" => { polyglot_parse_data_type, polyglot_generate_data_type },
+        "parse" => { polyglot_parse, polyglot_parse_one, polyglot_parse_with_options, polyglot_parse_one_with_options },
+        "data_types" => { polyglot_parse_data_type, polyglot_parse_data_type_with_options, polyglot_generate_data_type },
         "generate" => { polyglot_generate },
         "format" => { polyglot_format, polyglot_format_with_options },
         "validate" => { polyglot_validate, polyglot_validate_with_options },
+        "validate_schema" => { polyglot_validate_with_schema },
         "optimize" => { polyglot_optimize },
         "tokenize" => { polyglot_tokenize },
         "annotate_types" => { polyglot_annotate_types },

@@ -4,6 +4,8 @@
         test-rust test-rust-all test-rust-identity test-rust-dialect \
         test-rust-transpile test-rust-pretty test-rust-roundtrip test-rust-matrix \
         test-rust-compat test-rust-errors test-rust-functions test-rust-custom test-rust-lib test-rust-feature-gates test-rust-verify \
+        test-rust-verify-core test-rust-verify-release \
+        test-rust-ci-core test-rust-ci-release-fixtures test-rust-ci-bindings test-rust-ci-feature-gates \
         test-rust-transpile-generic test-rust-parser test-rust-check \
         test-rust-clickhouse-parser test-rust-clickhouse-coverage \
         test-ffi build-go test-go test-go-integration \
@@ -52,7 +54,11 @@ help:
 	@echo "  make test-rust-lib       - Run lib unit tests"
 	@echo "  make test-rust-feature-gates - Check optional Cargo feature combinations"
 	@echo "  make test-rust-check     - Compile Rust test targets without running them"
-	@echo "  make test-rust-verify    - Run full Rust verification suite incl. FFI"
+	@echo "  make test-rust-verify    - Check benchmarks and run full Rust verification incl. FFI"
+	@echo "  make test-rust-ci-core   - CI core/debug suite, including the standalone example"
+	@echo "  make test-rust-ci-release-fixtures - CI pretty-print and ClickHouse release tests"
+	@echo "  make test-rust-ci-bindings - CI WASM/FFI tests and FFI release build"
+	@echo "  make test-rust-ci-feature-gates - CI capability and single-dialect WASM checks"
 	@echo ""
 	@echo "  SQLGlot Fixture Tests:"
 	@echo "  make test-rust-identity         - Generic identity tests"
@@ -122,7 +128,7 @@ help:
 	@echo "  make lint-rust           - Run strict Clippy on wrapper/catalog crates"
 	@echo "  make lint-sdk            - Run Biome checks for the TypeScript SDK"
 	@echo "  make check-consistency   - Check versions, dialect metadata, and active docs"
-	@echo "  make docs-check          - Check metadata, Rust example, and Python docs"
+	@echo "  make docs-check          - Validate metadata, Rust example, and Python docs (no version updates)"
 	@echo "  make dev                 - Run quick development checks"
 	@echo "  make validate            - Run validation before commit"
 	@echo ""
@@ -230,11 +236,24 @@ test-rust-pretty:
 test-rust-lib:
 	cargo test --lib -p polyglot-sql
 
+# Check capabilities separately so Cargo feature unification cannot mask dependencies.
 test-rust-feature-gates:
 	cargo check -p polyglot-sql --no-default-features
+	@for feature in generate transpile builder ast-tools semantic openlineage diff planner time \
+		function-catalog-clickhouse function-catalog-duckdb function-catalog-all-dialects; do \
+		cargo check -p polyglot-sql --no-default-features --features "$$feature" || exit $$?; \
+	done
 	cargo check -p polyglot-sql --no-default-features --features dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features generate,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-clickhouse,dialect-postgresql
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-tsql
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-fabric
+	cargo check -p polyglot-sql --no-default-features --features dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features generate,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features ast-tools,dialect-snowflake
+	cargo check -p polyglot-sql --no-default-features --features semantic,generate
+	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features semantic,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features openlineage,dialect-clickhouse
 	cargo check -p polyglot-sql --no-default-features --features builder,diff,planner,time,dialect-clickhouse
@@ -248,10 +267,21 @@ test-rust-all:
 		--test sqlglot_transpilation --test sqlglot_pretty \
 		--test sqlglot_transpile --test sqlglot_parser -- --nocapture
 
-# Run lib + fixture suites + custom dialects + clickhouse + FFI tests (full verification)
+# Compile benchmarks and run lib + fixtures + custom dialects + ClickHouse + FFI tests.
+# Keep local verification sequential; CI gives each suite its own runner/target directory.
 test-rust-verify:
+	@$(MAKE) test-rust-verify-core
+	@$(MAKE) test-rust-verify-release
+	@$(MAKE) test-ffi
+
+# Shared recipes keep local verification and the CI suite selections in sync.
+test-rust-verify-core:
+	@echo "=== Compile performance benchmarks ==="
+	@cargo check -p polyglot-sql --benches
+	@echo ""
 	@echo "=== Lib unit tests ==="
 	@cargo test --lib -p polyglot-sql
+	@cargo test -p polyglot-sql --test deep_nesting_regression
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture
@@ -268,20 +298,36 @@ test-rust-verify:
 	@echo "=== Parser tests ==="
 	@cargo test --test sqlglot_parser test_sqlglot_parser_all -p polyglot-sql -- --nocapture
 	@echo ""
-	@echo "=== Pretty-print tests ==="
-	@cargo test --test sqlglot_pretty test_sqlglot_pretty_all -p polyglot-sql --release -- --nocapture
-	@echo ""
 	@echo "=== Custom dialect tests ==="
 	@cargo test --test custom_dialect_tests -p polyglot-sql -- --nocapture
+
+test-rust-verify-release:
+	@echo "=== Pretty-print tests ==="
+	@cargo test --test sqlglot_pretty test_sqlglot_pretty_all -p polyglot-sql --release -- --nocapture
 	@echo ""
 	@echo "=== ClickHouse parser tests ==="
 	@cargo test --test custom_clickhouse_parser -p polyglot-sql --release -- --nocapture
 	@echo ""
 	@echo "=== ClickHouse coverage tests ==="
 	@cargo test --test custom_clickhouse_coverage -p polyglot-sql --release -- --nocapture
-	@echo ""
-	@echo "=== FFI tests ==="
-	@cargo test -p polyglot-sql-ffi -- --nocapture
+
+# Four suites used by the CI matrix on both release and non-release events.
+# Fixture extraction remains explicit so these targets also work with local fixtures.
+test-rust-ci-core:
+	@$(MAKE) test-rust-verify-core
+	cargo check --manifest-path examples/rust/Cargo.toml
+
+test-rust-ci-release-fixtures:
+	RUST_MIN_STACK=16777216 $(MAKE) test-rust-verify-release
+
+test-rust-ci-bindings:
+	cargo test -p polyglot-sql-wasm --lib -- --nocapture
+	@$(MAKE) test-ffi
+	@$(MAKE) build-ffi
+
+test-rust-ci-feature-gates:
+	@$(MAKE) test-rust-feature-gates
+	cargo check -p polyglot-sql-wasm --no-default-features --features "console_error_panic_hook,dialect-clickhouse"
 
 # Run normalization/transpile tests from test_transpile.py
 test-rust-transpile-generic:
@@ -629,8 +675,7 @@ endif
 	@echo "Bumping version to $(V)..."
 	cargo set-version $(V)
 	pnpm -r exec pnpm version $(V) --no-git-tag-version
-	perl -0pi -e 's/const sdkVersion = "[^"]+"/const sdkVersion = "$(V)"/' packages/go/types.go
-	perl -0pi -e 's/(polyglot-sql = \{ version = ")[^"]+"/$${1}$(V)"/g' README.md crates/polyglot-sql/README.md examples/rust/Cargo.toml
+	python3 scripts/check_project_consistency.py --sync-version-references
 	cargo update --manifest-path examples/rust/Cargo.toml -p polyglot-sql
 	$(MAKE) check-consistency
 	@echo "Version bumped to $(V) in all crates and packages."

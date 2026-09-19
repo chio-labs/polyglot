@@ -26,6 +26,290 @@ func integrationClient(t *testing.T) *Client {
 	return client
 }
 
+func TestIntegrationNullOrderingPreservation(t *testing.T) {
+	client := integrationClient(t)
+	for _, dialect := range []string{"snowflake", "duckdb", "postgres"} {
+		for _, ordering := range []string{
+			"category NULLS LAST, created_at DESC NULLS FIRST",
+			"category, created_at DESC",
+		} {
+			sql := "SELECT id FROM items ORDER BY " + ordering
+			for _, options := range [][]FormatOptions{nil, {{}}} {
+				result, err := client.Format(sql, dialect, options...)
+				if err != nil || len(result) != 1 || strings.Join(strings.Fields(result[0]), " ") != sql {
+					t.Fatalf("format %s: %v, %v", dialect, result, err)
+				}
+			}
+			if dialect != "postgres" {
+				result, err := client.Transpile(sql, dialect, dialect)
+				if err != nil || len(result) != 1 || result[0] != sql {
+					t.Fatalf("transpile %s: %v, %v", dialect, result, err)
+				}
+			}
+		}
+	}
+}
+
+func TestIntegrationParserDepthGuard(t *testing.T) {
+	client := integrationClient(t)
+	sql := "SELECT " + strings.Repeat("~ ", 12) + "1"
+	for _, tc := range []struct {
+		limit GuardLimit
+		fails bool
+	}{
+		{GuardLimit{}, false}, {NewGuardLimit(0), true}, {NewGuardLimit(8), true},
+		{NewGuardLimit(64), false}, {DisabledGuardLimit(), false},
+	} {
+		_, err := client.Transpile(sql, "generic", "generic", TranspileOptions{
+			ComplexityGuard: &ComplexityGuardOptions{MaxParserDepth: tc.limit},
+		})
+		if tc.fails {
+			if err == nil || !strings.Contains(err.Error(), "E_GUARD_PARSER_DEPTH_EXCEEDED") {
+				t.Fatalf("expected depth error, got %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Transpile("SELECT "+strings.Repeat("~ ", 4000)+"1", "generic", "generic"); err == nil || !strings.Contains(err.Error(), "E_GUARD_PARSER_DEPTH_EXCEEDED") {
+		t.Fatalf("default guard: %v", err)
+	}
+	if _, err := client.Parse("SELECT 1", "generic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationParseValidationAnalysisGuardOptions(t *testing.T) {
+	client := integrationClient(t)
+	schema := ValidationSchema{Tables: []SchemaTable{{Name: "records", Columns: []SchemaColumn{{Name: "value", Type: "INTEGER"}}}}}
+	for _, depth := range []int{64, 65} {
+		sql := "SELECT " + strings.Repeat("COALESCE(", depth) + "value" + strings.Repeat(", 0)", depth) + " FROM records"
+		for _, tc := range []struct {
+			guard    *ComplexityGuardOptions
+			accepted bool
+		}{
+			{nil, depth == 64}, {&ComplexityGuardOptions{}, depth == 64},
+			{&ComplexityGuardOptions{MaxFunctionCallDepth: NewGuardLimit(128)}, true},
+			{&ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit()}, true},
+		} {
+			for _, parse := range []func(string, string, ...ParseOptions) (json.RawMessage, error){client.Parse, client.ParseOne} {
+				_, err := parse(sql, "snowflake", ParseOptions{ComplexityGuard: tc.guard})
+				if (err == nil) != tc.accepted {
+					t.Fatalf("depth=%d, accepted=%v: %v", depth, tc.accepted, err)
+				}
+				if err != nil && !strings.Contains(err.Error(), "E_GUARD_FUNCTION_NESTING_DEPTH_EXCEEDED") {
+					t.Fatal(err)
+				}
+			}
+			result, err := client.Validate(sql, "snowflake", ValidationOptions{ComplexityGuard: tc.guard})
+			if err != nil || result.Valid != tc.accepted {
+				t.Fatalf("validate: %#v, %v", result, err)
+			}
+			result, err = client.ValidateWithSchema(sql, schema, "snowflake", SchemaValidationOptions{ComplexityGuard: tc.guard})
+			if err != nil || result.Valid != tc.accepted {
+				t.Fatalf("validate schema: %#v, %v", result, err)
+			}
+			_, err = client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "snowflake", ComplexityGuard: tc.guard})
+			if (err == nil) != tc.accepted {
+				t.Fatalf("analyze: %v", err)
+			}
+		}
+	}
+	_, err := client.Parse("SELECT 1", "generic", ParseOptions{ComplexityGuard: &ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit(), MaxInputBytes: NewGuardLimit(1)}})
+	if err == nil || !strings.Contains(err.Error(), "E_GUARD_INPUT_TOO_LARGE") {
+		t.Fatalf("independent guard: %v", err)
+	}
+	_, err = client.ParseDataType("DECIMAL(10, 2)", "snowflake", ParseOptions{ComplexityGuard: &ComplexityGuardOptions{MaxASTNodes: NewGuardLimit(0)}})
+	if err == nil || !strings.Contains(err.Error(), "E_GUARD_AST_BUDGET_EXCEEDED") {
+		t.Fatalf("data type guard: %v", err)
+	}
+	if _, err := client.ParseDataType("DECIMAL(10, 2)", "snowflake"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ParseOne("SELECT 1; SELECT 2", "generic", ParseOptions{}); err == nil {
+		t.Fatal("accepted multiple statements")
+	}
+	if _, err := client.Parse("SELECT 1", "generic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationAnalyzeQueryCTECastType(t *testing.T) {
+	client := integrationClient(t)
+	sql := "WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final"
+	schema := &ValidationSchema{Tables: []SchemaTable{{Name: "raw_orders", Columns: []SchemaColumn{{Name: "amount", Type: "VARCHAR"}}}}}
+	for _, inputSchema := range []*ValidationSchema{nil, schema} {
+		analysis, err := client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "snowflake", Schema: inputSchema})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(analysis.Projections) != 1 {
+			t.Fatalf("unexpected projections: %#v", analysis.Projections)
+		}
+		projection := analysis.Projections[0]
+		if projection.TypeHint == nil || *projection.TypeHint != "INT" || projection.TransformKind != "direct" || projection.CastType != nil {
+			t.Fatalf("unexpected CTE projection: %#v", projection)
+		}
+	}
+}
+
+func TestIntegrationAnalyzeQueryColumnUses(t *testing.T) {
+	client := integrationClient(t)
+	sql := "SELECT '😀', o.id FROM orders o WHERE o.amount > 0 OR o.amount < -1"
+	analysis, err := client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "duckdb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analysis.ColumnUses) != 1 {
+		t.Fatalf("unexpected uses: %#v", analysis.ColumnUses)
+	}
+	fact := analysis.ColumnUses[0]
+	if fact.Context != ColumnUseFilter || fact.ScopePath != "root" || fact.ExpressionPath != "where_clause.this" || len(fact.References) != 2 {
+		t.Fatalf("unexpected use: %#v", fact)
+	}
+	if *fact.References[0].Span == *fact.References[1].Span {
+		t.Fatal("occurrences were deduplicated")
+	}
+	for _, ref := range fact.References {
+		if ref.SourceName == nil || *ref.SourceName != "orders" || ref.SourceAlias == nil || *ref.SourceAlias != "o" || ref.Column != "amount" || ref.Confidence != "resolved" {
+			t.Fatalf("unexpected reference: %#v", ref)
+		}
+		if ref.Span == nil || string([]rune(sql)[ref.Span.Start:ref.Span.End]) != "o.amount" {
+			t.Fatalf("invalid occurrence span: %#v", ref)
+		}
+	}
+	if len(analysis.Projections[1].Upstream) != 1 || analysis.Projections[1].Upstream[0].Column != "id" {
+		t.Fatal("projection lineage changed")
+	}
+	analysis, err = client.AnalyzeQuery("WITH base AS (SELECT id, amount FROM orders) SELECT id FROM base WHERE amount > 0 EXCEPT SELECT id FROM blocked", AnalyzeQueryOptions{Dialect: "duckdb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenFilter, seenBranch := false, false
+	for _, use := range analysis.ColumnUses {
+		if use.Context == ColumnUseFilter {
+			seenFilter = use.ScopePath == "root.branches[0]" && *use.References[0].Table == "orders" && use.References[0].Column == "amount"
+		}
+		if use.Context == ColumnUseSetOperationFilter {
+			seenBranch = use.ScopePath == "root.branches[1]" && *use.References[0].Table == "blocked"
+		}
+	}
+	if !seenFilter || !seenBranch {
+		t.Fatalf("missing scoped facts: %#v", analysis.ColumnUses)
+	}
+}
+
+func TestIntegrationValidateWithSchema(t *testing.T) {
+	client := integrationClient(t)
+	schema := ValidationSchema{Tables: []SchemaTable{
+		{Name: "orders", Columns: []SchemaColumn{{Name: "order_id", Type: "INT"}, {Name: "active", Type: "BOOLEAN"}}},
+		{Name: "customers", Columns: []SchemaColumn{{Name: "order_id", Type: "INT"}}},
+	}}
+	for _, tc := range []struct{ sql, code, token string }{
+		{"SELECT o.order_id FROM orders o WHERE o.missing_column = TRUE", "E201", "missing_column"},
+		{"SELECT x.order_id FROM orders", "E222", "x"},
+		{"SELECT * FROM missing", "E200", "missing"},
+		{"SELECT '😀', o.\"míssing\" FROM orders o", "E201", "\"míssing\""},
+		{"SELECT order_id FROM orders o JOIN customers c ON o.order_id=c.order_id", "E221", "order_id"},
+	} {
+		result, err := client.ValidateWithSchema(tc.sql, schema, "snowflake", SchemaValidationOptions{CheckTypes: true, CheckReferences: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid {
+			t.Fatalf("expected invalid SQL: %s", tc.sql)
+		}
+		found := false
+		for _, finding := range result.Errors {
+			if finding.Code != tc.code {
+				continue
+			}
+			found = true
+			if finding.Start == nil || finding.End == nil {
+				t.Fatalf("missing range: %+v", finding)
+			}
+			if token := string([]rune(tc.sql)[*finding.Start:*finding.End]); token != tc.token {
+				t.Fatalf("token = %q, want %q", token, tc.token)
+			}
+		}
+		if !found {
+			t.Fatalf("missing %s: %+v", tc.code, result.Errors)
+		}
+	}
+	for _, sql := range []string{
+		"WITH a AS (SELECT order_id AS id FROM orders), b AS (SELECT id FROM a) SELECT id FROM b",
+		"SELECT o.order_id FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.order_id=o.order_id)",
+	} {
+		result, err := client.ValidateWithSchema(sql, schema, "snowflake", SchemaValidationOptions{CheckReferences: true})
+		if err != nil || !result.Valid {
+			t.Fatalf("%s: %+v, %v", sql, result, err)
+		}
+	}
+	result, err := client.ValidateWithSchema("SELECT order_id FROM q WHERE EXISTS (WITH q AS (SELECT order_id FROM orders) SELECT order_id FROM q)", schema, "snowflake")
+	if err != nil || result.Valid {
+		t.Fatalf("CTE visibility: %+v, %v", result, err)
+	}
+
+	strict := false
+	schema.Strict = &strict
+	result, err = client.ValidateWithSchema("SELECT missing FROM orders", schema, "")
+	if err != nil || !result.Valid || result.Errors[0].Severity != "warning" {
+		t.Fatalf("non-strict: %+v, %v", result, err)
+	}
+	forceStrict := true
+	result, err = client.ValidateWithSchema("SELECT missing FROM orders", schema, "", SchemaValidationOptions{Strict: &forceStrict})
+	if err != nil || result.Valid {
+		t.Fatalf("strict override: %+v, %v", result, err)
+	}
+	schema.Strict = nil
+	result, err = client.ValidateWithSchema("SELECT order_id + active FROM orders", schema, "", SchemaValidationOptions{CheckTypes: true})
+	if err != nil || result.Valid {
+		t.Fatalf("types: %+v, %v", result, err)
+	}
+	result, err = client.ValidateWithSchema("SELECT *, FROM orders", schema, "", SchemaValidationOptions{StrictSyntax: true, Semantic: true})
+	if err != nil || result.Valid || len(result.Errors) != 1 || result.Errors[0].Code != "E005" {
+		t.Fatalf("syntax precedence: %+v, %v", result, err)
+	}
+	result, err = client.ValidateWithSchema("SELECT * FROM orders LIMIT 10", schema, "", SchemaValidationOptions{Semantic: true})
+	if err != nil || !result.Valid || len(result.Errors) != 2 {
+		t.Fatalf("semantic warnings: %+v, %v", result, err)
+	}
+	for _, test := range []struct{ sql, code string }{
+		{"SELECT order_id, SUM(active) FROM orders", "E230"},
+		{"SELECT order_id FROM orders WHERE SUM(order_id)>0", "E231"},
+		{"SELECT order_id FROM orders WHERE ROW_NUMBER() OVER()=1", "E232"},
+	} {
+		result, err = client.ValidateWithSchema(test.sql, schema, "snowflake", SchemaValidationOptions{Semantic: true, Strict: &strict})
+		found := false
+		for _, finding := range result.Errors {
+			found = found || (finding.Code == test.code && finding.Severity == "error")
+		}
+		if err != nil || result.Valid || !found {
+			t.Fatalf("semantic correctness %s: %+v, %v", test.sql, result, err)
+		}
+	}
+	for _, columns := range [][]SchemaColumn{nil, {{Name: "*"}}} {
+		schema.Tables[0].Columns = columns
+		result, err = client.ValidateWithSchema("SELECT missing FROM orders o JOIN customers c ON TRUE", schema, "")
+		if err != nil || !result.Valid {
+			t.Fatalf("open schema: %+v, %v", result, err)
+		}
+	}
+	if _, err = client.ValidateWithSchema("SELECT 1", schema, "bad_dialect"); err == nil {
+		t.Fatal("unknown dialect accepted")
+	}
+	result, err = client.ValidateWithSchema("SELECT 1", ValidationSchema{}, "")
+	if err != nil || !result.Valid {
+		t.Fatalf("zero-value schema: %+v, %v", result, err)
+	}
+	SetDefaultClient(client)
+	t.Cleanup(ClearDefaultClient)
+	result, err = ValidateWithSchema("SELECT order_id FROM customers", schema, "snowflake")
+	if err != nil || !result.Valid {
+		t.Fatalf("package wrapper: %+v, %v", result, err)
+	}
+}
+
 func benchmarkClient(b *testing.B) *Client {
 	b.Helper()
 	if os.Getenv(LibraryPathEnv) == "" {
@@ -41,6 +325,119 @@ func benchmarkClient(b *testing.B) *Client {
 		}
 	})
 	return client
+}
+
+func TestIntegrationParseSourceSpans(t *testing.T) {
+	client := integrationClient(t)
+	type sourceSpan struct{ Start, End, Line, Column int }
+	for _, tc := range []struct {
+		sql    string
+		index  int
+		source string
+	}{
+		{"SELECT customer_id FROM orders", 0, "customer_id"},
+		{"SELECT \"é😀\", \"a\".\"b\" FROM \"t\"", 1, "\"a\".\"b\""},
+	} {
+		data, err := client.ParseOne(tc.sql, "snowflake")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ast struct {
+			Select struct {
+				Expressions []struct {
+					Column struct {
+						Name struct{ Span *sourceSpan }
+						Span *sourceSpan
+					}
+				}
+			}
+		}
+		if err := json.Unmarshal(data, &ast); err != nil {
+			t.Fatal(err)
+		}
+		column := ast.Select.Expressions[tc.index].Column
+		if column.Span == nil || column.Name.Span == nil {
+			t.Fatalf("missing spans: %s", data)
+		}
+		span := column.Span
+		if source := string([]rune(tc.sql)[span.Start:span.End]); source != tc.source {
+			t.Fatalf("source %q, want %q", source, tc.source)
+		}
+	}
+}
+
+func TestIntegrationIntegerDataTypes(t *testing.T) {
+	client := integrationClient(t)
+	for _, tc := range []struct{ dialect, input, output, tag string }{
+		{"duckdb", "HUGEINT", "INT128", "int128"},
+		{"duckdb", "INT128", "INT128", "int128"},
+		{"clickhouse", "Int128", "Int128", "int128"},
+		{"starrocks", "LARGEINT", "LARGEINT", "int128"},
+		{"duckdb", "UTINYINT", "UTINYINT", "uint8"},
+		{"duckdb", "USMALLINT", "USMALLINT", "uint16"},
+		{"duckdb", "UINTEGER", "UINTEGER", "uint32"},
+		{"duckdb", "UBIGINT", "UBIGINT", "uint64"},
+		{"duckdb", "UHUGEINT", "UINT128", "uint128"},
+		{"duckdb", "UINT128", "UINT128", "uint128"},
+	} {
+		t.Run(tc.dialect+"/"+tc.input, func(t *testing.T) {
+			dataType, err := client.ParseDataType(tc.input, tc.dialect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(dataType, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded["data_type"] != tc.tag {
+				t.Fatalf("unexpected type: %s", dataType)
+			}
+			sql, err := client.GenerateDataType(dataType, tc.dialect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sql != tc.output {
+				t.Fatalf("generated %q, want %q", sql, tc.output)
+			}
+		})
+	}
+}
+
+func TestIntegrationGenerateDataTypeQuotedFieldNames(t *testing.T) {
+	client := integrationClient(t)
+	for _, tc := range []struct{ name, identifier string }{
+		{"field name", `"field name"`},
+		{`a"b`, `"a""b"`},
+		{"a INT, b", `"a INT, b"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, err := json.Marshal(map[string]any{
+				"data_type": "struct", "nested": false,
+				"fields": []any{map[string]any{"name": tc.name, "data_type": map[string]any{"data_type": "text"}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sql, err := client.GenerateDataType(input, "duckdb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sql != "STRUCT("+tc.identifier+" TEXT)" {
+				t.Fatalf("unexpected SQL: %s", sql)
+			}
+			parsed, err := client.ParseDataType(sql, "duckdb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var value struct{ Fields []struct{ Name string } }
+			if err := json.Unmarshal(parsed, &value); err != nil {
+				t.Fatal(err)
+			}
+			if len(value.Fields) != 1 || value.Fields[0].Name != tc.identifier {
+				t.Fatalf("field changed: %s", parsed)
+			}
+		})
+	}
 }
 
 func BenchmarkNativeProfileParse(b *testing.B) {
@@ -594,6 +991,11 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	if !hasUpstream(analysis.Projections[0].Upstream, "t", "order_id") {
 		t.Fatalf("unexpected AnalyzeQuery unknown-column upstream: %#v", analysis.Projections[0].Upstream)
+	}
+	for _, reference := range analysis.Projections[0].Upstream {
+		if reference.Confidence != "unknown" {
+			t.Fatalf("missing column claimed resolved: %#v", reference)
+		}
 	}
 	if !hasUpstream(analysis.Projections[1].Upstream, "t", "amount") {
 		t.Fatalf("unexpected AnalyzeQuery known-column upstream: %#v", analysis.Projections[1].Upstream)

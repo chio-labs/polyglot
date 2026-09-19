@@ -1,8 +1,12 @@
-//! Canonical AST construction and mutation primitives shared by builder façades.
+//! Canonical AST construction and mutation primitives shared by AST consumers.
 //!
-//! This module deliberately knows nothing about serde or a language binding. The
-//! native fluent API and [`super::plan`] both delegate their AST edits here so a
-//! clause has exactly one implementation.
+//! AST transform helpers, the native fluent builder, and serializable builder
+//! plans delegate their AST edits here so a clause has exactly one implementation.
+//! This module depends only on AST and error types, not the optional public builder
+//! API, SQL generation, serde, or a language binding.
+
+// AST-only consumers use a subset of the primitives; builders use the full set.
+#![cfg_attr(not(feature = "builder"), allow(dead_code))]
 
 use crate::error::{Error, Result};
 use crate::expressions::*;

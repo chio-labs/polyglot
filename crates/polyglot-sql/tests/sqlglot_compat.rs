@@ -277,6 +277,50 @@ mod alias_tests {
     }
 
     #[test]
+    fn test_duckdb_explicit_string_projection_aliases() {
+        assert_string_alias(
+            "SELECT 1 AS 'Column 1'",
+            DialectType::DuckDB,
+            "SELECT 1 AS \"Column 1\"",
+        );
+        assert!(Dialect::get(DialectType::DuckDB)
+            .parse("SELECT 1 'Column 1'")
+            .is_err());
+
+        for (sql, expected) in [
+            (
+                "SELECT 1 AS 'owner''s count'",
+                "SELECT 1 AS \"owner's count\"",
+            ),
+            (
+                "SELECT 1 AS 'item \"count\"'",
+                "SELECT 1 AS \"item \"\"count\"\"\"",
+            ),
+            ("SELECT 1 AS 'select'", "SELECT 1 AS \"select\""),
+            ("SELECT 1 AS ''", "SELECT 1"),
+            ("SELECT 'literal' AS ''", "SELECT 'literal'"),
+        ] {
+            let generated = transpile(sql, DialectType::DuckDB, DialectType::DuckDB);
+            assert_eq!(generated, expected, "{sql}");
+            assert_eq!(
+                transpile(&generated, DialectType::DuckDB, DialectType::DuckDB),
+                generated,
+                "{sql}"
+            );
+        }
+        for (dialect, expected) in [
+            (DialectType::PostgreSQL, "SELECT 1 AS \"Column 1\""),
+            (DialectType::TSQL, "SELECT 1 AS [Column 1]"),
+            (DialectType::MySQL, "SELECT 1 AS `Column 1`"),
+        ] {
+            assert_eq!(
+                transpile("SELECT 1 AS 'Column 1'", DialectType::DuckDB, dialect),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn test_tsql_string_projection_alias_issue_375() {
         let sql = "SELECT table.col1 AS 'Column 1' FROM table";
         let expected = "SELECT table.col1 AS [Column 1] FROM table";
@@ -992,6 +1036,80 @@ mod dialect_type_tests {
     use polyglot_sql::dialects::DialectType;
     use polyglot_sql::expressions::{BooleanLiteral, Expression};
     use polyglot_sql::generator::{Generator, GeneratorConfig};
+
+    #[test]
+    fn test_unsigned_integer_dialect_aliases() {
+        for (duckdb, clickhouse, output) in [
+            ("UTINYINT", "UInt8", "UTINYINT"),
+            ("USMALLINT", "UInt16", "USMALLINT"),
+            ("UINTEGER", "UInt32", "UINTEGER"),
+            ("UBIGINT", "UInt64", "UBIGINT"),
+            ("UHUGEINT", "UInt128", "UINT128"),
+        ] {
+            assert_eq!(
+                transpile(
+                    &format!("SELECT CAST(x AS {duckdb})"),
+                    DialectType::DuckDB,
+                    DialectType::ClickHouse
+                ),
+                format!("SELECT CAST(x AS {clickhouse})")
+            );
+            assert_eq!(
+                transpile(
+                    &format!("SELECT CAST(x AS {clickhouse})"),
+                    DialectType::ClickHouse,
+                    DialectType::DuckDB
+                ),
+                format!("SELECT CAST(x AS {output})")
+            );
+            if duckdb != "UHUGEINT" {
+                assert_eq!(
+                    transpile(
+                        &format!("SELECT CAST(x AS {duckdb})"),
+                        DialectType::DuckDB,
+                        DialectType::MySQL
+                    ),
+                    "SELECT CAST(x AS UNSIGNED)"
+                );
+            }
+        }
+        assert_eq!(
+            transpile(
+                "CAST(x AS UTINYINT)",
+                DialectType::Fabric,
+                DialectType::Fabric
+            ),
+            "CAST(x AS SMALLINT)"
+        );
+        assert_eq!(
+            transpile(
+                "SELECT CAST(x AS TINYINT)",
+                DialectType::TSQL,
+                DialectType::DuckDB
+            ),
+            "SELECT CAST(x AS UTINYINT)"
+        );
+    }
+
+    #[test]
+    fn test_int128_dialect_aliases() {
+        for (source, input) in [
+            (DialectType::DuckDB, "HUGEINT"),
+            (DialectType::ClickHouse, "Int128"),
+            (DialectType::StarRocks, "LARGEINT"),
+        ] {
+            for (target, output) in [
+                (DialectType::DuckDB, "INT128"),
+                (DialectType::ClickHouse, "Int128"),
+                (DialectType::StarRocks, "LARGEINT"),
+            ] {
+                assert_eq!(
+                    transpile(&format!("SELECT CAST(x AS {input})"), source, target),
+                    format!("SELECT CAST(x AS {output})")
+                );
+            }
+        }
+    }
 
     fn generate_with_dialect(expr: &Expression, dialect: DialectType) -> String {
         let config = GeneratorConfig {

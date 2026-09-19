@@ -873,12 +873,9 @@ fn get_string(expr: &Expression) -> Option<String> {
     }
 }
 
-/// Check if two expressions are structurally equal
-/// This is a simplified comparison - a full implementation would need deep comparison
+/// Compare syntax, ignoring identifier/column source locations via AST equality.
 fn expressions_equal(a: &Expression, b: &Expression) -> bool {
-    // For now, use Debug representation for comparison
-    // A proper implementation would do structural comparison
-    format!("{:?}", a) == format!("{:?}", b)
+    a == b
 }
 
 /// Flatten nested AND expressions into a list of operands
@@ -1202,13 +1199,34 @@ pub fn gen(expr: &Expression) -> String {
             let args: Vec<String> = f.args.iter().map(|a| gen(a)).collect();
             format!("{}({})", f.name.to_uppercase(), args.join(", "))
         }
-        _ => format!("{:?}", expr),
+        _ => super::structural_identity_key(expr),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_spans_do_not_change_simplification_or_identity_keys() {
+        let left = crate::Parser::parse_sql("CAST(x AS BOOLEAN)")
+            .unwrap()
+            .remove(0);
+        let right = crate::Parser::parse_sql("   CAST(x AS BOOLEAN)")
+            .unwrap()
+            .remove(0);
+        assert_eq!(left, right);
+        assert_eq!(gen(&left), gen(&right));
+        assert!(is_complement(
+            &left,
+            &Expression::Not(Box::new(UnaryOp::new(right.clone())))
+        ));
+        let result = simplify(
+            Expression::And(Box::new(BinaryOp::new(left.clone(), right))),
+            None,
+        );
+        assert_eq!(result, left);
+    }
 
     fn make_int(val: i64) -> Expression {
         Expression::Literal(Box::new(Literal::Number(val.to_string())))

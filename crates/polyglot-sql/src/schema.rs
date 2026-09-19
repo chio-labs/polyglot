@@ -177,6 +177,14 @@ impl MappingSchema {
             return name.to_string();
         }
 
+        let identifier = crate::binding::schema_identifier(name);
+        if identifier.quoted {
+            return crate::optimizer::normalize_identifiers::normalize_identifier(
+                identifier,
+                crate::optimizer::normalize_identifiers::get_normalization_strategy(self.dialect),
+            )
+            .name;
+        }
         // Default normalization: lowercase
         // Different dialects may have different rules
         match self.dialect {
@@ -458,6 +466,14 @@ pub fn normalize_name(
 ) -> String {
     if !normalize {
         return name.to_string();
+    }
+    let identifier = crate::binding::schema_identifier(name);
+    if identifier.quoted {
+        return crate::optimizer::normalize_identifiers::normalize_identifier(
+            identifier,
+            crate::optimizer::normalize_identifiers::get_normalization_strategy(dialect),
+        )
+        .name;
     }
 
     match dialect {

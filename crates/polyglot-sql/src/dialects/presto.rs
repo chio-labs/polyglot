@@ -408,38 +408,28 @@ impl PrestoDialect {
     /// Presto: %d, %H, %H, %i, %m, %s, %Y, %y
     pub fn oracle_to_presto_format(fmt: &str) -> String {
         // Process character by character to avoid double-replacement issues
-        let chars: Vec<char> = fmt.chars().collect();
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
         let mut result = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let remaining = &fmt[i..];
-            if remaining.starts_with("yyyy") {
+        while let Some(ch) = cursor.peek() {
+            if cursor.consume_prefix("yyyy", false) {
                 result.push_str("%Y");
-                i += 4;
-            } else if remaining.starts_with("yy") {
+            } else if cursor.consume_prefix("yy", false) {
                 result.push_str("%y");
-                i += 2;
-            } else if remaining.starts_with("hh24") {
+            } else if cursor.consume_prefix("hh24", false) {
                 result.push_str("%H");
-                i += 4;
-            } else if remaining.starts_with("hh") {
+            } else if cursor.consume_prefix("hh", false) {
                 result.push_str("%H");
-                i += 2;
-            } else if remaining.starts_with("mi") {
+            } else if cursor.consume_prefix("mi", false) {
                 result.push_str("%i");
-                i += 2;
-            } else if remaining.starts_with("mm") {
+            } else if cursor.consume_prefix("mm", false) {
                 result.push_str("%m");
-                i += 2;
-            } else if remaining.starts_with("dd") {
+            } else if cursor.consume_prefix("dd", false) {
                 result.push_str("%d");
-                i += 2;
-            } else if remaining.starts_with("ss") {
+            } else if cursor.consume_prefix("ss", false) {
                 result.push_str("%s");
-                i += 2;
             } else {
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result

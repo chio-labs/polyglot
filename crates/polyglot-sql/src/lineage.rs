@@ -364,22 +364,6 @@ fn lineage_from_column_ref(
     to_node(column, scope, dialect, "", "", "", trim_selects)
 }
 
-#[cfg(feature = "generate")]
-pub(crate) fn lineage_by_index_from_expression(
-    column_index: usize,
-    sql: &Expression,
-    dialect: Option<DialectType>,
-    trim_selects: bool,
-) -> Result<LineageNode> {
-    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
-    lineage_from_column_ref(
-        ColumnRef::Index(column_index),
-        &prepared,
-        dialect,
-        trim_selects,
-    )
-}
-
 fn lineage_normalized_expression(sql: &Expression) -> Expression {
     match sql {
         Expression::Prepare(prepare) => lineage_normalized_expression(&prepare.statement),
@@ -476,8 +460,8 @@ fn normalize_cte_name(ident: &Identifier) -> String {
 }
 
 /// Expand SELECT * in CTEs by walking CTE definitions in order and propagating
-/// resolved column lists. This handles nested CTEs (e.g., cte2 AS (SELECT * FROM cte1))
-/// which qualify_columns cannot resolve because it processes each SELECT independently.
+/// resolved column lists. This also handles chained CTEs in schema-free lineage
+/// and analysis paths, where full column qualification is not performed.
 ///
 /// When `schema` is provided, stars from external tables (not CTEs) are also resolved
 /// by looking up column names in the schema. This enables correct expansion of patterns
@@ -1003,11 +987,121 @@ struct IndexedScope {
 
 struct LineageScopeContext {
     scopes: Vec<IndexedScope>,
+    /// Usage analysis must not claim undeclared qualifiers as physical tables.
+    conservative: bool,
+}
+
+/// Reuse the lineage resolver for analysis of non-output column occurrences.
+/// The caller selects the lexical owner and checks ambiguous/open sources first.
+/// This keeps CTE, derived-table, virtual-source and set-operation tracing shared
+/// with projection lineage, without manufacturing SELECT projections.
+#[cfg(feature = "generate")]
+pub(crate) struct ScopedLineage {
+    context: LineageScopeContext,
+    root: ScopeId,
+    ctes: Vec<ScopeId>,
+    dialect: Option<DialectType>,
+}
+
+#[cfg(feature = "generate")]
+impl ScopedLineage {
+    pub(crate) fn new(scope: Scope, inherited_ctes: &[Scope], dialect: DialectType) -> Self {
+        let visible_ctes = scope.cte_sources.clone();
+        let (mut context, root) = LineageScopeContext::from_scope(scope);
+        context.conservative = true;
+        let mut ctes = context.indexed(root).cte_scopes.clone();
+        for cte_scope in inherited_ctes {
+            if let Expression::Cte(cte) = &cte_scope.expression {
+                if visible_ctes
+                    .get(&cte.alias.name)
+                    .is_some_and(|source| source.expression == cte_scope.expression)
+                    && !ctes
+                        .iter()
+                        .any(|id| context.scope(*id).expression == cte_scope.expression)
+                {
+                    ctes.push(context.insert_scope(cte_scope.clone()));
+                }
+            }
+        }
+        Self {
+            context,
+            root,
+            ctes,
+            dialect: Some(dialect),
+        }
+    }
+
+    pub(crate) fn column(&self, source: &str, column: &str) -> LineageNode {
+        let mut node = LineageNode::new(
+            column,
+            Expression::qualified_column(source, column),
+            Expression::Null(crate::expressions::Null),
+        );
+        resolve_qualified_column(
+            &mut node,
+            &self.context,
+            self.root,
+            self.dialect,
+            source,
+            column,
+            column,
+            false,
+            &self.ctes,
+            0,
+        );
+        node
+    }
+
+    pub(crate) fn output(&self, ordinal: usize) -> Result<LineageNode> {
+        to_node_inner(
+            ColumnRef::Index(ordinal),
+            &self.context,
+            self.root,
+            self.dialect,
+            "",
+            "",
+            "",
+            false,
+            &self.ctes,
+            0,
+        )
+    }
+
+    pub(crate) fn output_names(&self) -> Vec<String> {
+        crate::ast_transforms::get_output_column_names_for_dialect(
+            effective_scope_expression(&self.context.scope(self.root).expression),
+            self.dialect,
+        )
+    }
+
+    pub(crate) fn subquery_output(&self, index: usize) -> Result<LineageNode> {
+        let scope_id = *self
+            .context
+            .indexed(self.root)
+            .subquery_scopes
+            .get(index)
+            .ok_or_else(|| Error::internal("missing scalar subquery scope"))?;
+        to_node_inner(
+            ColumnRef::Index(0),
+            &self.context,
+            scope_id,
+            self.dialect,
+            "",
+            "",
+            "",
+            false,
+            &self.ctes,
+            0,
+        )
+    }
 }
 
 impl LineageScopeContext {
     fn from_scope(scope: Scope) -> (Self, ScopeId) {
-        let mut context = Self { scopes: Vec::new() };
+        let mut context = Self {
+            scopes: Vec::new(),
+            conservative: false,
+        };
         let root = context.insert_scope(scope);
         (context, root)
     }
@@ -1103,14 +1197,26 @@ fn to_node_inner(
     // 0. Unwrap CTE scope — CTE scope expressions are Expression::Cte(...)
     //    but we need the inner query (SELECT/UNION) for column lookup.
     let effective_expr = effective_scope_expression(scope_expr);
+    // A CTE's explicit output names replace its projection names by ordinal.
+    // Resolve that boundary before unwrapping, including unnamed expressions.
+    let alias_ordinal = match (scope_expr, &column) {
+        (Expression::Cte(cte), ColumnRef::Name(name)) if !cte.columns.is_empty() => {
+            cte.columns.iter().position(|alias| {
+                normalize_column_name(&alias.name, dialect) == normalize_column_name(name, dialect)
+            })
+        }
+        _ => None,
+    };
+    let lookup_column = alias_ordinal.map(ColumnRef::Index);
+    let lookup_column = lookup_column.as_ref().unwrap_or(&column);
 
     // 1. Set operations (UNION / INTERSECT / EXCEPT)
     if matches!(
         effective_expr,
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
     ) {
-        return handle_set_operation(
-            &column,
+        let mut node = handle_set_operation(
+            lookup_column,
             context,
             scope_id,
             effective_expr,
@@ -1122,15 +1228,25 @@ fn to_node_inner(
             trim_selects,
             &descendant_cte_scopes,
             depth,
-        );
+        )?;
+        if alias_ordinal.is_some() {
+            if let ColumnRef::Name(name) = &column {
+                node.name = (*name).to_string();
+            }
+        }
+        return Ok(node);
     }
 
     // 2. Find the select expression for this column
-    let select_expr = find_select_expr(effective_expr, &column, dialect)?;
+    let select_expr = find_select_expr(effective_expr, lookup_column, dialect)?;
     let column_name = resolve_column_name(&column, &select_expr);
 
     // 3. Trim source if requested
-    let node_source = if trim_selects {
+    // Internal fact consumers need physical leaf sources, not a copy of the
+    // entire SELECT for every output. Public lineage retains its source ASTs.
+    let node_source = if context.conservative {
+        Expression::Null(crate::expressions::Null)
+    } else if trim_selects {
         trim_source(effective_expr, &select_expr)
     } else {
         effective_expr.clone()
@@ -1649,8 +1765,11 @@ fn resolve_qualified_column(
     }
 
     // Base table or unresolved — terminal node
-    node.downstream
-        .push(make_table_column_node(table, col_name));
+    let mut child = make_table_column_node(table, col_name);
+    if context.conservative {
+        child.source_kind = SourceKind::Unknown;
+    }
+    node.downstream.push(child);
 }
 
 fn attach_pivot_dependencies(
