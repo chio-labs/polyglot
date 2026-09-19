@@ -119,6 +119,39 @@ fn base_schema() -> ValidationSchema {
     }
 }
 
+#[test]
+fn test_schema_validation_handles_long_set_operation_cte_without_revalidating_prefixes() {
+    let schema = base_schema();
+    let options = SchemaValidationOptions::default();
+    let branches: Vec<String> = (0..256)
+        .map(|index| format!("SELECT id, {index} AS sequence_number FROM users"))
+        .collect();
+    let valid_sql = format!(
+        "WITH order_sequence AS ({}) SELECT id, sequence_number FROM order_sequence",
+        branches.join(" UNION ALL ")
+    );
+
+    let valid = validate_with_schema(&valid_sql, DialectType::Snowflake, &schema, &options);
+
+    assert!(valid.valid, "{:?}", valid.errors);
+
+    let invalid_sql = valid_sql.replace(
+        "SELECT id, 255 AS sequence_number FROM users",
+        "SELECT missing, 255 AS sequence_number FROM users",
+    );
+    let invalid = validate_with_schema(&invalid_sql, DialectType::Snowflake, &schema, &options);
+
+    assert!(
+        !invalid.valid
+            && invalid
+                .errors
+                .iter()
+                .any(|error| error.code == validation_codes::E_UNKNOWN_COLUMN),
+        "{:?}",
+        invalid.errors
+    );
+}
+
 fn attach_column_fk(
     schema: &mut ValidationSchema,
     table_name: &str,
