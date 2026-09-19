@@ -236,6 +236,13 @@ class Expression:
         """
         ...
 
+    def with_ctes(self) -> list[tuple[str, bool, Expression]]:
+        """Return top-level CTE names, column-alias flags, and body expressions.
+
+        Unlike :meth:`arg`, this accessor does not serialize complete CTE bodies.
+        """
+        ...
+
     # ── Child accessors (no serialization, fast) ─────────────────────
 
     @property
