@@ -1896,6 +1896,36 @@ fn test_validate_with_schema_unknown_column_in_derived_table() {
 }
 
 #[test]
+fn test_validate_with_schema_values_columns_are_visible() {
+    let schema = base_schema();
+    let options = SchemaValidationOptions::default();
+    for sql in [
+        "WITH inventory AS (SELECT column1 AS product_id FROM VALUES (1)) \
+         SELECT product_id FROM inventory",
+        "SELECT inventory_rows.product_id FROM VALUES (1) AS inventory_rows(product_id)",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+
+        assert!(result.valid, "{:#?}", result.errors);
+    }
+}
+
+#[test]
+fn test_validate_with_schema_lateral_subquery_resolves_prior_source_alias() {
+    let schema = base_schema();
+    let options = SchemaValidationOptions::default();
+    let result = validate_with_schema(
+        "SELECT nested.value FROM orders AS orders_source, \
+         LATERAL (SELECT orders_source.total AS value) AS nested",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+
+    assert!(result.valid, "{:#?}", result.errors);
+}
+
+#[test]
 fn test_validate_with_schema_unknown_column_in_insert_query() {
     let schema = base_schema();
     let opts = SchemaValidationOptions::default();
