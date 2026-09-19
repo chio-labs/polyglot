@@ -29,6 +29,19 @@ def test_expression_arg_returns_wrapped_children_when_possible():
     assert isinstance(expressions, list)
     assert isinstance(expressions[0], polyglot_sql.Expression)
 
+    where_clause = polyglot_sql.parse_one("SELECT a FROM t WHERE b = 1").arg("where_clause")
+    assert where_clause["this"]["eq"]["right"]["literal"]["value"] == "1"
+
+
+def test_expression_arg_returns_set_operation_branches_and_by_name():
+    expression = polyglot_sql.parse_one(
+        "SELECT 1 AS order_id UNION ALL BY NAME SELECT 2 AS order_id"
+    )
+
+    assert expression.arg("left").sql() == "SELECT 1 AS order_id"
+    assert expression.arg("right").sql() == "SELECT 2 AS order_id"
+    assert expression.arg("by_name") is True
+
 
 def test_expression_children_walk_and_find():
     expr = polyglot_sql.parse_one("SELECT a, b FROM t WHERE c = 1", dialect="postgres")
@@ -350,3 +363,20 @@ def test_comments_property():
     expr = polyglot_sql.parse_one("SELECT a FROM t")
     # Most expressions have empty comments
     assert isinstance(expr.comments, list)
+def test_with_ctes_returns_metadata_and_expression_bodies_without_payload_conversion():
+    expression = polyglot_sql.parse_one(
+        "WITH first_cte AS (SELECT 1 AS id), "
+        "second_cte(value) AS (SELECT id FROM first_cte) "
+        "SELECT value FROM second_cte"
+    )
+
+    ctes = expression.with_ctes()
+
+    assert [(name, has_column_aliases) for name, has_column_aliases, _ in ctes] == [
+        ("first_cte", False),
+        ("second_cte", True),
+    ]
+    assert [body.sql() for _, _, body in ctes] == [
+        "SELECT 1 AS id",
+        "SELECT id FROM first_cte",
+    ]

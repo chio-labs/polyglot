@@ -384,6 +384,34 @@ impl PyExpression {
     }
 
     fn arg(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        if name == "where_clause" {
+            if let Expression::Select(select) = &self.inner {
+                return match &select.where_clause {
+                    Some(where_clause) => to_python_object(py, where_clause),
+                    None => Ok(py.None()),
+                };
+            }
+        }
+        let set_operation = match &self.inner {
+            Expression::Union(operation) => {
+                Some((&operation.left, &operation.right, operation.by_name))
+            }
+            Expression::Intersect(operation) => {
+                Some((&operation.left, &operation.right, operation.by_name))
+            }
+            Expression::Except(operation) => {
+                Some((&operation.left, &operation.right, operation.by_name))
+            }
+            _ => None,
+        };
+        if let Some((left, right, by_name)) = set_operation {
+            match name {
+                "left" => return wrap_expression(py, left.clone()),
+                "right" => return wrap_expression(py, right.clone()),
+                "by_name" => return to_python_object(py, &Value::Bool(by_name)),
+                _ => {}
+            }
+        }
         if let Some(payload) = expression_payload(&self.inner)? {
             if let Some(value) = payload.get(name) {
                 return value_to_python_object(py, value.clone());
@@ -391,6 +419,29 @@ impl PyExpression {
         }
 
         Ok(py.None())
+    }
+
+    /// Return top-level CTE metadata and body expressions without serializing their ASTs.
+    fn with_ctes(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<Vec<(String, bool, Py<PyAny>)>> {
+        let inner = &slf.borrow().inner;
+        let with = match inner {
+            Expression::Select(select) => select.with.as_ref(),
+            Expression::Union(union) => union.with.as_ref(),
+            Expression::Intersect(intersect) => intersect.with.as_ref(),
+            Expression::Except(except) => except.with.as_ref(),
+            _ => None,
+        };
+        let Some(with) = with else {
+            return Ok(Vec::new());
+        };
+        let parent_ref = slf.unbind().into_any();
+        with.ctes
+            .iter()
+            .map(|cte| {
+                wrap_expression_with_parent(py, cte.this.clone(), parent_ref.clone_ref(py), "with")
+                    .map(|body| (cte.alias.name.clone(), !cte.columns.is_empty(), body))
+            })
+            .collect()
     }
 
     // === Property accessors (no serde) ===
