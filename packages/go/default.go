@@ -102,6 +102,15 @@ func Validate(sql, dialect string, options ...ValidationOptions) (ValidationResu
 	return client.Validate(sql, dialect, options...)
 }
 
+// ValidateWithSchema uses the default client's shared Rust schema validator.
+func ValidateWithSchema(sql string, schema ValidationSchema, dialect string, options ...SchemaValidationOptions) (ValidationResult, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return ValidationResult{}, err
+	}
+	return client.ValidateWithSchema(sql, schema, dialect, options...)
+}
+
 func Dialects() ([]string, error) {
 	client, err := DefaultClient()
 	if err != nil {

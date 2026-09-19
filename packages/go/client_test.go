@@ -78,6 +78,24 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 	}
 }
 
+func TestColumnUseJSONCompatibility(t *testing.T) {
+	var legacy QueryAnalysis
+	if err := json.Unmarshal([]byte(`{"shape":"select","projections":[]}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.ColumnUses) != 0 {
+		t.Fatal("legacy payload acquired column uses")
+	}
+	var current QueryAnalysis
+	if err := json.Unmarshal([]byte(`{"columnUses":[{"context":"filter","scopePath":"root","expressionPath":"where_clause.this","expressionSql":"id > 0","references":[{"column":"id","sourceKind":"unknown","confidence":"unknown","unqualified":true,"span":{"start":7,"end":9}}]}]}`), &current); err != nil {
+		t.Fatal(err)
+	}
+	ref := current.ColumnUses[0].References[0]
+	if ref.Column != "id" || ref.Confidence != "unknown" || ref.Span.Start != 7 || ref.Span.End != 9 {
+		t.Fatalf("invalid flattened reference: %#v", ref)
+	}
+}
+
 func TestVersion(t *testing.T) {
 	if Version() == "" {
 		t.Fatal("Version() is empty")
@@ -199,10 +217,9 @@ func TestTranspileOptionsJSON(t *testing.T) {
 }
 
 func TestTranspileOptionsComplexityGuardJSON(t *testing.T) {
-	limit := 128
 	payload, err := marshalOptions(TranspileOptions{
 		ComplexityGuard: &ComplexityGuardOptions{
-			MaxFunctionCallDepth: &limit,
+			MaxFunctionCallDepth: NewGuardLimit(128),
 		},
 	})
 	if err != nil {
@@ -210,6 +227,75 @@ func TestTranspileOptionsComplexityGuardJSON(t *testing.T) {
 	}
 	if payload != `{"complexityGuard":{"maxFunctionCallDepth":128}}` {
 		t.Fatalf("payload = %s", payload)
+	}
+}
+
+func TestParserDepthGuardJSON(t *testing.T) {
+	for _, tc := range []struct {
+		limit GuardLimit
+		want  string
+	}{
+		{GuardLimit{}, `{}`},
+		{NewGuardLimit(0), `{"maxParserDepth":0}`},
+		{NewGuardLimit(64), `{"maxParserDepth":64}`},
+		{DisabledGuardLimit(), `{"maxParserDepth":null}`},
+	} {
+		data, err := json.Marshal(ComplexityGuardOptions{MaxParserDepth: tc.limit})
+		if err != nil || string(data) != tc.want {
+			t.Fatalf("JSON = %s, %v; want %s", data, err, tc.want)
+		}
+		var decoded ComplexityGuardOptions
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		data, err = json.Marshal(decoded)
+		if err != nil || string(data) != tc.want {
+			t.Fatalf("round trip = %s, %v", data, err)
+		}
+	}
+	for _, data := range []string{`{"maxParserDepth":-1}`, `{"maxParserDepth":1.5}`, `{"maxParserDepth":true}`} {
+		var decoded ComplexityGuardOptions
+		if err := json.Unmarshal([]byte(data), &decoded); err == nil {
+			t.Fatalf("accepted %s", data)
+		}
+	}
+}
+
+func TestAllComplexityGuardLimitsPreserveThreeStates(t *testing.T) {
+	for _, name := range []string{"maxParserDepth", "maxInputBytes", "maxTokens", "maxAstNodes", "maxAstDepth", "maxParenthesisDepth", "maxFunctionCallDepth"} {
+		for _, value := range []string{"0", "128", "null"} {
+			payload := `{"` + name + `":` + value + `}`
+			var options ComplexityGuardOptions
+			if err := json.Unmarshal([]byte(payload), &options); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(options)
+			if err != nil || string(data) != payload {
+				t.Fatalf("round trip %s: %s, %v", payload, data, err)
+			}
+		}
+		for _, value := range []string{"-1", "true", "1.0", "1.5", `"128"`, "18446744073709551616"} {
+			var options ComplexityGuardOptions
+			if err := json.Unmarshal([]byte(`{"`+name+`":`+value+`}`), &options); err == nil {
+				t.Fatalf("accepted %s=%s", name, value)
+			}
+		}
+	}
+	guard := &ComplexityGuardOptions{MaxFunctionCallDepth: DisabledGuardLimit()}
+	for _, options := range []any{ParseOptions{ComplexityGuard: guard}, ValidationOptions{ComplexityGuard: guard}, SchemaValidationOptions{ComplexityGuard: guard}, AnalyzeQueryOptions{ComplexityGuard: guard}} {
+		payload, err := marshalOptions(options)
+		if err != nil || payload != `{"complexityGuard":{"maxFunctionCallDepth":null}}` {
+			t.Fatalf("%T: %s, %v", options, payload, err)
+		}
+	}
+}
+
+func TestParseRejectsMultipleOptions(t *testing.T) {
+	client := &Client{}
+	for _, parse := range []func(string, string, ...ParseOptions) (json.RawMessage, error){client.Parse, client.ParseOne, client.ParseDataType} {
+		if _, err := parse("SELECT 1", "generic", ParseOptions{}, ParseOptions{}); err == nil || !strings.Contains(err.Error(), "at most one") {
+			t.Fatalf("expected options error, got %v", err)
+		}
 	}
 }
 
@@ -231,6 +317,59 @@ func TestValidationOptionsJSON(t *testing.T) {
 	}
 	if payload != `{"strictSyntax":true,"semantic":true}` {
 		t.Fatalf("payload = %s", payload)
+	}
+}
+
+func TestSchemaValidationOptionsAndSchemaJSON(t *testing.T) {
+	strict := false
+	payload, err := marshalOptions(SchemaValidationOptions{
+		CheckTypes: true, CheckReferences: true, Strict: &strict, StrictSyntax: true, Semantic: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var options map[string]any
+	if err := json.Unmarshal([]byte(payload), &options); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"check_types", "check_references", "strict_syntax", "semantic"} {
+		if options[key] != true {
+			t.Fatalf("%s missing from %s", key, payload)
+		}
+	}
+	if options["strict"] != false {
+		t.Fatalf("strict=false lost: %s", payload)
+	}
+	payload, err = marshalOptions(SchemaValidationOptions{})
+	if err != nil || payload != "{}" {
+		t.Fatalf("default options = %s, %v", payload, err)
+	}
+	payload, err = marshalOptions(ValidationSchema{})
+	if err != nil || payload != `{"tables":[]}` {
+		t.Fatalf("empty schema = %s, %v", payload, err)
+	}
+	schema := ValidationSchema{Tables: []SchemaTable{{Name: "orders"}}}
+	payload, err = marshalOptions(schema)
+	if err != nil || !strings.Contains(payload, `"columns":[]`) {
+		t.Fatalf("open schema = %s, %v", payload, err)
+	}
+	if schema.Tables[0].Columns != nil {
+		t.Fatal("serialization mutated the caller's schema")
+	}
+}
+
+func TestValidateWithSchemaInputAndLifecycleErrors(t *testing.T) {
+	var client *Client
+	if _, err := client.ValidateWithSchema("SELECT 1", ValidationSchema{}, ""); !errors.Is(err, ErrClosed) {
+		t.Fatalf("nil client error = %v", err)
+	}
+	for _, input := range [][2]string{{"SELECT \x00", "generic"}, {"SELECT 1", "generic\x00"}} {
+		if _, err := client.ValidateWithSchema(input[0], ValidationSchema{}, input[1]); err == nil || errors.Is(err, ErrClosed) {
+			t.Fatalf("expected NUL validation error, got %v", err)
+		}
+	}
+	if _, err := client.ValidateWithSchema("SELECT 1", ValidationSchema{}, "", SchemaValidationOptions{}, SchemaValidationOptions{}); err == nil || errors.Is(err, ErrClosed) {
+		t.Fatalf("expected options count error, got %v", err)
 	}
 }
 

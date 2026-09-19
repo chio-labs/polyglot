@@ -1323,6 +1323,10 @@ impl Expression {
             Expression::AggregateFunction(f) => f.inferred_type.as_ref(),
             Expression::WindowFunction(f) => f.inferred_type.as_ref(),
             Expression::Case(c) => c.inferred_type.as_ref(),
+            Expression::Array(a) => a.inferred_type.as_ref(),
+            Expression::ArrayFunc(a) => a.inferred_type.as_ref(),
+            Expression::Paren(p) => p.this.inferred_type(),
+            Expression::Annotated(a) => a.this.inferred_type(),
             Expression::Subquery(s) => s.inferred_type.as_ref(),
             Expression::Alias(a) => a.inferred_type.as_ref(),
             Expression::Unnest(u) => u.inferred_type.as_ref(),
@@ -1333,6 +1337,7 @@ impl Expression {
             Expression::StringAgg(f) => f.inferred_type.as_ref(),
             Expression::ListAgg(f) => f.inferred_type.as_ref(),
             Expression::SumIf(f) => f.inferred_type.as_ref(),
+            Expression::Trim(f) => f.inferred_type.as_ref(),
 
             // UnaryFunc variants
             Expression::Upper(f)
@@ -1552,6 +1557,10 @@ impl Expression {
             Expression::AggregateFunction(f) => f.inferred_type = Some(dt),
             Expression::WindowFunction(f) => f.inferred_type = Some(dt),
             Expression::Case(c) => c.inferred_type = Some(dt),
+            Expression::Array(a) => a.inferred_type = Some(dt),
+            Expression::ArrayFunc(a) => a.inferred_type = Some(dt),
+            Expression::Paren(p) => p.this.set_inferred_type(dt),
+            Expression::Annotated(a) => a.this.set_inferred_type(dt),
             Expression::Subquery(s) => s.inferred_type = Some(dt),
             Expression::Alias(a) => a.inferred_type = Some(dt),
             Expression::Unnest(u) => u.inferred_type = Some(dt),
@@ -1562,6 +1571,7 @@ impl Expression {
             Expression::StringAgg(f) => f.inferred_type = Some(dt),
             Expression::ListAgg(f) => f.inferred_type = Some(dt),
             Expression::SumIf(f) => f.inferred_type = Some(dt),
+            Expression::Trim(f) => f.inferred_type = Some(dt),
 
             // UnaryFunc variants
             Expression::Upper(f)
@@ -3064,6 +3074,7 @@ impl Expression {
             Expression::GroupBy(g) => &g.expressions,
             Expression::In(i) => &i.expressions,
             Expression::Array(a) => &a.expressions,
+            Expression::ArrayFunc(a) => &a.expressions,
             Expression::Tuple(t) => &t.expressions,
             Expression::Coalesce(f)
             | Expression::Greatest(f)
@@ -3307,7 +3318,7 @@ pub struct Null;
 /// (double-quoted, backtick-quoted, or bracket-quoted depending on the
 /// dialect). The generator uses this flag to decide whether to emit quoting
 /// characters.
-#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Identifier {
     /// The raw text of the identifier, without any quoting characters.
@@ -3316,9 +3327,18 @@ pub struct Identifier {
     pub quoted: bool,
     #[serde(default)]
     pub trailing_comments: Vec<String>,
-    /// Source position span (populated during parsing, None for programmatically constructed nodes)
+    /// Original source range, including quoting delimiters. Absent for synthetic
+    /// or programmatically constructed identifiers. Not part of structural equality.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
+}
+
+impl PartialEq for Identifier {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.quoted == other.quoted
+            && self.trailing_comments == other.trailing_comments
+    }
 }
 
 impl Identifier {
@@ -3353,6 +3373,16 @@ impl Identifier {
         self.name.is_empty()
     }
 
+    /// Preserve quoting in the legacy string representation of named type fields.
+    /// Always use SQL-standard delimiters internally, independent of the source dialect.
+    pub(crate) fn to_type_field_name(&self) -> String {
+        if self.quoted {
+            format!("\"{}\"", self.name.replace('"', "\"\""))
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// Set the source span on this identifier
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
@@ -3375,7 +3405,7 @@ impl fmt::Display for Identifier {
 /// Renders as `name` when unqualified, or `table.name` when qualified.
 /// Use [`Expression::column()`] or [`Expression::qualified_column()`] for
 /// convenient construction.
-#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Column {
     /// The column name.
@@ -3388,13 +3418,24 @@ pub struct Column {
     /// Trailing comments that appeared after this column reference
     #[serde(default)]
     pub trailing_comments: Vec<String>,
-    /// Source position span
+    /// Original column-reference range, including its qualifier when present.
+    /// Absent for synthetic references. Not part of structural equality.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
     /// Inferred data type from type annotation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ast(skip)]
     pub inferred_type: Option<DataType>,
+}
+
+impl PartialEq for Column {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.table == other.table
+            && self.join_mark == other.join_mark
+            && self.trailing_comments == other.trailing_comments
+            && self.inferred_type == other.inferred_type
+    }
 }
 
 impl fmt::Display for Column {
@@ -5709,6 +5750,9 @@ pub enum WindowFrameBound {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct StructField {
+    /// A raw field name, or a delimited identifier for compatibility with parsed ASTs.
+    /// Parsed quoted names use double quotes with doubled internal quotes. An empty
+    /// string denotes an anonymous field. Generation selects the target dialect's quotes.
     pub name: String,
     pub data_type: DataType,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5870,6 +5914,23 @@ pub enum DataType {
     BigInt {
         length: Option<u32>,
     },
+    /// Signed 128-bit integer (DuckDB HUGEINT, ClickHouse Int128, StarRocks LARGEINT).
+    Int128,
+    /// Unsigned 8-bit integer (DuckDB UTINYINT, ClickHouse UInt8).
+    #[serde(rename = "uint8")]
+    UInt8,
+    /// Unsigned 16-bit integer (DuckDB USMALLINT, ClickHouse UInt16).
+    #[serde(rename = "uint16")]
+    UInt16,
+    /// Unsigned 32-bit integer (DuckDB UINTEGER, ClickHouse UInt32).
+    #[serde(rename = "uint32")]
+    UInt32,
+    /// Unsigned 64-bit integer (DuckDB UBIGINT, ClickHouse UInt64).
+    #[serde(rename = "uint64")]
+    UInt64,
+    /// Unsigned 128-bit integer (DuckDB UHUGEINT, ClickHouse UInt128).
+    #[serde(rename = "uint128")]
+    UInt128,
     /// Float type with optional precision and scale. `real_spelling` indicates whether the original
     /// type was spelled as `REAL` (true) vs `FLOAT` (false), used for dialects like Redshift that
     /// preserve the original spelling.
@@ -6042,12 +6103,31 @@ pub enum DataType {
     Unknown,
 }
 
+impl DataType {
+    /// Canonical unsigned names and their bit-width aliases. Parser entry points
+    /// and legacy Custom-type normalization share this mapping.
+    pub(crate) fn from_unsigned_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "UTINYINT" | "UINT8" => Some(Self::UInt8),
+            "USMALLINT" | "UINT16" => Some(Self::UInt16),
+            "UINTEGER" | "UINT32" => Some(Self::UInt32),
+            "UBIGINT" | "UINT64" => Some(Self::UInt64),
+            "UHUGEINT" | "UINT128" => Some(Self::UInt128),
+            _ => None,
+        }
+    }
+}
+
 /// Array expression
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[cfg_attr(feature = "bindings", ts(rename = "SqlArray"))]
 pub struct Array {
     pub expressions: Vec<Expression>,
+    /// Inferred array data type from type annotation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub inferred_type: Option<DataType>,
 }
 
 /// Struct expression
@@ -6363,6 +6443,10 @@ pub struct TrimFunc {
     /// Whether the position was explicitly specified (BOTH/LEADING/TRAILING) vs defaulted
     #[serde(default)]
     pub position_explicit: bool,
+    /// Inferred data type from type annotation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub inferred_type: Option<DataType>,
 }
 
 #[derive(
@@ -7019,6 +7103,10 @@ pub struct ArrayConstructor {
     pub bracket_notation: bool,
     /// True if LIST keyword was used instead of ARRAY (DuckDB)
     pub use_list_keyword: bool,
+    /// Inferred array data type from type annotation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub inferred_type: Option<DataType>,
 }
 
 /// ARRAY_SORT function
@@ -15338,6 +15426,31 @@ pub struct NextValueFor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_spans_are_metadata_not_expression_identity() {
+        let plain = Expression::column("customer_id");
+        let mut positioned = plain.clone();
+        if let Expression::Column(column) = &mut positioned {
+            column.span = Some(Span::new(7, 18, 1, 19));
+            column.name.span = column.span;
+        }
+        assert_eq!(plain, positioned);
+        assert_ne!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::to_value(&positioned).unwrap()
+        );
+        assert_eq!(
+            Identifier::new("a"),
+            Identifier::new("a").with_span(Span::new(3, 4, 1, 5))
+        );
+        assert_ne!(Identifier::new("a"), Identifier::quoted("a"));
+        assert_ne!(plain, Expression::column("other"));
+        let Expression::Column(column) = plain else {
+            unreachable!()
+        };
+        assert!(column.span.is_none() && column.name.span.is_none());
+    }
 
     #[test]
     #[cfg(feature = "bindings")]

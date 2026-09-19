@@ -1,9 +1,60 @@
 //! Internal helpers for converting date/time format token strings.
 
+/// A format cursor whose remaining input always starts on a UTF-8 boundary.
+///
+/// Token matching never case-folds Unicode literals into ASCII format directives.
+#[cfg(any(test, feature = "generate"))]
+pub(crate) struct FormatTokenCursor<'a> {
+    remaining: &'a str,
+}
+
+#[cfg(any(test, feature = "generate"))]
+impl<'a> FormatTokenCursor<'a> {
+    pub(crate) fn new(input: &'a str) -> Self {
+        Self { remaining: input }
+    }
+
+    pub(crate) fn peek(&self) -> Option<char> {
+        self.peek_nth(0)
+    }
+
+    pub(crate) fn peek_nth(&self, index: usize) -> Option<char> {
+        self.remaining.chars().nth(index)
+    }
+
+    pub(crate) fn next_char(&mut self) -> Option<char> {
+        let ch = self.peek()?;
+        self.remaining = &self.remaining[ch.len_utf8()..];
+        Some(ch)
+    }
+
+    /// Consume a nonempty token, optionally ignoring ASCII letter case.
+    /// A failed match leaves the cursor unchanged, including when the requested
+    /// prefix length would split a multibyte character.
+    pub(crate) fn consume_prefix(&mut self, prefix: &str, ignore_ascii_case: bool) -> bool {
+        if prefix.is_empty() {
+            return false;
+        }
+        let Some(candidate) = self.remaining.get(..prefix.len()) else {
+            return false;
+        };
+        let matches = if ignore_ascii_case {
+            candidate.eq_ignore_ascii_case(prefix)
+        } else {
+            candidate == prefix
+        };
+        if matches {
+            self.remaining = &self.remaining[prefix.len()..];
+        }
+        matches
+    }
+}
+
 /// Convert format tokens using longest-token matching.
 ///
 /// Unknown text is copied through unchanged. Empty input returns `None`,
 /// matching the public `time::format_time` helper.
+#[cfg(any(test, feature = "dialect-tsql", feature = "dialect-fabric"))]
 pub(crate) fn convert_format_tokens(input: &str, mapping: &[(&str, &str)]) -> Option<String> {
     if input.is_empty() {
         return None;
@@ -48,7 +99,36 @@ pub(crate) fn convert_format_tokens(input: &str, mapping: &[(&str, &str)]) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::convert_format_tokens;
+    use super::{convert_format_tokens, FormatTokenCursor};
+
+    #[test]
+    fn cursor_preserves_unicode_and_match_boundaries() {
+        let mut cursor = FormatTokenCursor::new("é年🦀e\u{301}ßſyyyy");
+        assert!(!cursor.consume_prefix("", false));
+        assert!(!cursor.consume_prefix("x", false));
+        assert!(!cursor.consume_prefix("yyy", true));
+        assert_eq!(cursor.peek(), Some('é'));
+        assert_eq!(cursor.peek_nth(2), Some('🦀'));
+        assert!(cursor.consume_prefix("é", false));
+        for ch in ['年', '🦀', 'e', '\u{301}', 'ß', 'ſ'] {
+            assert!(!cursor.consume_prefix("SS", true));
+            assert!(!cursor.consume_prefix("S", true));
+            assert_eq!(cursor.next_char(), Some(ch));
+        }
+        assert!(!cursor.consume_prefix("YYYY", false));
+        assert!(cursor.consume_prefix("YYYY", true));
+        assert_eq!(cursor.next_char(), None);
+        assert!(!cursor.consume_prefix("Y", true));
+        assert_eq!(FormatTokenCursor::new("").peek(), None);
+    }
+
+    #[test]
+    fn format_tokens_preserve_unicode_literals() {
+        assert_eq!(
+            convert_format_tokens("éYYYY年MM🦀ßSS", TEST_MAPPING),
+            Some("é%Y年MM🦀ß%S".into())
+        );
+    }
 
     const TEST_MAPPING: &[(&str, &str)] = &[
         ("TMMonth", "%B"),

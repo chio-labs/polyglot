@@ -252,6 +252,7 @@ pub(super) fn rewrite(
 
                         let array_expr = Expression::Array(Box::new(crate::expressions::Array {
                             expressions: quantiles,
+                            inferred_type: None,
                         }));
 
                         let mut new_agg = *agg;

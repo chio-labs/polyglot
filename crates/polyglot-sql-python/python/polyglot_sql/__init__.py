@@ -1,6 +1,38 @@
 """Polyglot SQL — Rust-powered SQL transpiler for more than 30 SQL dialects."""
 
-from polyglot_sql._polyglot_sql import (
+from typing import Optional, TypedDict
+from .analysis_types import (
+    AnalyzeQueryOptions as AnalyzeQueryOptions,
+    ValidationSchema as ValidationSchema,
+    SchemaTable as SchemaTable,
+    SchemaColumn as SchemaColumn,
+    SchemaColumnReference as SchemaColumnReference,
+    SchemaTableReference as SchemaTableReference,
+    SchemaForeignKey as SchemaForeignKey,
+    QueryAnalysis as QueryAnalysis,
+    QuerySourceSpan as QuerySourceSpan,
+    ProjectionFact as ProjectionFact,
+    TransformFunctionFact as TransformFunctionFact,
+    CteFact as CteFact,
+    RelationFact as RelationFact,
+    StarProjectionFact as StarProjectionFact,
+    SetOperationFact as SetOperationFact,
+    SetOperationBranchFact as SetOperationBranchFact,
+    ColumnUseFact as ColumnUseFact,
+    ColumnUseReferenceFact as ColumnUseReferenceFact,
+    ColumnReferenceFact as ColumnReferenceFact,
+    ReferenceConfidence as ReferenceConfidence,
+    ProjectionNullability as ProjectionNullability,
+    TransformKind as TransformKind,
+    ColumnUseContext as ColumnUseContext,
+    FunctionNameCase as FunctionNameCase,
+    FunctionSignature as FunctionSignature,
+    FunctionCatalogEntry as FunctionCatalogEntry,
+    FunctionCatalogSpec as FunctionCatalogSpec,
+)
+
+# Native exports are described by the adjacent public __init__.pyi.
+from polyglot_sql._polyglot_sql import (  # pyright: ignore[reportMissingImports]
     Expression,
     ColumnResolutionError,
     GenerateError,
@@ -60,8 +92,24 @@ from polyglot_sql._polyglot_sql import (
     except_,
     extract,
     validate,
+    validate_with_schema,
     version as _version,
 )
+
+
+class ComplexityGuardOptions(TypedDict, total=False):
+    """Shared Rust limits. Omit a key for its default; None disables that check.
+
+    Raising or disabling limits can permit stack exhaustion and process termination.
+    """
+
+    maxParserDepth: Optional[int]
+    maxInputBytes: Optional[int]
+    maxTokens: Optional[int]
+    maxAstNodes: Optional[int]
+    maxAstDepth: Optional[int]
+    maxParenthesisDepth: Optional[int]
+    maxFunctionCallDepth: Optional[int]
 
 
 def _builtin(name, *args):
@@ -228,7 +276,7 @@ def dense_rank():
     return _builtin("dense_rank")
 
 # Expression subclasses — import all from native module
-from polyglot_sql._polyglot_sql import (
+from polyglot_sql._polyglot_sql import (  # pyright: ignore[reportMissingImports]
     Abs,
     Add,
     AddMonths,
@@ -1156,6 +1204,34 @@ format = format_sql
 __version__ = _version()
 
 __all__ = [
+    "AnalyzeQueryOptions",
+    "ValidationSchema",
+    "SchemaTable",
+    "SchemaColumn",
+    "SchemaColumnReference",
+    "SchemaTableReference",
+    "SchemaForeignKey",
+    "QueryAnalysis",
+    "QuerySourceSpan",
+    "ProjectionFact",
+    "TransformFunctionFact",
+    "CteFact",
+    "RelationFact",
+    "StarProjectionFact",
+    "SetOperationFact",
+    "SetOperationBranchFact",
+    "ColumnUseFact",
+    "ColumnUseReferenceFact",
+    "ColumnReferenceFact",
+    "ReferenceConfidence",
+    "ProjectionNullability",
+    "TransformKind",
+    "ColumnUseContext",
+    "FunctionNameCase",
+    "FunctionSignature",
+    "FunctionCatalogEntry",
+    "FunctionCatalogSpec",
+    "ComplexityGuardOptions",
     "transpile",
     "parse",
     "parse_one",
@@ -1169,6 +1245,7 @@ __all__ = [
     "format_sql",
     "format",
     "validate",
+    "validate_with_schema",
     "optimize",
     "analyze_query",
     "lineage",

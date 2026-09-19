@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.9.4"
+const sdkVersion = "0.12.0"
 
 func Version() string {
 	return sdkVersion
@@ -16,12 +16,66 @@ type TranspileOptions struct {
 }
 
 type ComplexityGuardOptions struct {
-	MaxInputBytes        *int `json:"maxInputBytes,omitempty"`
-	MaxTokens            *int `json:"maxTokens,omitempty"`
-	MaxASTNodes          *int `json:"maxAstNodes,omitempty"`
-	MaxASTDepth          *int `json:"maxAstDepth,omitempty"`
-	MaxParenthesisDepth  *int `json:"maxParenthesisDepth,omitempty"`
-	MaxFunctionCallDepth *int `json:"maxFunctionCallDepth,omitempty"`
+	MaxParserDepth       GuardLimit `json:"maxParserDepth"`
+	MaxInputBytes        GuardLimit `json:"maxInputBytes"`
+	MaxTokens            GuardLimit `json:"maxTokens"`
+	MaxASTNodes          GuardLimit `json:"maxAstNodes"`
+	MaxASTDepth          GuardLimit `json:"maxAstDepth"`
+	MaxParenthesisDepth  GuardLimit `json:"maxParenthesisDepth"`
+	MaxFunctionCallDepth GuardLimit `json:"maxFunctionCallDepth"`
+}
+
+// GuardLimit distinguishes an omitted limit from a number (including zero) and
+// explicit disabling. Raising or disabling a parser limit can permit stack exhaustion.
+type GuardLimit struct {
+	value *uint64
+	set   bool
+}
+
+// NewGuardLimit supplies an explicit, nonnegative resource limit.
+func NewGuardLimit(value uint64) GuardLimit { return GuardLimit{value: &value, set: true} }
+
+// DisabledGuardLimit disables this check only; other guards remain active.
+func DisabledGuardLimit() GuardLimit { return GuardLimit{set: true} }
+
+func (limit GuardLimit) MarshalJSON() ([]byte, error) { return json.Marshal(limit.value) }
+
+func (limit *GuardLimit) UnmarshalJSON(data []byte) error {
+	var value *uint64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*limit = GuardLimit{value: value, set: true}
+	return nil
+}
+
+// Custom omission is needed on Go 1.22: omitempty does not omit a value struct.
+func (options ComplexityGuardOptions) MarshalJSON() ([]byte, error) {
+	limits := map[string]GuardLimit{
+		"maxParserDepth":       options.MaxParserDepth,
+		"maxInputBytes":        options.MaxInputBytes,
+		"maxTokens":            options.MaxTokens,
+		"maxAstNodes":          options.MaxASTNodes,
+		"maxAstDepth":          options.MaxASTDepth,
+		"maxParenthesisDepth":  options.MaxParenthesisDepth,
+		"maxFunctionCallDepth": options.MaxFunctionCallDepth,
+	}
+	for name, limit := range limits {
+		if !limit.set {
+			delete(limits, name)
+		}
+	}
+	return json.Marshal(limits)
+}
+
+func (options *ComplexityGuardOptions) UnmarshalJSON(data []byte) error {
+	type fields ComplexityGuardOptions
+	var decoded fields
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*options = ComplexityGuardOptions(decoded)
+	return nil
 }
 
 type UnsupportedLevel string
@@ -44,9 +98,15 @@ type OptimizeOptions struct{}
 
 type GenerateOptions struct{}
 
+// ParseOptions configures parsing without changing dialect-specific defaults.
+type ParseOptions struct {
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+}
+
 type AnalyzeQueryOptions struct {
-	Dialect string            `json:"dialect,omitempty"`
-	Schema  *ValidationSchema `json:"schema,omitempty"`
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	Dialect         string                  `json:"dialect,omitempty"`
+	Schema          *ValidationSchema       `json:"schema,omitempty"`
 }
 
 type ValidationResult struct {
@@ -55,8 +115,21 @@ type ValidationResult struct {
 }
 
 type ValidationOptions struct {
-	StrictSyntax bool `json:"strictSyntax,omitempty"`
-	Semantic     bool `json:"semantic,omitempty"`
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	StrictSyntax    bool                    `json:"strictSyntax,omitempty"`
+	Semantic        bool                    `json:"semantic,omitempty"`
+}
+
+// SchemaValidationOptions controls the shared Rust schema validator. Unknown
+// identifiers are checked by default. Strict overrides ValidationSchema.Strict;
+// nil inherits the schema setting (which defaults to true).
+type SchemaValidationOptions struct {
+	ComplexityGuard *ComplexityGuardOptions `json:"complexityGuard,omitempty"`
+	CheckTypes      bool                    `json:"check_types,omitempty"`
+	CheckReferences bool                    `json:"check_references,omitempty"`
+	Strict          *bool                   `json:"strict,omitempty"`
+	Semantic        bool                    `json:"semantic,omitempty"`
+	StrictSyntax    bool                    `json:"strict_syntax,omitempty"`
 }
 
 type ValidationError struct {
@@ -65,8 +138,10 @@ type ValidationError struct {
 	Column   *int   `json:"column,omitempty"`
 	Severity string `json:"severity"`
 	Code     string `json:"code"`
-	Start    *int   `json:"start,omitempty"`
-	End      *int   `json:"end,omitempty"`
+	// Start and End are Unicode character offsets, suitable for slicing []rune(sql).
+	// End is exclusive; nil means the source range is unavailable.
+	Start *int `json:"start,omitempty"`
+	End   *int `json:"end,omitempty"`
 }
 
 type SchemaColumnReference struct {
@@ -109,6 +184,20 @@ type SchemaTable struct {
 type ValidationSchema struct {
 	Tables []SchemaTable `json:"tables"`
 	Strict *bool         `json:"strict,omitempty"`
+}
+
+// MarshalJSON represents nil table/column slices as empty arrays, matching the
+// shared schema contract. An empty column list denotes an open schema.
+func (schema ValidationSchema) MarshalJSON() ([]byte, error) {
+	type wireSchema ValidationSchema
+	wire := wireSchema(schema)
+	wire.Tables = append([]SchemaTable{}, schema.Tables...)
+	for i := range wire.Tables {
+		if wire.Tables[i].Columns == nil {
+			wire.Tables[i].Columns = []SchemaColumn{}
+		}
+	}
+	return json.Marshal(wire)
 }
 
 type LineageNode struct {
@@ -169,6 +258,47 @@ type QueryAnalysis struct {
 	BaseTables      []RelationFact       `json:"baseTables"`
 	StarProjections []StarProjectionFact `json:"starProjections"`
 	SetOperations   []SetOperationFact   `json:"setOperations"`
+	ColumnUses      []ColumnUseFact      `json:"columnUses"`
+}
+
+// QuerySourceSpan is a half-open range of Unicode characters in the original SQL.
+type QuerySourceSpan struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+// ColumnUseReferenceFact locates the use, not its upstream column definition.
+type ColumnUseReferenceFact struct {
+	ColumnReferenceFact
+	Span *QuerySourceSpan `json:"span,omitempty"`
+}
+
+type ColumnUseContext string
+
+const (
+	ColumnUseJoin               ColumnUseContext = "join"
+	ColumnUseFilter             ColumnUseContext = "filter"
+	ColumnUseGroup              ColumnUseContext = "group"
+	ColumnUseHaving             ColumnUseContext = "having"
+	ColumnUseQualify            ColumnUseContext = "qualify"
+	ColumnUseWindowPartition    ColumnUseContext = "window_partition"
+	ColumnUseWindowOrder        ColumnUseContext = "window_order"
+	ColumnUseWindowFrame        ColumnUseContext = "window_frame"
+	ColumnUseOrder              ColumnUseContext = "order"
+	ColumnUseAggregateOrder     ColumnUseContext = "aggregate_order"
+	ColumnUseSetOperationFilter ColumnUseContext = "set_operation_filter"
+)
+
+// ColumnUseFact groups references by their containing expression. Paths identify
+// locations within an analysis, not persistent IDs across SQL edits. ExpressionSQL
+// is dialect-rendered SQL; Span is absent unless a complete source range is known.
+type ColumnUseFact struct {
+	Context        ColumnUseContext         `json:"context"`
+	ScopePath      string                   `json:"scopePath"`
+	ExpressionPath string                   `json:"expressionPath"`
+	ExpressionSQL  string                   `json:"expressionSql"`
+	Span           *QuerySourceSpan         `json:"span,omitempty"`
+	References     []ColumnUseReferenceFact `json:"references"`
 }
 
 type ProjectionFact struct {

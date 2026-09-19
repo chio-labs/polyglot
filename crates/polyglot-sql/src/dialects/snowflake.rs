@@ -10,7 +10,9 @@
 //! - Default case-insensitive identifiers (unquoted)
 
 use super::{DialectImpl, DialectType};
+#[cfg(feature = "transpile")]
 use crate::error::Result;
+#[cfg(feature = "transpile")]
 use crate::expressions::{
     AggFunc, BinaryOp, Cast, CeilFunc, DataType, Expression, Function, IntervalUnit, ListAggFunc,
     Literal, UnaryFunc, VarArgFunc,
@@ -20,6 +22,7 @@ use crate::generator::GeneratorConfig;
 use crate::tokens::TokenizerConfig;
 
 /// Convert IntervalUnit to string for Snowflake syntax
+#[cfg(feature = "transpile")]
 fn interval_unit_to_str(unit: &IntervalUnit) -> String {
     match unit {
         IntervalUnit::Year => "YEAR".to_string(),
@@ -1199,39 +1202,9 @@ impl DialectImpl for SnowflakeDialect {
                 })))
             }
 
-            // ===== ORDER BY null ordering normalization =====
-            // Snowflake is nulls_are_large: ASC defaults to NULLS LAST, DESC defaults to NULLS FIRST
-            // Fill in implicit nulls_first so target dialects can properly strip/add as needed
-            Expression::Select(mut select) => {
-                if let Some(ref mut order) = select.order_by {
-                    for ord in &mut order.expressions {
-                        if ord.nulls_first.is_none() {
-                            ord.nulls_first = Some(ord.desc);
-                        }
-                    }
-                }
-                Ok(Expression::Select(select))
-            }
-
-            // Fill in NULLS ordering for window function ORDER BY clauses
-            Expression::WindowFunction(mut wf) => {
-                for ord in &mut wf.over.order_by {
-                    if ord.nulls_first.is_none() {
-                        ord.nulls_first = Some(ord.desc);
-                    }
-                }
-                Ok(Expression::WindowFunction(wf))
-            }
-
-            // Also handle Expression::Window (WindowSpec)
-            Expression::Window(mut w) => {
-                for ord in &mut w.order_by {
-                    if ord.nulls_first.is_none() {
-                        ord.nulls_first = Some(ord.desc);
-                    }
-                }
-                Ok(Expression::Window(w))
-            }
+            // Implicit NULL ordering is handled by cross-dialect normalization,
+            // not here: this transform also runs on Snowflake targets and identity
+            // queries, where missing clauses must retain server-dependent semantics.
 
             // LATERAL FLATTEN: add default column aliases (SEQ, KEY, PATH, INDEX, VALUE, THIS)
             Expression::Lateral(mut lat) => {
@@ -2389,6 +2362,7 @@ impl SnowflakeDialect {
                     expressions: f.args,
                     bracket_notation: true,
                     use_list_keyword: false,
+                    inferred_type: None,
                 },
             ))),
 
@@ -3527,97 +3501,66 @@ impl SnowflakeDialect {
     /// MI -> mi, SS -> ss, FF -> ff, AM/PM -> pm, quoted "T" -> T
     fn normalize_snowflake_format(format: &str) -> String {
         let mut result = String::new();
-        let chars: Vec<char> = format.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            // Handle quoted strings like "T" -> T
-            if chars[i] == '"' {
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1; // skip closing quote
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(format);
+        while let Some(ch) = cursor.peek() {
+            // Quoted literals are copied without recognizing format tokens.
+            if cursor.consume_prefix("\"", false) {
+                while let Some(literal) = cursor.next_char() {
+                    if literal == '"' {
+                        break;
+                    }
+                    result.push(literal);
                 }
                 continue;
             }
 
-            let remaining = &format[i..];
-            let remaining_upper = remaining.to_uppercase();
-
             // Multi-char patterns (check longest first)
-            if remaining_upper.starts_with("YYYY") {
+            if cursor.consume_prefix("YYYY", true) {
                 result.push_str("yyyy");
-                i += 4;
-            } else if remaining_upper.starts_with("YY") {
+            } else if cursor.consume_prefix("YY", true) {
                 result.push_str("yy");
-                i += 2;
-            } else if remaining_upper.starts_with("MMMM") {
+            } else if cursor.consume_prefix("MMMM", true) {
                 result.push_str("mmmm");
-                i += 4;
-            } else if remaining_upper.starts_with("MON") {
+            } else if cursor.consume_prefix("MON", true) {
                 result.push_str("mon");
-                i += 3;
-            } else if remaining_upper.starts_with("MM") {
+            } else if cursor.consume_prefix("MM", true) {
                 result.push_str("mm");
-                i += 2;
-            } else if remaining_upper.starts_with("DD") {
+            } else if cursor.consume_prefix("DD", true) {
                 result.push_str("DD");
-                i += 2;
-            } else if remaining_upper.starts_with("DY") {
+            } else if cursor.consume_prefix("DY", true) {
                 result.push_str("dy");
-                i += 2;
-            } else if remaining_upper.starts_with("HH24") {
+            } else if cursor.consume_prefix("HH24", true) {
                 result.push_str("hh24");
-                i += 4;
-            } else if remaining_upper.starts_with("HH12") {
+            } else if cursor.consume_prefix("HH12", true) {
                 result.push_str("hh12");
-                i += 4;
-            } else if remaining_upper.starts_with("HH") {
+            } else if cursor.consume_prefix("HH", true) {
                 result.push_str("hh");
-                i += 2;
-            } else if remaining_upper.starts_with("MISS") {
+            } else if cursor.consume_prefix("MISS", true) {
                 // MISS = MI + SS
                 result.push_str("miss");
-                i += 4;
-            } else if remaining_upper.starts_with("MI") {
+            } else if cursor.consume_prefix("MI", true) {
                 result.push_str("mi");
-                i += 2;
-            } else if remaining_upper.starts_with("SS") {
+            } else if cursor.consume_prefix("SS", true) {
                 result.push_str("ss");
-                i += 2;
-            } else if remaining_upper.starts_with("FF") {
-                // FF followed by a digit (FF1-FF9) keeps the digit
-                let ff_len = 2;
-                let digit = if i + ff_len < chars.len() && chars[i + ff_len].is_ascii_digit() {
-                    let d = chars[i + ff_len];
-                    Some(d)
-                } else {
-                    None
-                };
-                if let Some(d) = digit {
+            } else if cursor.consume_prefix("FF", true) {
+                if let Some(digit) = cursor.peek().filter(|c| c.is_ascii_digit()) {
                     result.push_str("ff");
-                    result.push(d);
-                    i += 3;
+                    result.push(digit);
+                    cursor.next_char();
                 } else {
-                    // Plain FF -> ff9
+                    // Plain FF normalizes to nanosecond precision.
                     result.push_str("ff9");
-                    i += 2;
                 }
-            } else if remaining_upper.starts_with("AM") || remaining_upper.starts_with("PM") {
+            } else if cursor.consume_prefix("AM", true) || cursor.consume_prefix("PM", true) {
                 result.push_str("pm");
-                i += 2;
-            } else if remaining_upper.starts_with("TZH") {
+            } else if cursor.consume_prefix("TZH", true) {
                 result.push_str("tzh");
-                i += 3;
-            } else if remaining_upper.starts_with("TZM") {
+            } else if cursor.consume_prefix("TZM", true) {
                 result.push_str("tzm");
-                i += 3;
             } else {
                 // Keep separators and other characters as-is
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result
@@ -3939,6 +3882,7 @@ impl SnowflakeDialect {
 }
 
 /// Convert strftime format specifiers to Snowflake format specifiers
+#[cfg(feature = "transpile")]
 fn strftime_to_snowflake_format(fmt: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = fmt.chars().collect();
@@ -4017,6 +3961,44 @@ mod tests {
     use super::*;
     use crate::dialects::Dialect;
 
+    #[test]
+    fn test_date_time_format_normalization_preserves_unicode() {
+        for literal in ["é", "年", "🦀", "e\u{301}", "ß", "ſ"] {
+            assert_eq!(
+                SnowflakeDialect::normalize_snowflake_format(literal),
+                literal
+            );
+            assert_eq!(
+                SnowflakeDialect::normalize_snowflake_format(&format!(
+                    "{literal}YYYY{literal}mM{literal}"
+                )),
+                format!("{literal}yyyy{literal}mm{literal}")
+            );
+        }
+        for (input, expected) in [
+            ("", ""),
+            (
+                "YYYY YY MMMM MON MM DD DY HH24 HH12 HH MISS MI SS AM PM TZH TZM",
+                "yyyy yy mmmm mon mm DD dy hh24 hh12 hh miss mi ss pm pm tzh tzm",
+            ),
+            (
+                "FF FF0 FF1 FF6 FF7 FF9 FF69",
+                "ff9 ff0 ff1 ff6 ff7 ff9 ff69",
+            ),
+            ("éFF9年YYYY", "éff9年yyyy"),
+            ("\"éYYYY🦀\"YYYY", "éYYYY🦀yyyy"),
+            ("YYYY\"年", "yyyy年"),
+            ("\"\"YYYY\"T\"HH24", "yyyyThh24"),
+            ("q %-q %", "q %-q %"),
+        ] {
+            assert_eq!(
+                SnowflakeDialect::normalize_snowflake_format(input),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
     fn transpile_to_snowflake(sql: &str) -> String {
         let dialect = Dialect::get(DialectType::Generic);
         let result = dialect
@@ -4040,6 +4022,14 @@ mod tests {
         let result = transpile_to_snowflake("SELECT a, b FROM users WHERE id = 1");
         assert!(result.contains("SELECT"));
         assert!(result.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_extract_string_comma_syntax_remains_date_part() {
+        assert_eq!(
+            transpile_to_snowflake("SELECT EXTRACT('month', a)"),
+            "SELECT DATE_PART('month', a)"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ go get github.com/tobilg/polyglot/packages/go
 ```
 
 Go module releases use nested tags that match the root Polyglot release, for
-example `packages/go/v0.5.0`.
+example `packages/go/v0.12.0`.
 
 ## Native Library Setup
 
@@ -147,7 +147,8 @@ These methods are available on `*Client` and as package-level wrappers:
 | `GenerateDataType(dataType json.RawMessage, dialect string) (string, error)` | Generate SQL from a JSON `DataType` returned by `ParseDataType`. |
 | `Build(expression Expression) (json.RawMessage, error)` | Evaluate an immutable builder plan and return its JSON AST. |
 | `BuildSQL(expression Expression, dialect string) (string, error)` | Evaluate an immutable builder plan and render SQL for a dialect. |
-| `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic warnings; diagnostics are returned as data. |
+| `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic correctness/quality checks; diagnostics are returned as data. |
+| `ValidateWithSchema(sql string, schema ValidationSchema, dialect string, options ...SchemaValidationOptions) (ValidationResult, error)` | Validate references and optional types using the shared Rust engine. |
 | `Dialects() ([]string, error)` | Return supported dialect names. |
 | `DialectCount() (int, error)` | Return the number of supported dialects. |
 
@@ -179,9 +180,9 @@ parts they need:
 
 | API | Description |
 | --- | --- |
-| `Parse(sql, dialect string) (json.RawMessage, error)` | Parse one or more SQL statements into a JSON AST array. |
-| `ParseOne(sql, dialect string) (json.RawMessage, error)` | Parse one SQL statement into a single JSON AST node. |
-| `ParseDataType(sql, dialect string) (json.RawMessage, error)` | Parse exactly one standalone SQL data type into a JSON `DataType`. |
+| `Parse(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse one or more SQL statements into a JSON AST array. |
+| `ParseOne(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse one SQL statement into a single JSON AST node. |
+| `ParseDataType(sql, dialect string, options ...ParseOptions) (json.RawMessage, error)` | Parse exactly one standalone SQL data type into a JSON `DataType`. |
 | `Tokenize(sql, dialect string) (json.RawMessage, error)` | Tokenize SQL and return token JSON. |
 | `AnnotateTypes(sql, dialect string, schema *ValidationSchema) (json.RawMessage, error)` | Parse SQL and annotate expression types, optionally using schema metadata. |
 | `Diff(sql1, sql2, dialect string) (json.RawMessage, error)` | Return an AST diff between two SQL strings. |
@@ -374,6 +375,15 @@ and schema-expanded columns, and `ProjectionFact.Nullability` is one of
 Each `SetOperationBranchFact.Role` is `value` for value-producing branches or
 `filter` for the right branch of `EXCEPT` and `INTERSECT`.
 
+`ColumnUses` groups non-projection references by clause, covering joins, filters,
+grouping, HAVING/QUALIFY, window keys/frames, ordering, and set-operation filter
+inputs. `ScopePath` and `ExpressionPath` distinguish nested expressions and
+branches. `ExpressionSQL` is dialect-rendered, not necessarily original text.
+Optional `Span` ranges are half-open Unicode-character offsets; slice `[]rune(sql)`
+to recover source text. Reference spans locate uses, not upstream definitions.
+Repeated occurrences are retained and uncertain references remain `ambiguous`
+or `unknown`. Older runtime payloads decode with an empty/nil `ColumnUses` slice.
+
 ### OpenLineage
 
 | API | Description |
@@ -424,16 +434,51 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 
 ### Options and Result Types
 
+Parser nesting is limited to 1024 logical levels by default in the native Rust core
+(WASM uses a separate default of 32).
+Set `ComplexityGuardOptions.MaxParserDepth` with `NewGuardLimit(n)` to override
+it, or `DisabledGuardLimit()` to disable that check. The zero-value `GuardLimit` omits
+the option; `NewGuardLimit(0)` rejects parsing descents. This is separate from AST depth.
+Raising/disabling limits can permit stack exhaustion and process termination; it does
+not increase available stack or provide a general time/memory budget. Only application
+owners should control overrides.
+
+All seven complexity limits now use `GuardLimit`: the zero value omits the field,
+`NewGuardLimit(n)` supplies a bound, and `DisabledGuardLimit()` emits JSON `null`.
+**Migration:** fields previously using `*int` must now use `NewGuardLimit(uint64(n))`
+(after checking that `n` is nonnegative); replace nil/defaults with `GuardLimit{}`.
+This change does not affect `FormatOptions`.
+
+`Parse`, `ParseOne`, and `ParseDataType` accept an optional `ParseOptions` value.
+`ValidationOptions`, `SchemaValidationOptions`, and `AnalyzeQueryOptions` also
+accept `ComplexityGuard`, using the same Rust implementation as transpilation.
+Omitting the guard preserves dialect defaults; an explicit guard object uses
+shared defaults for omitted fields. Rebuild/update the native FFI library with
+this SDK: it loads the new `polyglot_parse*_with_options` symbols.
+
+```go
+guard := &polyglot.ComplexityGuardOptions{
+    MaxFunctionCallDepth: polyglot.NewGuardLimit(128),
+}
+ast, err := client.ParseOne(sql, "snowflake", polyglot.ParseOptions{ComplexityGuard: guard})
+result, err := client.Validate(sql, "snowflake", polyglot.ValidationOptions{ComplexityGuard: guard})
+```
+
+Lineage, optimization, and other SQL-consuming helpers retain their default limits.
+
 | Type | Fields |
 | --- | --- |
 | `TranspileOptions` | `Pretty`, `UnsupportedLevel`, `MaxUnsupported`, `ComplexityGuard` |
-| `ComplexityGuardOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxASTDepth`, `MaxParenthesisDepth`, `MaxFunctionCallDepth` |
+| `ParseOptions` | `ComplexityGuard` |
+| `ComplexityGuardOptions` | `MaxParserDepth`, `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxASTDepth`, `MaxParenthesisDepth`, `MaxFunctionCallDepth` |
 | `UnsupportedLevel` | `UnsupportedIgnore`, `UnsupportedWarn`, `UnsupportedRaise`, `UnsupportedImmediate` |
 | `FormatOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxSetOpChain` |
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
-| `AnalyzeQueryOptions` | `Dialect`, `Schema` |
-| `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations` |
+| `AnalyzeQueryOptions` | `Dialect`, `Schema`, `ComplexityGuard` |
+| `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations`, `ColumnUses` |
+| `ColumnUseFact` | `Context`, `ScopePath`, `ExpressionPath`, `ExpressionSQL`, `Span`, `References` |
+| `ColumnUseReferenceFact` | Embedded `ColumnReferenceFact`, optional original-use `Span` |
 | `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `TransformFunction`, `CastType`, `TypeHint`, `Nullability`, `Upstream` |
 | `TransformFunctionFact` | `Name`, `LiteralArgs`, `ColumnArgs` |
 | `CTEFact` | `Name`, `Columns`, `BodySQL`, `OutputColumns` |
@@ -444,7 +489,8 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `SetOperationBranchFact` | `Index`, `Role`, `Projections` |
 | `ValidationResult` | `Valid`, `Errors` |
 | `ValidationError` | `Message`, `Line`, `Column`, `Severity`, `Code`, `Start`, `End` |
-| `ValidationOptions` | `StrictSyntax`, `Semantic` |
+| `ValidationOptions` | `StrictSyntax`, `Semantic`, `ComplexityGuard` |
+| `SchemaValidationOptions` | `CheckTypes`, `CheckReferences`, `Strict`, `Semantic`, `StrictSyntax`, `ComplexityGuard` |
 | `ValidationSchema` | `Tables`, `Strict` |
 | `SchemaTable` | `Name`, `Schema`, `Columns`, `Aliases`, `PrimaryKey`, `UniqueKeys`, `ForeignKeys` |
 | `SchemaColumn` | `Name`, `Type`, `Nullable`, `PrimaryKey`, `Unique`, `References` |
@@ -515,6 +561,45 @@ if err != nil {
 fmt.Println(result.Valid)
 fmt.Println(result.Errors)
 ```
+
+Schema-aware validation is also available on `Client` and through the default
+client package wrapper:
+
+```go
+schema := polyglot.ValidationSchema{Tables: []polyglot.SchemaTable{
+    {Name: "orders", Columns: []polyglot.SchemaColumn{{Name: "order_id", Type: "INT"}}},
+}}
+sql := "SELECT o.order_id FROM orders o WHERE o.missing_column = TRUE"
+result, err := client.ValidateWithSchema(sql, schema, "snowflake", polyglot.SchemaValidationOptions{
+    CheckTypes: true,
+    CheckReferences: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+for _, finding := range result.Errors {
+    fmt.Println(finding.Code, finding.Message)
+    if finding.Start != nil && finding.End != nil {
+        fmt.Println(string([]rune(sql)[*finding.Start:*finding.End]))
+    }
+}
+```
+
+Unknown tables, aliases and columns are checked by default. `CheckReferences`
+additionally checks ambiguity and foreign-key metadata. `CheckTypes` enables
+type checks. `Strict` is an optional `*bool`: nil inherits `schema.Strict`,
+which defaults to true; false reports reference/type findings as warnings.
+`StrictSyntax` and `Semantic` behave as for `Validate`. An empty dialect selects
+`generic`; at most one options value may be supplied.
+
+Empty or nil column slices and wildcard (`*`) columns represent open schemas.
+Other nonempty column lists are treated as complete. Nil table/column slices
+serialize as empty arrays without modifying the caller's schema. Diagnostic
+`Start`/`End` values are Unicode character offsets, not byte offsets; slice
+`[]rune(sql)` rather than the SQL string directly. Unavailable ranges are nil.
+Validation findings are data; invalid arguments and native-library failures
+remain Go errors. This API requires the matching updated FFI library with the
+`polyglot_validate_with_schema` export.
 
 Strict syntax and query-quality warnings use the same Rust validation path as
 the other SDKs:

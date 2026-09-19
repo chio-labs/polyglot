@@ -10,19 +10,37 @@
 
 import type { Expression } from '../../generated/Expression';
 import {
-  type ExpressionByKey,
+  type ExpressionBySingleKey,
   type ExpressionType,
   getExprType,
+  type SingleExpressionType,
 } from '../helpers';
 
 /**
- * Generic type guard factory
+ * Narrow an Expression when the tag is statically known to be one variant.
+ * Union and broad tags return a boolean so their false branches remain sound.
  */
-function isType<T extends ExpressionType>(
-  type: T,
-): (expr: Expression) => expr is ExpressionByKey<T> {
-  return (expr: Expression): expr is ExpressionByKey<T> =>
-    type in (expr as Record<string, unknown>);
+export function isExpressionType<const T extends ExpressionType>(
+  expr: Expression,
+  type: SingleExpressionType<T>,
+): expr is ExpressionBySingleKey<T>;
+export function isExpressionType(
+  expr: Expression,
+  type: ExpressionType,
+): boolean;
+export function isExpressionType(
+  expr: Expression,
+  type: ExpressionType,
+): boolean {
+  return type in (expr as Record<string, unknown>);
+}
+
+/** Generic type guard factory for the named guard exports below. */
+function isType<const T extends ExpressionType>(
+  type: SingleExpressionType<T>,
+): (expr: Expression) => expr is ExpressionBySingleKey<T> {
+  return (expr: Expression): expr is ExpressionBySingleKey<T> =>
+    isExpressionType(expr, type);
 }
 
 // ============================================================================

@@ -50,6 +50,26 @@ fn round_trip_tsql(sql: &str) -> String {
 }
 
 #[test]
+fn keyword_relation_alias_handling_preserves_tsql_top_clause() {
+    for dialect_type in [DialectType::TSQL, DialectType::Fabric] {
+        let dialect = Dialect::get(dialect_type);
+        for sql in [
+            "SELECT TOP 2 item_id FROM ranked_items",
+            "SELECT TOP (2) WITH TIES item_id FROM ranked_items ORDER BY item_id",
+        ] {
+            let tokens = dialect.tokenize(sql).unwrap();
+            assert_eq!(tokens[1].token_type, TokenType::Top);
+            let statements = dialect.parse(sql).unwrap();
+            let Expression::Select(select) = &statements[0] else {
+                panic!("Expected SELECT for {sql}");
+            };
+            assert!(select.top.is_some(), "{dialect_type:?}: {sql}");
+            assert_eq!(dialect.transpile(sql, dialect_type).unwrap(), [sql]);
+        }
+    }
+}
+
+#[test]
 fn issue_376_tsql_and_fabric_accept_sampling_words_as_implicit_table_aliases() {
     for dialect_type in [DialectType::TSQL, DialectType::Fabric] {
         let dialect = Dialect::get(dialect_type);

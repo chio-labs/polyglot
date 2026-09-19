@@ -11,6 +11,29 @@ const DEFAULT_MAX_AST_NODES: usize = 1_000_000;
 const DEFAULT_MAX_AST_DEPTH: usize = 512;
 const DEFAULT_MAX_PARENTHESES_DEPTH: usize = 512;
 const DEFAULT_MAX_FUNCTION_CALL_DEPTH: usize = 64;
+// WASM has no stacker support, and grammar frames differ substantially in size.
+// Keep its default conservative; an explicit option still replaces this value.
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_MAX_PARSER_DEPTH: usize = 32;
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_MAX_PARSER_DEPTH: usize = 1_024;
+
+/// Per-call parsing options. An absent guard preserves dialect-specific defaults.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ParseOptions {
+    #[serde(default)]
+    pub complexity_guard: Option<ComplexityGuardOptions>,
+}
+
+fn default_max_parser_depth() -> Option<usize> {
+    Some(DEFAULT_MAX_PARSER_DEPTH)
+}
+
+/// Resource exhaustion must not be treated as a speculative syntax mismatch.
+pub(crate) fn is_guard_error(error: &Error) -> bool {
+    matches!(error, Error::Parse { message, .. } if message.starts_with("E_GUARD_"))
+}
 
 fn default_max_input_bytes() -> Option<usize> {
     Some(DEFAULT_MAX_INPUT_BYTES)
@@ -41,8 +64,13 @@ fn default_max_function_call_depth() -> Option<usize> {
 /// These limits turn excessively deep or large inputs into regular errors
 /// instead of relying on process stack exhaustion as the failure mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComplexityGuardOptions {
+    /// Maximum logical nesting during parsing, before an AST exists.
+    /// Defaults to 32 on WASM and 1024 on native targets.
+    /// Raising this limit or disabling it with `None` can permit stack exhaustion.
+    #[serde(default = "default_max_parser_depth")]
+    pub max_parser_depth: Option<usize>,
     /// Maximum allowed SQL input size in bytes.
     /// `None` disables this check.
     #[serde(default = "default_max_input_bytes")]
@@ -120,6 +148,7 @@ impl TokenGuardStats {
 impl Default for ComplexityGuardOptions {
     fn default() -> Self {
         Self {
+            max_parser_depth: default_max_parser_depth(),
             max_input_bytes: default_max_input_bytes(),
             max_tokens: default_max_tokens(),
             max_ast_nodes: default_max_ast_nodes(),
@@ -371,6 +400,33 @@ mod token_guard_tests {
     use super::*;
     use crate::tokens::Tokenizer;
     use std::sync::Arc;
+
+    #[test]
+    fn parser_depth_json_contract() {
+        let omitted: ComplexityGuardOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.max_parser_depth, Some(DEFAULT_MAX_PARSER_DEPTH));
+        assert_eq!(
+            omitted.max_parser_depth,
+            ComplexityGuardOptions::default().max_parser_depth
+        );
+        for limit in [Some(0), Some(1), Some(2048), None] {
+            let guard = ComplexityGuardOptions {
+                max_parser_depth: limit,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&guard).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ComplexityGuardOptions>(&json).unwrap(),
+                guard
+            );
+        }
+        for value in ["-1", "1.5", "true", "\"10\""] {
+            assert!(serde_json::from_str::<ComplexityGuardOptions>(&format!(
+                "{{\"maxParserDepth\":{value}}}"
+            ))
+            .is_err());
+        }
+    }
 
     #[test]
     fn collected_parser_stats_match_full_token_guard_pass() {

@@ -60,6 +60,9 @@ pub struct Resolver<'a> {
     unambiguous_columns_cache: Option<HashMap<String, String>>,
     /// Cached set of all available columns
     all_columns_cache: Option<HashSet<String>>,
+    /// Actual correlated parents, nearest first. Physical schema entries alone
+    /// do not make a relation visible in a query.
+    outer_scopes: Vec<&'a Scope>,
 }
 
 impl<'a> Resolver<'a> {
@@ -73,7 +76,46 @@ impl<'a> Resolver<'a> {
             source_columns_cache: HashMap::new(),
             unambiguous_columns_cache: None,
             all_columns_cache: None,
+            outer_scopes: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_outer_scopes(mut self, scopes: &'a [Scope]) -> Self {
+        self.outer_scopes = scopes.iter().rev().collect();
+        self
+    }
+
+    pub(crate) fn outer_source_exists(&self, name: &str) -> bool {
+        self.outer_scopes.iter().any(|scope| {
+            scope.sources.keys().any(|source| {
+                normalize_name(source, self.dialect, true, true)
+                    == normalize_name(name, self.dialect, true, true)
+            })
+        })
+    }
+
+    pub(crate) fn find_column_in_outer_scopes(&self, column: &str) -> Option<String> {
+        let mut shadowed = HashSet::new();
+        shadowed.extend(
+            self.scope
+                .sources
+                .keys()
+                .map(|name| normalize_name(name, self.dialect, true, true)),
+        );
+        for outer in &self.outer_scopes {
+            let mut visible = (*outer).clone();
+            visible
+                .sources
+                .retain(|name, _| shadowed.insert(normalize_name(name, self.dialect, true, true)));
+            let mut resolver = Resolver::new(&visible, self.schema, self.infer_schema);
+            if resolver.is_ambiguous(column) {
+                return None;
+            }
+            if let Some(table) = resolver.get_table(column) {
+                return Some(table);
+            }
+        }
+        None
     }
 
     /// Get the table for a column name.
@@ -112,15 +154,15 @@ impl<'a> Resolver<'a> {
     }
 
     /// Check if a table exists in the schema (not necessarily in the current scope).
-    /// Used to detect correlated references to outer scope tables.
+    /// Catalogue membership alone does not imply lexical visibility.
     pub fn table_exists_in_schema(&self, table_name: &str) -> bool {
         self.schema.column_names(table_name).is_ok()
     }
 
     /// Find the table for a column by searching all schema tables not in the current scope.
-    /// Used for correlated subquery resolution: if an unqualified column can't be resolved
-    /// in the current scope, check if it uniquely belongs to an outer-scope table.
-    /// Returns Some(table_name) if the column is found in exactly one non-local table.
+    /// Returns Some(table_name) if the column is found in exactly one non-local
+    /// catalogue table. This is not a correlated-scope lookup: qualification
+    /// must use the actual lexical parents instead.
     pub fn find_column_in_outer_schema_tables(&self, column_name: &str) -> Option<String> {
         let tables = self.schema.find_tables_for_column(column_name);
         // Filter to tables NOT in the current scope

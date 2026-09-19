@@ -10,6 +10,8 @@ pub struct ValidationErrorInfo {
     message: String,
     line: usize,
     col: usize,
+    start: Option<usize>,
+    end: Option<usize>,
     code: String,
     severity: String,
 }
@@ -29,6 +31,16 @@ impl ValidationErrorInfo {
     #[getter]
     fn col(&self) -> usize {
         self.col
+    }
+
+    #[getter]
+    fn start(&self) -> Option<usize> {
+        self.start
+    }
+
+    #[getter]
+    fn end(&self) -> Option<usize> {
+        self.end
     }
 
     #[getter]
@@ -86,6 +98,8 @@ fn validation_error_info_from_core(err: &CoreValidationError) -> ValidationError
         message: err.message.clone(),
         line: err.line.unwrap_or(0),
         col: err.column.unwrap_or(0),
+        start: err.start,
+        end: err.end,
         code: err.code.clone(),
         severity: match err.severity {
             ValidationSeverity::Error => "error".to_string(),

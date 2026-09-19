@@ -25,12 +25,12 @@ By default, `polyglot-sql` enables the full public API. Parser-only consumers ca
 disable default features and opt into only the dialect parsers they need:
 
 ```toml
-polyglot-sql = { version = "0.9.4", default-features = false }
+polyglot-sql = { version = "0.12.0", default-features = false }
 ```
 
 ```toml
 polyglot-sql = {
-    version = "0.8.0",
+    version = "0.12.0",
     default-features = false,
     features = ["dialect-clickhouse"],
 }
@@ -44,14 +44,14 @@ Examples:
 ```toml
 # Parse and generate SQL for one dialect.
 polyglot-sql = {
-    version = "0.8.0",
+    version = "0.12.0",
     default-features = false,
     features = ["generate", "dialect-clickhouse"],
 }
 
 # Cross-dialect transpilation.
 polyglot-sql = {
-    version = "0.8.0",
+    version = "0.12.0",
     default-features = false,
     features = ["transpile", "dialect-clickhouse", "dialect-postgresql"],
 }
@@ -244,6 +244,29 @@ let tables = get_tables(&ast[0]);
 
 ### Validation
 
+Parsing, validation, and query analysis accept per-call `ComplexityGuardOptions`.
+Existing entry points retain their defaults; parsing adds `parse_with_options`,
+`parse_one_with_options`, and `parse_data_type_with_options` (and corresponding
+`Dialect` parsing methods). For example:
+
+```rust
+use polyglot_sql::{parse_one_with_options, ComplexityGuardOptions, DialectType, ParseOptions};
+
+let options = ParseOptions {
+    complexity_guard: Some(ComplexityGuardOptions {
+        max_function_call_depth: Some(128),
+        ..Default::default()
+    }),
+};
+let expression = parse_one_with_options("SELECT COALESCE(value, 0) FROM records", DialectType::Snowflake, &options)?;
+```
+
+`ValidationOptions`, `SchemaValidationOptions`, and `AnalyzeQueryOptions` expose
+the same optional `complexity_guard`. An absent guard preserves dialect-specific
+defaults; `None` on an individual limit disables only that check. Raising or
+disabling limits can permit stack exhaustion; these are not general runtime or
+memory budgets. Use `..Default::default()` when constructing extended options.
+
 ```rust
 use polyglot_sql::{validate_with_options, DialectType, ValidationOptions};
 
@@ -253,6 +276,7 @@ let result = validate_with_options(
     &ValidationOptions {
         strict_syntax: false,
         semantic: true,
+        ..Default::default()
     },
 );
 // W001 and W004 are warnings, so result.valid remains true.
@@ -301,6 +325,7 @@ let opts = SchemaValidationOptions {
     check_references: true,
     strict: None,
     semantic: true,
+    ..Default::default()
 };
 
 let result = validate_with_schema(
@@ -360,6 +385,7 @@ let analysis = analyze_query(
     AnalyzeQueryOptions {
         dialect: DialectType::Generic,
         schema: Some(schema),
+        ..Default::default()
     },
 ).unwrap();
 
@@ -478,6 +504,11 @@ Athena, BigQuery, ClickHouse, CockroachDB, DataFusion, Databricks, Doris, Dremio
 | `planner` | Enable logical planning helpers |
 | `time` | Enable time-format conversion helpers |
 | `bindings` | Enable `ts-rs` TypeScript type generation |
+
+With `default-features = false`, `ast-tools` and `semantic` can be used without
+enabling `builder` or `generate`. AST transforms reuse the same internal mutation
+primitives as the native and serializable builders, while the public builder APIs
+remain gated by `builder`.
 
 ## License
 

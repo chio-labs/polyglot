@@ -1,4 +1,43 @@
-from typing import Any as TypingAny, overload
+from typing import Any as TypingAny, TypedDict, overload
+from .analysis_types import (
+    AnalyzeQueryOptions as AnalyzeQueryOptions,
+    ValidationSchema as ValidationSchema,
+    SchemaTable as SchemaTable,
+    SchemaColumn as SchemaColumn,
+    SchemaColumnReference as SchemaColumnReference,
+    SchemaTableReference as SchemaTableReference,
+    SchemaForeignKey as SchemaForeignKey,
+    QueryAnalysis as QueryAnalysis,
+    QuerySourceSpan as QuerySourceSpan,
+    ProjectionFact as ProjectionFact,
+    TransformFunctionFact as TransformFunctionFact,
+    CteFact as CteFact,
+    RelationFact as RelationFact,
+    StarProjectionFact as StarProjectionFact,
+    SetOperationFact as SetOperationFact,
+    SetOperationBranchFact as SetOperationBranchFact,
+    ColumnUseFact as ColumnUseFact,
+    ColumnUseReferenceFact as ColumnUseReferenceFact,
+    ColumnReferenceFact as ColumnReferenceFact,
+    ReferenceConfidence as ReferenceConfidence,
+    ProjectionNullability as ProjectionNullability,
+    TransformKind as TransformKind,
+    ColumnUseContext as ColumnUseContext,
+    FunctionNameCase as FunctionNameCase,
+    FunctionSignature as FunctionSignature,
+    FunctionCatalogEntry as FunctionCatalogEntry,
+    FunctionCatalogSpec as FunctionCatalogSpec,
+)
+
+
+class ComplexityGuardOptions(TypedDict, total=False):
+    maxParserDepth: int | None
+    maxInputBytes: int | None
+    maxTokens: int | None
+    maxAstNodes: int | None
+    maxAstDepth: int | None
+    maxParenthesisDepth: int | None
+    maxFunctionCallDepth: int | None
 
 
 class PolyglotError(Exception):
@@ -48,6 +87,16 @@ class ValidationErrorInfo:
         ...
 
     @property
+    def start(self) -> int | None:
+        """Zero-based Unicode character offset, or None when unavailable."""
+        ...
+
+    @property
+    def end(self) -> int | None:
+        """Exclusive Unicode character offset, or None when unavailable."""
+        ...
+
+    @property
     def code(self) -> str:
         """Machine-readable error code (e.g. ``"E001"``)."""
         ...
@@ -59,11 +108,11 @@ class ValidationErrorInfo:
 
 
 class ValidationResult:
-    """Result returned by :func:`validate`."""
+    """Result returned by validate and validate_with_schema."""
 
     @property
     def valid(self) -> bool:
-        """``True`` when the SQL is syntactically valid."""
+        """True when no errors were found; warnings do not invalidate SQL."""
         ...
 
     @property
@@ -1422,7 +1471,10 @@ def transpile(
     *,
     identity: bool = True,
     error_level: str | None = None,
+    unsupported_level: str | None = None,
     pretty: bool = False,
+    max_unsupported: int | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> list[str]:
     """Transpile SQL from one dialect to another.
 
@@ -1450,6 +1502,7 @@ def parse(
     dialect: str | None = None,
     *,
     error_level: str | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> list[Expression]:
     """Parse SQL into a list of ``Expression`` AST nodes.
 
@@ -1477,6 +1530,7 @@ def parse_one(
     *,
     into: type[DataType],
     error_level: str | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> DataType:
     ...
 
@@ -1488,6 +1542,7 @@ def parse_one(
     *,
     into: None = None,
     error_level: str | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> Expression:
     ...
 
@@ -1498,6 +1553,7 @@ def parse_one(
     *,
     into: type[DataType] | None = None,
     error_level: str | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> Expression | DataType:
     """Parse a single SQL statement into an ``Expression`` AST node.
 
@@ -1525,6 +1581,7 @@ def parse_data_type(
     dialect: str | None = None,
     *,
     error_level: str | None = None,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> DataType:
     """Parse a standalone SQL data type string.
 
@@ -1672,8 +1729,9 @@ def validate(
     *,
     strict_syntax: bool = False,
     semantic: bool = False,
+    complexity_guard: ComplexityGuardOptions | None = None,
 ) -> ValidationResult:
-    """Validate SQL syntax and optional semantic warnings.
+    """Validate SQL syntax and optional semantic correctness/quality checks.
 
     Does **not** raise on invalid SQL — check ``result.valid`` or
     ``bool(result)`` instead.
@@ -1682,10 +1740,42 @@ def validate(
         sql: SQL to validate.
         dialect: Dialect for parsing. Defaults to ``"generic"``.
         strict_syntax: Reject permissive forms such as trailing commas.
-        semantic: Report query-quality warnings W001 through W004.
+        semantic: Report correctness errors E230-E232 and quality warnings W001-W004.
 
     Raises:
         ValueError: If the dialect name is unknown.
+    """
+    ...
+
+
+def validate_with_schema(
+    sql: str,
+    schema: ValidationSchema | dict[str, TypingAny],
+    dialect: str = "generic",
+    *,
+    check_types: bool = False,
+    check_references: bool = False,
+    strict: bool | None = None,
+    semantic: bool = False,
+    strict_syntax: bool = False,
+    complexity_guard: ComplexityGuardOptions | None = None,
+    function_catalog: FunctionCatalogSpec | dict[str, TypingAny] | None = None,
+) -> ValidationResult:
+    """Validate SQL against a shared ValidationSchema dictionary using Rust.
+
+    Unknown tables, columns and aliases are checked by default. check_types
+    enables type checks; check_references enables ambiguity and foreign-key
+    checks. strict overrides schema['strict'], which otherwise defaults to
+    True. Non-strict reference/type findings are warnings. Empty column lists
+    and '*' columns represent open schemas, not known-empty tables.
+
+    semantic and strict_syntax behave as in validate. Syntax errors take
+    precedence. Invalid SQL returns findings; invalid schemas or dialect names
+    raise ValueError. Options are snake_case keyword arguments, not a dictionary.
+
+    function_catalog replaces the embedded name/arity catalog for check_types;
+    it does not enable checks by itself. Unknown nested input keys are rejected.
+    Proven semantic errors remain errors even with strict=False.
     """
     ...
 
@@ -1789,19 +1879,28 @@ def source_tables(column: str, sql: str, dialect: str = "generic") -> list[str]:
 
 def analyze_query(
     sql: str,
-    options: dict[str, TypingAny] | None = None,
+    options: AnalyzeQueryOptions | dict[str, TypingAny] | None = None,
     dialect: str = "generic",
-) -> dict[str, TypingAny]:
+    *,
+    complexity_guard: ComplexityGuardOptions | None = None,
+) -> QueryAnalysis:
     """Return compact query analysis facts for a SELECT or set operation.
 
-    Options use camelCase keys and currently support ``dialect`` and optional
+    Options use camelCase keys and support ``dialect``, ``complexityGuard`` and optional
     ``schema`` in the same ValidationSchema shape accepted by schema-aware
     validation and lineage APIs. Schema columns use the ``type`` key for type
     strings; ``dataType`` and ``data_type`` are not accepted aliases.
 
+    Supply guard limits using either ``complexity_guard`` or the options entry,
+    not both. Omitted limits use defaults; a field-level None disables one check.
+
     The returned dict includes ``relations``, transitive ``baseTables``,
     top-level ``cteFacts``, original ``starProjections``, and projection
     ``nullability`` values of ``"non_null"``, ``"nullable"``, or ``"unknown"``.
+    ``columnUses`` groups non-projection references by clause, with ``context``,
+    ``scopePath``, ``expressionPath``, dialect-rendered ``expressionSql`` and
+    ``references``. Optional ``span`` objects use half-open Unicode-character
+    offsets into the original SQL. Reference spans locate uses, not definitions.
     """
     ...
 

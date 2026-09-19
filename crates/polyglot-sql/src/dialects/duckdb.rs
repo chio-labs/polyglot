@@ -97,6 +97,8 @@ impl DialectImpl for DuckDBDialect {
         let mut config = TokenizerConfig::default();
         // DuckDB uses double quotes for identifiers
         config.identifiers.insert('"', '"');
+        // A leading escaped double quote belongs to the identifier, not a triple-quoted string.
+        config.quotes.remove("\"\"\"");
         // DuckDB supports nested comments
         config.nested_comments = true;
         // DuckDB allows underscores as digit separators in numeric literals
@@ -1520,6 +1522,9 @@ impl DuckDBDialect {
             DataType::Custom { ref name } => {
                 let upper = name.to_uppercase();
                 match upper.as_str() {
+                    name if DataType::from_unsigned_name(name).is_some() => {
+                        DataType::from_unsigned_name(name).unwrap()
+                    }
                     // INT64 -> BIGINT
                     "INT64" | "INT8" => DataType::BigInt { length: None },
                     // INT32, INT4, SIGNED -> INT
@@ -1532,13 +1537,7 @@ impl DuckDBDialect {
                     // INT1 -> TINYINT
                     "INT1" => DataType::TinyInt { length: None },
                     // HUGEINT -> INT128
-                    "HUGEINT" => DataType::Custom {
-                        name: "INT128".to_string(),
-                    },
-                    // UHUGEINT -> UINT128
-                    "UHUGEINT" => DataType::Custom {
-                        name: "UINT128".to_string(),
-                    },
+                    "HUGEINT" | "INT128" => DataType::Int128,
                     // BPCHAR -> TEXT
                     "BPCHAR" => DataType::Text,
                     // CHARACTER VARYING, CHAR VARYING -> TEXT
@@ -2160,6 +2159,7 @@ impl DuckDBDialect {
             // LIST_VALUE -> Array literal notation [...]
             "LIST_VALUE" => Ok(Expression::Array(Box::new(crate::expressions::Array {
                 expressions: f.args,
+                inferred_type: None,
             }))),
 
             // ARRAY_AGG -> LIST in DuckDB (or array_agg which is also supported)
@@ -3379,9 +3379,7 @@ impl DuckDBDialect {
                     Ok(Expression::BitwiseLeftShift(Box::new(BinaryOp {
                         left: Expression::Cast(Box::new(Cast {
                             this: a,
-                            to: DataType::Custom {
-                                name: "INT128".to_string(),
-                            },
+                            to: DataType::Int128,
                             trailing_comments: Vec::new(),
                             double_colon_syntax: false,
                             format: None,
@@ -3445,9 +3443,7 @@ impl DuckDBDialect {
                     Ok(Expression::BitwiseRightShift(Box::new(BinaryOp {
                         left: Expression::Cast(Box::new(Cast {
                             this: a,
-                            to: DataType::Custom {
-                                name: "INT128".to_string(),
-                            },
+                            to: DataType::Int128,
                             trailing_comments: Vec::new(),
                             double_colon_syntax: false,
                             format: None,
@@ -6464,6 +6460,7 @@ impl DuckDBDialect {
                 }));
                 let empty_result = Expression::Array(Box::new(crate::expressions::Array {
                     expressions: vec![null_struct],
+                    inferred_type: None,
                 }));
 
                 let range_upper = if n == 1 {
@@ -6513,6 +6510,7 @@ impl DuckDBDialect {
                 }));
                 let empty_array = Expression::Array(Box::new(crate::expressions::Array {
                     expressions: vec![],
+                    inferred_type: None,
                 }));
                 let zipped_struct = Expression::Struct(Box::new(Struct {
                     fields: args
@@ -6743,85 +6741,55 @@ impl DuckDBDialect {
     /// Handles both uppercase Snowflake originals (YYYY, MM, DD) and normalized lowercase forms (yyyy, mm, DD).
     fn snowflake_to_strptime(s: &str) -> String {
         let mut result = String::new();
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-        while i < len {
-            let remaining = &s[i..];
-            let remaining_upper: String =
-                remaining.chars().take(8).collect::<String>().to_uppercase();
-
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(s);
+        while let Some(ch) = cursor.peek() {
             // Compound patterns first
-            if remaining_upper.starts_with("HH24MISS") {
+            if cursor.consume_prefix("HH24MISS", true) {
                 result.push_str("%H%M%S");
-                i += 8;
-            } else if remaining_upper.starts_with("MMMM") {
+            } else if cursor.consume_prefix("MMMM", true) {
                 result.push_str("%B");
-                i += 4;
-            } else if remaining_upper.starts_with("YYYY") {
+            } else if cursor.consume_prefix("YYYY", true) {
                 result.push_str("%Y");
-                i += 4;
-            } else if remaining_upper.starts_with("YY") {
+            } else if cursor.consume_prefix("YY", true) {
                 result.push_str("%y");
-                i += 2;
-            } else if remaining_upper.starts_with("MON") {
+            } else if cursor.consume_prefix("MON", true) {
                 result.push_str("%b");
-                i += 3;
-            } else if remaining_upper.starts_with("HH24") {
+            } else if cursor.consume_prefix("HH24", true) {
                 result.push_str("%H");
-                i += 4;
-            } else if remaining_upper.starts_with("HH12") {
+            } else if cursor.consume_prefix("HH12", true) {
                 result.push_str("%I");
-                i += 4;
-            } else if remaining_upper.starts_with("HH") {
+            } else if cursor.consume_prefix("HH", true) {
                 result.push_str("%I");
-                i += 2;
-            } else if remaining_upper.starts_with("MISS") {
+            } else if cursor.consume_prefix("MISS", true) {
                 result.push_str("%M%S");
-                i += 4;
-            } else if remaining_upper.starts_with("MI") {
+            } else if cursor.consume_prefix("MI", true) {
                 result.push_str("%M");
-                i += 2;
-            } else if remaining_upper.starts_with("MM") {
+            } else if cursor.consume_prefix("MM", true) {
                 result.push_str("%m");
-                i += 2;
-            } else if remaining_upper.starts_with("DD") {
+            } else if cursor.consume_prefix("DD", true) {
                 result.push_str("%d");
-                i += 2;
-            } else if remaining_upper.starts_with("DY") {
+            } else if cursor.consume_prefix("DY", true) {
                 result.push_str("%a");
-                i += 2;
-            } else if remaining_upper.starts_with("SS") {
+            } else if cursor.consume_prefix("SS", true) {
                 result.push_str("%S");
-                i += 2;
-            } else if remaining_upper.starts_with("FF") {
-                // FF with optional digit (FF, FF1-FF9)
-                // %f = microseconds (6 digits, FF1-FF6), %n = nanoseconds (9 digits, FF7-FF9)
-                let ff_pos = i + 2;
-                if ff_pos < len && chars[ff_pos].is_ascii_digit() {
-                    let digit = chars[ff_pos].to_digit(10).unwrap_or(6);
-                    if digit >= 7 {
-                        result.push_str("%n");
-                    } else {
-                        result.push_str("%f");
-                    }
-                    i += 3; // skip FF + digit
+            } else if cursor.consume_prefix("FF", true) {
+                // Preserve the existing one-digit precision rule: FF7-FF9 use
+                // nanoseconds; FF0-FF6 and bare FF use microseconds.
+                if let Some(digit) = cursor.peek().filter(|c| c.is_ascii_digit()) {
+                    result.push_str(if digit >= '7' { "%n" } else { "%f" });
+                    cursor.next_char();
                 } else {
                     result.push_str("%f");
-                    i += 2;
                 }
-            } else if remaining_upper.starts_with("PM") || remaining_upper.starts_with("AM") {
+            } else if cursor.consume_prefix("PM", true) || cursor.consume_prefix("AM", true) {
                 result.push_str("%p");
-                i += 2;
-            } else if remaining_upper.starts_with("TZH") {
+            } else if cursor.consume_prefix("TZH", true) {
                 result.push_str("%z");
-                i += 3;
-            } else if remaining_upper.starts_with("TZM") {
+            } else if cursor.consume_prefix("TZM", true) {
                 // TZM is part of timezone, skip
-                i += 3;
             } else {
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result
@@ -7504,6 +7472,34 @@ impl DuckDBDialect {
 mod tests {
     use super::*;
     use crate::dialects::Dialect;
+    use crate::expressions::JoinKind;
+
+    #[test]
+    fn test_date_time_format_conversion_preserves_unicode() {
+        for literal in ["é", "年", "🦀", "e\u{301}", "ß", "ſ"] {
+            assert_eq!(DuckDBDialect::snowflake_to_strptime(literal), literal);
+            assert_eq!(
+                DuckDBDialect::snowflake_to_strptime(&format!("{literal}YYYY{literal}mM{literal}")),
+                format!("{literal}%Y{literal}%m{literal}")
+            );
+        }
+        for (input, expected) in [
+            ("", ""),
+            (
+                "HH24MISS MMMM YYYY YY MON HH24 HH12 HH MISS MI MM DD DY SS PM AM TZH TZM",
+                "%H%M%S %B %Y %y %b %H %I %I %M%S %M %m %d %a %S %p %p %z ",
+            ),
+            ("FF FF0 FF1 FF6 FF7 FF9 FF69", "%f %f %f %f %n %n %f9"),
+            ("éFF7年YYYY", "é%n年%Y"),
+            ("\"年\"YYYY %q", "\"年\"%Y %q"),
+        ] {
+            assert_eq!(
+                DuckDBDialect::snowflake_to_strptime(input),
+                expected,
+                "{input}"
+            );
+        }
+    }
 
     fn transpile_to_duckdb(sql: &str) -> String {
         transpile_to_duckdb_from(sql, DialectType::Generic)
@@ -7542,6 +7538,144 @@ mod tests {
         let result = transpile_to_duckdb("SELECT a, b FROM users WHERE id = 1");
         assert!(result.contains("SELECT"));
         assert!(result.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_duckdb_keyword_relation_aliases() {
+        let dialect = Dialect::get(DialectType::DuckDB);
+        for alias in [
+            "top",
+            "TOP",
+            "ToP",
+            "first",
+            "last",
+            "begin",
+            "type",
+            "\"top\"",
+            "\"where\"",
+        ] {
+            for template in [
+                "SELECT {alias}.item_id FROM ranked_items {as}{alias}",
+                "WITH ranked_items AS (SELECT 1 AS item_id) SELECT {alias}.item_id FROM ranked_items {as}{alias}",
+                "WITH ranked_items AS (SELECT 1 AS item_id), selected_items AS (SELECT 1 AS item_id) SELECT {alias}.item_id FROM selected_items JOIN ranked_items {as}{alias} ON {alias}.item_id = selected_items.item_id",
+                "SELECT {alias}.item_id FROM (SELECT 1 AS item_id) {as}{alias}",
+                "SELECT {alias}.item_id FROM range(1) {as}{alias}(item_id)",
+                "SELECT {alias}.item_id FROM (VALUES (1)) {as}{alias}(item_id)",
+            ] {
+                let template = template.replace("{alias}", alias);
+                let explicit_sql = template.replace("{as}", "AS ");
+                let expected = transpile_to_duckdb_from(&explicit_sql, DialectType::DuckDB);
+                for as_keyword in ["", "AS "] {
+                    let sql = template.replace("{as}", as_keyword);
+                    let statements = dialect
+                        .parse(&sql)
+                        .unwrap_or_else(|error| panic!("Failed to parse {sql:?}: {error}"));
+                    assert_eq!(statements.len(), 1, "{sql}");
+                    let Expression::Select(select) = &statements[0] else {
+                        panic!("Expected SELECT for {sql}");
+                    };
+                    let relation = select.joins.last().map_or_else(
+                        || &select.from.as_ref().unwrap().expressions[0],
+                        |join| &join.this,
+                    );
+                    let (identifier, columns) = match relation {
+                        Expression::Table(table) => (table.alias.as_ref().unwrap(), &table.column_aliases),
+                        Expression::Subquery(subquery) => (subquery.alias.as_ref().unwrap(), &subquery.column_aliases),
+                        Expression::Alias(alias) => (&alias.alias, &alias.column_aliases),
+                        _ => panic!("Expected aliased relation for {sql}"),
+                    };
+                    assert_eq!(identifier.name, alias.trim_matches('"'), "{sql}");
+                    assert_eq!(identifier.quoted, alias.starts_with('"'), "{sql}");
+                    if template.contains("(item_id)") {
+                        assert_eq!(columns.len(), 1, "{sql}");
+                        assert_eq!(columns[0].name, "item_id", "{sql}");
+                    }
+                    assert_eq!(
+                        transpile_to_duckdb_from(&sql, DialectType::DuckDB),
+                        expected,
+                        "{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_duckdb_keyword_relation_aliases_preserve_clause_boundaries() {
+        let dialect = Dialect::get(DialectType::DuckDB);
+        for alias in ["", " top"] {
+            let sql = format!(
+                "SELECT item_id, ROW_NUMBER() OVER w AS rn FROM ranked_items{alias} \
+                 WHERE item_id > 0 GROUP BY item_id HAVING COUNT(*) > 0 \
+                 WINDOW w AS (ORDER BY item_id) QUALIFY rn = 1 \
+                 ORDER BY item_id NULLS FIRST, rn NULLS LAST LIMIT 5 OFFSET 1"
+            );
+            let statements = dialect.parse(&sql).unwrap();
+            let Expression::Select(select) = &statements[0] else {
+                panic!("Expected SELECT for {sql}");
+            };
+            assert!(select.where_clause.is_some());
+            assert!(select.group_by.is_some());
+            assert!(select.having.is_some());
+            assert!(select.windows.is_some());
+            assert!(select.qualify.is_some());
+            let ordering = &select.order_by.as_ref().unwrap().expressions;
+            assert_eq!(ordering.len(), 2);
+            assert_eq!(ordering[0].nulls_first, Some(true));
+            assert_eq!(ordering[1].nulls_first, Some(false));
+            assert!(select.limit.is_some());
+            assert!(select.offset.is_some());
+            let Expression::Table(table) = &select.from.as_ref().unwrap().expressions[0] else {
+                panic!("Expected table source for {sql}");
+            };
+            assert_eq!(
+                table.alias.as_ref().map(|a| a.name.as_str()),
+                if alias.is_empty() { None } else { Some("top") }
+            );
+
+            for (join, kind) in [
+                ("LEFT JOIN selected_items ON TRUE", JoinKind::Left),
+                ("POSITIONAL JOIN selected_items", JoinKind::Positional),
+            ] {
+                let sql = format!("SELECT * FROM ranked_items{alias} {join}");
+                let statements = dialect.parse(&sql).unwrap();
+                let Expression::Select(select) = &statements[0] else {
+                    panic!("Expected SELECT for {sql}");
+                };
+                assert_eq!(select.joins.len(), 1, "{sql}");
+                assert_eq!(select.joins[0].kind, kind, "{sql}");
+                let Expression::Table(table) = &select.from.as_ref().unwrap().expressions[0] else {
+                    panic!("Expected table source for {sql}");
+                };
+                assert_eq!(
+                    table.alias.as_ref().map(|a| a.name.as_str()),
+                    if alias.is_empty() { None } else { Some("top") }
+                );
+            }
+        }
+
+        // Truly reserved DuckDB words must not become implicit relation aliases.
+        for alias in ["end", "where", "qualify", "select", "join", "limit"] {
+            let sql = format!("SELECT * FROM ranked_items {alias}");
+            assert!(dialect.parse(&sql).is_err(), "Unexpectedly accepted {sql}");
+        }
+    }
+
+    #[test]
+    fn test_extract_quoted_date_parts() {
+        for (quoted, canonical) in [("year", "YEAR"), ("month", "MONTH"), ("day", "DAY")] {
+            let sql = format!("SELECT EXTRACT('{quoted}' FROM created_at) FROM events");
+            assert_eq!(
+                transpile_to_duckdb_from(&sql, DialectType::DuckDB),
+                format!("SELECT EXTRACT({canonical} FROM created_at) FROM events")
+            );
+        }
+
+        let unquoted = "SELECT EXTRACT(YEAR FROM created_at) FROM events";
+        assert_eq!(
+            transpile_to_duckdb_from(unquoted, DialectType::DuckDB),
+            unquoted
+        );
     }
 
     #[test]

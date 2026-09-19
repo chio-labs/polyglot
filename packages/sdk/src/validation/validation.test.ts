@@ -7,6 +7,29 @@ import { validate, validateWithSchema } from './index';
 import type { Schema } from './schema';
 
 describe('validate', () => {
+  it('does not treat lambda-local parameters as ungrouped inputs', () => {
+    const result = validate(
+      'SELECT TRANSFORM(ARRAY_CONSTRUCT(1), x -> x + 1), COUNT(*) FROM items',
+      'snowflake',
+      { semantic: true },
+    );
+    expect(result.valid).toBe(true);
+  });
+  it.each([
+    ['SELECT id, SUM(amount) FROM t', 'E230'],
+    ['SELECT id FROM t WHERE SUM(amount)>0', 'E231'],
+    ['SELECT id FROM t WHERE ROW_NUMBER() OVER()=1', 'E232'],
+  ])('reports opt-in semantic correctness errors: %s', (sql, code) => {
+    expect(validate(sql, 'snowflake').valid).toBe(true);
+    const result = validate(sql, 'snowflake', { semantic: true });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code, severity: 'error' }),
+      ]),
+    );
+  });
+
   describe('syntax validation', () => {
     it('should return valid for correct SQL', () => {
       const result = validate('SELECT 1', 'generic');
@@ -155,6 +178,86 @@ describe('validateWithSchema', () => {
       },
     ],
   };
+
+  describe('schema reference scopes and positions', () => {
+    it.each([
+      'WITH a AS (SELECT id AS k FROM users), b AS (SELECT k FROM a) SELECT k FROM b',
+      'SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)',
+      'WITH unused AS (SELECT id FROM orders) SELECT id FROM users',
+    ])('accepts valid lexical references: %s', (sql) => {
+      const result = validateWithSchema(sql, schema, 'snowflake', {
+        checkReferences: true,
+      });
+      expect(result.errors).toEqual([]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('does not leak an inner CTE into the outer query', () => {
+      const result = validateWithSchema(
+        'SELECT id FROM q WHERE EXISTS (WITH q AS (SELECT id FROM users) SELECT id FROM q)',
+        schema,
+        'snowflake',
+      );
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((error) => error.code === 'E200')).toBe(true);
+    });
+
+    it.each([
+      { columns: [] },
+      { columns: [{ name: '*', type: 'UNKNOWN' }] },
+    ])('allows open source columns: %j', ({ columns }) => {
+      const openSchema: Schema = {
+        tables: [{ name: 'users', columns }, schema.tables[1]],
+      };
+      for (const sql of [
+        'SELECT missing FROM users',
+        'SELECT u.missing FROM users u',
+        'SELECT missing FROM users u JOIN orders o ON TRUE',
+      ]) {
+        expect(validateWithSchema(sql, openSchema).valid).toBe(true);
+      }
+    });
+
+    it('retains Unicode character ranges for each offending identifier', () => {
+      const sql = 'SELECT \'😀\', u."míssing", u."míssing" FROM users u';
+      const result = validateWithSchema(sql, schema, 'snowflake');
+      const errors = result.errors.filter((error) => error.code === 'E201');
+      expect(errors).toHaveLength(2);
+      const characters = Array.from(sql);
+      for (const error of errors) {
+        expect(error.start).toBeTypeOf('number');
+        expect(error.end).toBeTypeOf('number');
+        expect(characters.slice(error.start, error.end).join('')).toBe(
+          '"míssing"',
+        );
+      }
+      expect(errors[0].start).not.toBe(errors[1].start);
+    });
+
+    it('positions unknown qualifiers, tables and ambiguity warnings', () => {
+      const qualifier = validateWithSchema('SELECT x.id FROM users', schema)
+        .errors[0];
+      expect(qualifier).toMatchObject({ code: 'E222', start: 7, end: 8 });
+      const table = validateWithSchema('SELECT * FROM missing', schema)
+        .errors[0];
+      expect(table).toMatchObject({ code: 'E200', start: 14, end: 21 });
+      const ambiguous = validateWithSchema(
+        'SELECT id FROM users u JOIN orders o ON u.id = o.user_id',
+        schema,
+        'generic',
+        { checkReferences: true, strict: false },
+      );
+      expect(ambiguous.valid).toBe(true);
+      expect(ambiguous.errors).toContainEqual(
+        expect.objectContaining({
+          code: 'W222',
+          severity: 'warning',
+          start: 7,
+          end: 9,
+        }),
+      );
+    });
+  });
 
   describe('table validation', () => {
     it('should validate known tables', () => {

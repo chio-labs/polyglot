@@ -14,7 +14,8 @@
 //! - Certain legacy types (MONEY, SMALLMONEY, etc.) are not supported
 //! - Unicode types (NCHAR, NVARCHAR) are mapped to non-unicode equivalents
 
-use super::{DialectImpl, DialectType, TSQLDialect};
+use super::tsql::TSQLDialect;
+use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{BinaryOp, Cast, DataType, Expression, Function, Identifier, Literal};
 #[cfg(feature = "generate")]
@@ -362,8 +363,8 @@ impl FabricDialect {
                 name: "UNIQUEIDENTIFIER".to_string(),
             },
 
-            // TinyInt -> SMALLINT
-            DataType::TinyInt { .. } => DataType::Custom {
+            // Preserve the existing signed/unsigned 8-bit mapping for typed ASTs.
+            DataType::TinyInt { .. } | DataType::UInt8 => DataType::Custom {
                 name: "SMALLINT".to_string(),
             },
 

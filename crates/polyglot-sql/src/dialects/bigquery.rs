@@ -34,6 +34,7 @@ impl DialectImpl for BigQueryDialect {
         // Remove double quote from identifiers (it's in the default config)
         config.identifiers.remove(&'"');
         config.identifiers.insert('`', '`');
+        config.identifier_backslash_escapes = true;
         // BigQuery supports double quotes for strings (in addition to single quotes)
         config.quotes.insert("\"".to_string(), "\"".to_string());
         // BigQuery supports triple-quoted strings

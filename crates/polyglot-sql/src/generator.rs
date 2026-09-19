@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 /// let sql = gen.generate(&ast[0])?;
 /// ```
 pub struct Generator {
+    /// Formatting preserves the parsed null-ordering clauses instead of normalizing them.
+    preserve_null_ordering: bool,
     config: Arc<GeneratorConfig>,
     output: String,
     unsupported_messages: Vec<String>,
@@ -284,8 +286,6 @@ pub struct GeneratorConfig {
     /// Whether null ordering (NULLS FIRST/LAST) is supported in ORDER BY
     /// True: Full Support, false: No support
     pub null_ordering_supported: bool,
-    /// Preserve explicit NULLS FIRST/LAST clauses even when they match the dialect default.
-    pub preserve_explicit_null_ordering: bool,
     /// Whether ignore nulls is inside the agg or outside
     /// FIRST(x IGNORE NULLS) OVER vs FIRST(x) IGNORE NULLS OVER
     pub ignore_nulls_in_func: bool,
@@ -583,7 +583,6 @@ impl Default for GeneratorConfig {
 
             // ===== Null handling =====
             null_ordering_supported: true,
-            preserve_explicit_null_ordering: false,
             ignore_nulls_in_func: false,
             nvl2_supported: true,
 
@@ -2201,6 +2200,7 @@ impl Generator {
     /// same settings (e.g. during transpilation). The [`Arc`] is cheap to clone.
     pub(crate) fn with_arc_config(config: Arc<GeneratorConfig>) -> Self {
         Self {
+            preserve_null_ordering: false,
             config,
             output: String::new(),
             unsupported_messages: Vec::new(),
@@ -2210,6 +2210,17 @@ impl Generator {
             merge_strip_qualifiers: Vec::new(),
             clickhouse_nullable_depth: 0,
         }
+    }
+
+    pub(crate) fn with_preserved_null_ordering(mut self) -> Self {
+        self.preserve_null_ordering = true;
+        self
+    }
+
+    fn child_generator(&self) -> Self {
+        let mut generator = Self::with_arc_config(self.config.clone());
+        generator.preserve_null_ordering = self.preserve_null_ordering;
+        generator
     }
 
     /// Add column aliases to a query expression for TSQL SELECT INTO.
@@ -6763,6 +6774,7 @@ impl Generator {
                                             expressions: f.args.clone(),
                                             bracket_notation: true,
                                             use_list_keyword: false,
+                                            inferred_type: None,
                                         },
                                     ));
                                 }
@@ -6787,6 +6799,7 @@ impl Generator {
                                             expressions: f.args.clone(),
                                             bracket_notation: true,
                                             use_list_keyword: false,
+                                            inferred_type: None,
                                         },
                                     ));
                                 }
@@ -16622,22 +16635,7 @@ impl Generator {
             } else {
                 quote_style
             };
-            // Escape any quote characters within the identifier
-            let escaped_name = if quote_style.start == quote_style.end {
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            } else {
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            };
-            self.write(&format!(
-                "{}{}{}",
-                quote_style.start, escaped_name, quote_style.end
-            ));
+            self.write_quoted_identifier(&output_name, *quote_style);
         } else {
             self.write(&output_name);
         }
@@ -16747,24 +16745,8 @@ impl Generator {
         };
 
         if needs_quoting {
-            // Escape any quote characters within the identifier
-            let escaped_name = if quote_style.start == quote_style.end {
-                // Same start/end char (e.g., " or `) - double the quote char
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            } else {
-                // Different start/end (e.g., [ and ]) - escape only the end char
-                output_name.replace(
-                    quote_style.end,
-                    &format!("{}{}", quote_style.end, quote_style.end),
-                )
-            };
-            self.write(&format!(
-                "{}{}{}{}",
-                quote_style.start, escaped_name, quote_style.end, suffix
-            ));
+            self.write_quoted_identifier(&output_name, *quote_style);
+            self.write(&suffix);
         } else {
             self.write(&output_name);
         }
@@ -16775,6 +16757,78 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         Ok(())
+    }
+
+    /// Write an identifier using the target dialect's delimiters and escape rules.
+    fn write_quoted_identifier(&mut self, name: &str, quote_style: IdentifierQuoteStyle) {
+        let backslash_escapes = matches!(
+            self.config.dialect,
+            Some(DialectType::BigQuery | DialectType::ClickHouse)
+        );
+        self.output.push(quote_style.start);
+        for c in name.chars() {
+            if backslash_escapes {
+                let escape = match c {
+                    '\\' => Some("\\\\"),
+                    '\n' => Some("\\n"),
+                    '\r' => Some("\\r"),
+                    '\t' => Some("\\t"),
+                    '\0' => Some("\\x00"),
+                    _ => None,
+                };
+                if let Some(escape) = escape {
+                    self.write(escape);
+                    continue;
+                }
+                if c == quote_style.end && self.config.dialect == Some(DialectType::BigQuery) {
+                    self.output.push('\\');
+                    self.output.push(c);
+                    continue;
+                }
+            }
+            self.output.push(c);
+            if c == quote_style.end {
+                self.output.push(c);
+            }
+        }
+        self.output.push(quote_style.end);
+    }
+
+    /// Named type fields are single identifiers, never SQL fragments or index columns.
+    /// Keep the public string shape while accepting legacy delimited field names.
+    fn generate_type_field_name(&mut self, field_name: &str) {
+        let mut name = Cow::Borrowed(field_name);
+        let mut quoted = false;
+        for (start, end) in [('"', '"'), ('`', '`'), ('[', ']')] {
+            if let Some(inner) = field_name
+                .strip_prefix(start)
+                .and_then(|s| s.strip_suffix(end))
+            {
+                name = Cow::Owned(inner.replace(&format!("{end}{end}"), &end.to_string()));
+                quoted = true;
+                break;
+            }
+        }
+
+        let needs_quoting = quoted
+            || !Self::is_safe_unquoted_identifier(&name)
+            || self.is_reserved_keyword(&name)
+            || self.config.always_quote_identifiers;
+        if self.config.normalize_identifiers && !quoted {
+            name = Cow::Owned(name.to_ascii_lowercase());
+        }
+        if !needs_quoting {
+            self.write(&name);
+            return;
+        }
+
+        let quote_style =
+            if self.config.dialect == Some(DialectType::Athena) && self.athena_hive_context {
+                IdentifierQuoteStyle::BACKTICK
+            } else {
+                self.config.identifier_quote_style
+            };
+        self.write_quoted_identifier(&name, quote_style);
     }
 
     fn generate_column(&mut self, col: &Column) -> Result<()> {
@@ -17452,7 +17506,7 @@ impl Generator {
                 let arg_strings: Vec<String> = args
                     .iter()
                     .map(|arg| {
-                        let mut gen = Generator::with_arc_config(self.config.clone());
+                        let mut gen = self.child_generator();
                         gen.generate_expression(arg)?;
                         Ok(gen.output)
                     })
@@ -19075,10 +19129,23 @@ impl Generator {
         // Input: FUNC(args) WITH ORDINALITY
         // Stored as: name="FUNC WITH ORDINALITY", args=[...]
         // Output must be: FUNC(args) WITH ORDINALITY
-        let has_ordinality = func.name.len() >= 16
-            && func.name[func.name.len() - 16..].eq_ignore_ascii_case(" WITH ORDINALITY");
+        const ORDINALITY_SUFFIX: &str = " WITH ORDINALITY";
+        // Compared as bytes rather than by slicing the name. `len()` counts bytes, so
+        // `name[len - 16..]` panics when that index lands inside a multi-byte character,
+        // and a non-ASCII function name puts it there: `SELECT "a\u{e9}xxxxxxxxxxxxxxx"(1)`
+        // is 18 bytes with a two-byte character across bytes 1..3, so byte 2 is mid-character.
+        // A byte comparison against an ASCII suffix cannot panic, and it stays correct: a byte
+        // that ASCII-case-insensitively equals an ASCII byte is itself ASCII, so whenever the
+        // suffix matches, the slice below starts on a character boundary.
+        let has_ordinality = func
+            .name
+            .len()
+            .checked_sub(ORDINALITY_SUFFIX.len())
+            .is_some_and(|start| {
+                func.name.as_bytes()[start..].eq_ignore_ascii_case(ORDINALITY_SUFFIX.as_bytes())
+            });
         let output_name = if has_ordinality {
-            let base_name = &func.name[..func.name.len() - " WITH ORDINALITY".len()];
+            let base_name = &func.name[..func.name.len() - ORDINALITY_SUFFIX.len()];
             self.normalize_func_name(base_name)
         } else {
             normalized_name.clone()
@@ -19171,7 +19238,7 @@ impl Generator {
                 // Pre-render arguments to check total width
                 let mut expr_strings: Vec<String> = Vec::with_capacity(func.args.len());
                 for arg in &func.args {
-                    let mut temp_gen = Generator::with_arc_config(self.config.clone());
+                    let mut temp_gen = self.child_generator();
                     Arc::make_mut(&mut temp_gen.config).pretty = false; // Don't recurse into pretty
                     temp_gen.generate_expression(arg)?;
                     expr_strings.push(temp_gen.output);
@@ -20993,7 +21060,7 @@ impl Generator {
             self.write_keyword("INTERVAL");
             self.write_space();
             self.write("'");
-            let mut interval_gen = Generator::with_arc_config(self.config.clone());
+            let mut interval_gen = self.child_generator();
             let interval_sql = interval_gen.generate(&f.interval)?;
             self.write(&interval_sql);
             self.write(" ");
@@ -22387,7 +22454,7 @@ impl Generator {
         let should_split = if self.config.pretty && !expressions.is_empty() {
             let mut expr_strings: Vec<String> = Vec::with_capacity(expressions.len());
             for expr in expressions {
-                let mut temp_gen = Generator::with_arc_config(self.config.clone());
+                let mut temp_gen = self.child_generator();
                 Arc::make_mut(&mut temp_gen.config).pretty = false;
                 temp_gen.generate_expression(expr)?;
                 expr_strings.push(temp_gen.output);
@@ -25234,7 +25301,7 @@ impl Generator {
                 // Determine if we should skip outputting NULLS FIRST/LAST when it's the default
                 // for the dialect. Different dialects have different NULL ordering defaults:
                 //
-                // nulls_are_large (Oracle, Postgres, Snowflake, etc.):
+                // nulls_are_large (Oracle, Postgres, Redshift):
                 //   - ASC: NULLS LAST is default (omit NULLS LAST for ASC)
                 //   - DESC: NULLS FIRST is default (omit NULLS FIRST for DESC)
                 //
@@ -25242,7 +25309,7 @@ impl Generator {
                 //   - ASC: NULLS FIRST is default
                 //   - DESC: NULLS LAST is default
                 //
-                // nulls_are_last (DuckDB, Presto, Trino, Dremio, etc.):
+                // nulls_are_last (Presto, Trino, Dremio, etc.):
                 //   - NULLS LAST is always the default regardless of sort direction
                 let is_asc = !ordered.desc;
                 let is_nulls_are_large = matches!(
@@ -25250,12 +25317,10 @@ impl Generator {
                     Some(DialectType::Oracle)
                         | Some(DialectType::PostgreSQL)
                         | Some(DialectType::Redshift)
-                        | Some(DialectType::Snowflake)
                 );
                 let is_nulls_are_last = matches!(
                     self.config.dialect,
                     Some(DialectType::Dremio)
-                        | Some(DialectType::DuckDB)
                         | Some(DialectType::Presto)
                         | Some(DialectType::Trino)
                         | Some(DialectType::Athena)
@@ -25275,7 +25340,9 @@ impl Generator {
                     false
                 };
 
-                if self.config.preserve_explicit_null_ordering || !is_default_nulls {
+                // Snowflake and DuckDB deliberately aren't in the default-elision
+                // groups above: their NULL ordering is configurable at runtime.
+                if self.preserve_null_ordering || !is_default_nulls {
                     self.write_space();
                     self.write_keyword("NULLS");
                     self.write_space();
@@ -25942,6 +26009,35 @@ impl Generator {
                     if let Some(n) = length {
                         self.write(&format!("({})", n));
                     }
+                }
+            }
+            DataType::Int128 => match self.config.dialect {
+                // Preserve native Int128 output; explicit nullability is represented
+                // by DataType::Nullable, as with the former Custom("INT128") form.
+                Some(DialectType::ClickHouse) => self.write("Int128"),
+                Some(DialectType::StarRocks) => self.write_keyword("LARGEINT"),
+                // Preserve the full width, including for targets without a native equivalent.
+                _ => self.write_keyword("INT128"),
+            },
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128 => {
+                let (canonical, clickhouse) = match dt {
+                    DataType::UInt8 => ("UTINYINT", "UInt8"),
+                    DataType::UInt16 => ("USMALLINT", "UInt16"),
+                    DataType::UInt32 => ("UINTEGER", "UInt32"),
+                    DataType::UInt64 => ("UBIGINT", "UInt64"),
+                    DataType::UInt128 => ("UINT128", "UInt128"),
+                    _ => unreachable!(),
+                };
+                if self.config.dialect == Some(DialectType::ClickHouse) {
+                    // As with Int128, only an explicit Nullable wrapper adds nullability.
+                    self.write(clickhouse);
+                } else {
+                    // Do not silently discard signedness or narrow unsupported targets.
+                    self.write_keyword(canonical);
                 }
             }
             DataType::BigInt { length } => {
@@ -26818,7 +26914,7 @@ impl Generator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.write(name);
+                    self.generate_type_field_name(name);
                     self.write(" ");
                     self.generate_data_type(dt)?;
                     if *not_null {
@@ -26842,7 +26938,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26857,7 +26953,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26872,7 +26968,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26887,7 +26983,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26902,7 +26998,7 @@ impl Generator {
                                 self.write(", ");
                             }
                             if !field.name.is_empty() {
-                                self.write(&field.name);
+                                self.generate_type_field_name(&field.name);
                                 self.write(" ");
                             }
                             self.generate_data_type(&field.data_type)?;
@@ -26910,12 +27006,14 @@ impl Generator {
                         self.write(")");
                     }
                     _ => {
-                        // Hive/Spark always use angle bracket syntax: STRUCT<name: TYPE>
+                        // BigQuery and Hive/Spark use angle brackets even for types
+                        // parsed from a parenthesized source dialect.
                         let force_angle_brackets = matches!(
                             self.config.dialect,
                             Some(DialectType::Hive)
                                 | Some(DialectType::Spark)
                                 | Some(DialectType::Databricks)
+                                | Some(DialectType::BigQuery)
                         );
                         if *nested && !force_angle_brackets {
                             self.write_keyword("STRUCT(");
@@ -26924,7 +27022,7 @@ impl Generator {
                                     self.write(", ");
                                 }
                                 if !field.name.is_empty() {
-                                    self.write(&field.name);
+                                    self.generate_type_field_name(&field.name);
                                     self.write(" ");
                                 }
                                 self.generate_data_type(&field.data_type)?;
@@ -26938,7 +27036,7 @@ impl Generator {
                                 }
                                 if !field.name.is_empty() {
                                     // Named field: name TYPE (with configurable separator for Hive)
-                                    self.write(&field.name);
+                                    self.generate_type_field_name(&field.name);
                                     self.write(self.config.struct_field_sep);
                                 }
                                 // For anonymous fields, just output the type
@@ -27006,7 +27104,7 @@ impl Generator {
                         self.write(", ");
                     }
                     if !name.is_empty() {
-                        self.write(name);
+                        self.generate_type_field_name(name);
                         self.write(" ");
                     }
                     self.generate_data_type(dt)?;
@@ -27881,6 +27979,7 @@ impl Generator {
             ..Default::default()
         };
         let mut gen = Generator::with_config(config);
+        gen.preserve_null_ordering = self.preserve_null_ordering;
         gen.generate_expression(expr)?;
         Ok(gen.output)
     }
@@ -29845,7 +29944,7 @@ impl Generator {
 
         if let Some(this) = &e.this {
             let mut s = String::from("HISTORY_TABLE=");
-            let mut gen = Generator::with_arc_config(self.config.clone());
+            let mut gen = self.child_generator();
             gen.generate_expression(this)?;
             s.push_str(&gen.output);
             parts.push(s);
@@ -29853,7 +29952,7 @@ impl Generator {
 
         if let Some(data_consistency) = &e.data_consistency {
             let mut s = String::from("DATA_CONSISTENCY_CHECK=");
-            let mut gen = Generator::with_arc_config(self.config.clone());
+            let mut gen = self.child_generator();
             gen.generate_expression(data_consistency)?;
             s.push_str(&gen.output);
             parts.push(s);
@@ -29861,7 +29960,7 @@ impl Generator {
 
         if let Some(retention_period) = &e.retention_period {
             let mut s = String::from("HISTORY_RETENTION_PERIOD=");
-            let mut gen = Generator::with_arc_config(self.config.clone());
+            let mut gen = self.child_generator();
             gen.generate_expression(retention_period)?;
             s.push_str(&gen.output);
             parts.push(s);
@@ -33247,7 +33346,7 @@ impl Generator {
                 if key.is_empty() {
                     // Bracket notation at start of segment (e.g., already formatted)
                     self.write(segment);
-                } else if Self::is_safe_json_path_key(key) {
+                } else if Self::is_safe_unquoted_identifier(key) {
                     self.write(key);
                     self.write(subscript);
                 } else {
@@ -33256,7 +33355,7 @@ impl Generator {
                     self.write("\"]");
                     self.write(subscript);
                 }
-            } else if Self::is_safe_json_path_key(segment) {
+            } else if Self::is_safe_unquoted_identifier(segment) {
                 self.write(segment);
             } else {
                 self.write("[\"");
@@ -33266,9 +33365,9 @@ impl Generator {
         }
     }
 
-    /// Check if a JSON path key is a safe identifier that doesn't need bracket quoting.
+    /// Check if a name can be emitted as a conservative unquoted identifier.
     /// Matches Python sqlglot's SAFE_IDENTIFIER_RE: ^[_a-zA-Z]\w*$
-    fn is_safe_json_path_key(key: &str) -> bool {
+    fn is_safe_unquoted_identifier(key: &str) -> bool {
         if key.is_empty() {
             return false;
         }
@@ -33486,7 +33585,7 @@ impl Generator {
             // First, generate all expressions into strings to check width
             let mut expr_strings: Vec<String> = Vec::with_capacity(e.expressions.len());
             for expr in &e.expressions {
-                let mut temp_gen = Generator::with_arc_config(self.config.clone());
+                let mut temp_gen = self.child_generator();
                 temp_gen.generate_expression(expr)?;
                 expr_strings.push(temp_gen.output);
             }
@@ -35033,8 +35132,9 @@ impl Generator {
             }
             if let Some(nulls_first) = ordered.nulls_first {
                 // In Dremio, NULLS LAST is the default, so skip generating it
-                let skip_nulls_last =
-                    !nulls_first && matches!(self.config.dialect, Some(DialectType::Dremio));
+                let skip_nulls_last = !self.preserve_null_ordering
+                    && !nulls_first
+                    && matches!(self.config.dialect, Some(DialectType::Dremio));
                 if !skip_nulls_last {
                     self.write_space();
                     self.write_keyword("NULLS");
@@ -37763,36 +37863,32 @@ impl Generator {
     /// Convert strftime format to Teradata date format (YYYY, DD, MM, etc.)
     fn strftime_to_teradata_format(fmt: &str) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
-        let bytes = fmt.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'%' && i + 1 < len {
-                let replacement = match bytes[i + 1] {
-                    b'Y' => "YYYY",
-                    b'y' => "YY",
-                    b'm' => "MM",
-                    b'B' => "MMMM",
-                    b'b' => "MMM",
-                    b'd' => "DD",
-                    b'j' => "DDD",
-                    b'H' => "HH",
-                    b'M' => "MI",
-                    b'S' => "SS",
-                    b'f' => "SSSSSS",
-                    b'A' => "EEEE",
-                    b'a' => "EEE",
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
+        while let Some(ch) = cursor.next_char() {
+            if ch == '%' && cursor.peek().is_some() {
+                let replacement = match cursor.peek() {
+                    Some('Y') => "YYYY",
+                    Some('y') => "YY",
+                    Some('m') => "MM",
+                    Some('B') => "MMMM",
+                    Some('b') => "MMM",
+                    Some('d') => "DD",
+                    Some('j') => "DDD",
+                    Some('H') => "HH",
+                    Some('M') => "MI",
+                    Some('S') => "SS",
+                    Some('f') => "SSSSSS",
+                    Some('A') => "EEEE",
+                    Some('a') => "EEE",
                     _ => {
                         result.push('%');
-                        i += 1;
                         continue;
                     }
                 };
                 result.push_str(replacement);
-                i += 2;
+                cursor.next_char();
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
         }
         result
@@ -37821,95 +37917,91 @@ impl Generator {
 
     fn strftime_to_java_format_with_padding(fmt: &str, padded: bool) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
-        let bytes = fmt.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'\\' && i + 1 < len {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
+        while let Some(ch) = cursor.next_char() {
+            if ch == '\\' && cursor.peek().is_some() {
                 // PostgreSQL TO_CHAR literals are marked with a backslash by the
                 // parser so .NET does not interpret reserved format characters.
                 result.push('\\');
-                if bytes[i + 1] == b'\'' {
+                if cursor.peek() == Some('\'') {
                     result.push_str("''");
                 } else {
-                    result.push(bytes[i + 1] as char);
+                    result.push(cursor.peek().expect("escaped character exists"));
                 }
-                i += 2;
-            } else if bytes[i] == b'%' && i + 1 < len {
+                cursor.next_char();
+            } else if ch == '%' && cursor.peek().is_some() {
                 // Check for non-padded variants (%-X)
-                if bytes[i + 1] == b'-' && i + 2 < len {
-                    let replacement = match bytes[i + 2] {
-                        b'd' => "d",
-                        b'm' => "M",
-                        b'H' => "H",
-                        b'I' => "h",
-                        b'M' => "m",
-                        b'S' => "s",
+                if cursor.peek() == Some('-') && cursor.peek_nth(1).is_some() {
+                    let replacement = match cursor.peek_nth(1) {
+                        Some('d') => "d",
+                        Some('m') => "M",
+                        Some('H') => "H",
+                        Some('I') => "h",
+                        Some('M') => "m",
+                        Some('S') => "s",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 3;
+                    cursor.next_char();
+                    cursor.next_char();
                 } else {
-                    let replacement = match bytes[i + 1] {
-                        b'Y' => "yyyy",
-                        b'y' => "yy",
-                        b'm' => {
+                    let replacement = match cursor.peek() {
+                        Some('Y') => "yyyy",
+                        Some('y') => "yy",
+                        Some('m') => {
                             if padded {
                                 "MM"
                             } else {
                                 "M"
                             }
                         }
-                        b'B' => "MMMM",
-                        b'b' => "MMM",
-                        b'd' => {
+                        Some('B') => "MMMM",
+                        Some('b') => "MMM",
+                        Some('d') => {
                             if padded {
                                 "dd"
                             } else {
                                 "d"
                             }
                         }
-                        b'j' => "DDD",
-                        b'H' => {
+                        Some('j') => "DDD",
+                        Some('H') => {
                             if padded {
                                 "HH"
                             } else {
                                 "H"
                             }
                         }
-                        b'M' => {
+                        Some('M') => {
                             if padded {
                                 "mm"
                             } else {
                                 "m"
                             }
                         }
-                        b'S' => {
+                        Some('S') => {
                             if padded {
                                 "ss"
                             } else {
                                 "s"
                             }
                         }
-                        b'f' => "SSSSSS",
-                        b'A' => "EEEE",
-                        b'a' => "EEE",
+                        Some('f') => "SSSSSS",
+                        Some('A') => "EEEE",
+                        Some('a') => "EEE",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 2;
+                    cursor.next_char();
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
         }
         result
@@ -37919,55 +38011,51 @@ impl Generator {
     /// Similar to Java but uses ffffff for microseconds instead of SSSSSS
     fn strftime_to_tsql_format(fmt: &str) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
-        let bytes = fmt.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'%' && i + 1 < len {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
+        while let Some(ch) = cursor.next_char() {
+            if ch == '%' && cursor.peek().is_some() {
                 // Check for non-padded variants (%-X)
-                if bytes[i + 1] == b'-' && i + 2 < len {
-                    let replacement = match bytes[i + 2] {
-                        b'd' => "d",
-                        b'm' => "M",
-                        b'H' => "H",
-                        b'M' => "m",
-                        b'S' => "s",
+                if cursor.peek() == Some('-') && cursor.peek_nth(1).is_some() {
+                    let replacement = match cursor.peek_nth(1) {
+                        Some('d') => "d",
+                        Some('m') => "M",
+                        Some('H') => "H",
+                        Some('M') => "m",
+                        Some('S') => "s",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 3;
+                    cursor.next_char();
+                    cursor.next_char();
                 } else {
-                    let replacement = match bytes[i + 1] {
-                        b'Y' => "yyyy",
-                        b'y' => "yy",
-                        b'm' => "MM",
-                        b'B' => "MMMM",
-                        b'b' => "MMM",
-                        b'd' => "dd",
-                        b'j' => "DDD",
-                        b'H' => "HH",
-                        b'I' => "hh",
-                        b'M' => "mm",
-                        b'S' => "ss",
-                        b'f' => "ffffff",
-                        b'A' => "dddd",
-                        b'a' => "ddd",
+                    let replacement = match cursor.peek() {
+                        Some('Y') => "yyyy",
+                        Some('y') => "yy",
+                        Some('m') => "MM",
+                        Some('B') => "MMMM",
+                        Some('b') => "MMM",
+                        Some('d') => "dd",
+                        Some('j') => "DDD",
+                        Some('H') => "HH",
+                        Some('I') => "hh",
+                        Some('M') => "mm",
+                        Some('S') => "ss",
+                        Some('f') => "ffffff",
+                        Some('A') => "dddd",
+                        Some('a') => "ddd",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 2;
+                    cursor.next_char();
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
         }
         result
@@ -38240,54 +38328,50 @@ impl Generator {
     /// Convert strftime format to PostgreSQL date format (YYYY, MM, DD, etc.)
     fn strftime_to_postgres_format(fmt: &str) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
-        let bytes = fmt.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'%' && i + 1 < len {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
+        while let Some(ch) = cursor.next_char() {
+            if ch == '%' && cursor.peek().is_some() {
                 // Check for non-padded variants (%-X)
-                if bytes[i + 1] == b'-' && i + 2 < len {
-                    let replacement = match bytes[i + 2] {
-                        b'd' => "FMDD",
-                        b'm' => "FMMM",
-                        b'H' => "FMHH24",
-                        b'M' => "FMMI",
-                        b'S' => "FMSS",
+                if cursor.peek() == Some('-') && cursor.peek_nth(1).is_some() {
+                    let replacement = match cursor.peek_nth(1) {
+                        Some('d') => "FMDD",
+                        Some('m') => "FMMM",
+                        Some('H') => "FMHH24",
+                        Some('M') => "FMMI",
+                        Some('S') => "FMSS",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 3;
+                    cursor.next_char();
+                    cursor.next_char();
                 } else {
-                    let replacement = match bytes[i + 1] {
-                        b'Y' => "YYYY",
-                        b'y' => "YY",
-                        b'm' => "MM",
-                        b'B' => "Month",
-                        b'b' => "Mon",
-                        b'd' => "DD",
-                        b'j' => "DDD",
-                        b'H' => "HH24",
-                        b'M' => "MI",
-                        b'S' => "SS",
-                        b'f' => "US",
-                        b'A' => "Day",
-                        b'a' => "Dy",
+                    let replacement = match cursor.peek() {
+                        Some('Y') => "YYYY",
+                        Some('y') => "YY",
+                        Some('m') => "MM",
+                        Some('B') => "Month",
+                        Some('b') => "Mon",
+                        Some('d') => "DD",
+                        Some('j') => "DDD",
+                        Some('H') => "HH24",
+                        Some('M') => "MI",
+                        Some('S') => "SS",
+                        Some('f') => "US",
+                        Some('A') => "Day",
+                        Some('a') => "Dy",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 2;
+                    cursor.next_char();
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
         }
         result
@@ -38296,46 +38380,42 @@ impl Generator {
     /// Convert strftime format to Snowflake date format (yyyy, mm, DD, etc.)
     fn strftime_to_snowflake_format(fmt: &str) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
-        let bytes = fmt.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'%' && i + 1 < len {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(fmt);
+        while let Some(ch) = cursor.next_char() {
+            if ch == '%' && cursor.peek().is_some() {
                 // Check for non-padded variants (%-X)
-                if bytes[i + 1] == b'-' && i + 2 < len {
-                    let replacement = match bytes[i + 2] {
-                        b'd' => "dd",
-                        b'm' => "mm",
+                if cursor.peek() == Some('-') && cursor.peek_nth(1).is_some() {
+                    let replacement = match cursor.peek_nth(1) {
+                        Some('d') => "dd",
+                        Some('m') => "mm",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 3;
+                    cursor.next_char();
+                    cursor.next_char();
                 } else {
-                    let replacement = match bytes[i + 1] {
-                        b'Y' => "yyyy",
-                        b'y' => "yy",
-                        b'm' => "mm",
-                        b'd' => "DD",
-                        b'H' => "hh24",
-                        b'M' => "mi",
-                        b'S' => "ss",
-                        b'f' => "ff",
+                    let replacement = match cursor.peek() {
+                        Some('Y') => "yyyy",
+                        Some('y') => "yy",
+                        Some('m') => "mm",
+                        Some('d') => "DD",
+                        Some('H') => "hh24",
+                        Some('M') => "mi",
+                        Some('S') => "ss",
+                        Some('f') => "ff",
                         _ => {
                             result.push('%');
-                            i += 1;
                             continue;
                         }
                     };
                     result.push_str(replacement);
-                    i += 2;
+                    cursor.next_char();
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
         }
         result
@@ -38570,63 +38650,46 @@ impl Generator {
     /// Convert Snowflake normalized format to strftime-style (%Y, %m, etc.)
     fn snowflake_format_to_strftime(format: &str) -> String {
         let mut result = String::new();
-        let chars: Vec<char> = format.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let remaining = &format[i..];
-            if remaining.starts_with("yyyy") {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(format);
+        while let Some(ch) = cursor.peek() {
+            if cursor.consume_prefix("yyyy", false) {
                 result.push_str("%Y");
-                i += 4;
-            } else if remaining.starts_with("yy") {
+            } else if cursor.consume_prefix("yy", false) {
                 result.push_str("%y");
-                i += 2;
-            } else if remaining.starts_with("mmmm") {
+            } else if cursor.consume_prefix("mmmm", false) {
                 result.push_str("%B"); // full month name
-                i += 4;
-            } else if remaining.starts_with("mon") {
+            } else if cursor.consume_prefix("mon", false) {
                 result.push_str("%b"); // abbreviated month
-                i += 3;
-            } else if remaining.starts_with("mm") {
+            } else if cursor.consume_prefix("mm", false) {
                 result.push_str("%m");
-                i += 2;
-            } else if remaining.starts_with("DD") {
+            } else if cursor.consume_prefix("DD", false) {
                 result.push_str("%d");
-                i += 2;
-            } else if remaining.starts_with("dy") {
+            } else if cursor.consume_prefix("dy", false) {
                 result.push_str("%a"); // abbreviated day name
-                i += 2;
-            } else if remaining.starts_with("hh24") {
+            } else if cursor.consume_prefix("hh24", false) {
                 result.push_str("%H");
-                i += 4;
-            } else if remaining.starts_with("hh12") {
+            } else if cursor.consume_prefix("hh12", false) {
                 result.push_str("%I");
-                i += 4;
-            } else if remaining.starts_with("hh") {
+            } else if cursor.consume_prefix("hh", false) {
                 result.push_str("%H");
-                i += 2;
-            } else if remaining.starts_with("mi") {
+            } else if cursor.consume_prefix("mi", false) {
                 result.push_str("%M");
-                i += 2;
-            } else if remaining.starts_with("ss") {
+            } else if cursor.consume_prefix("ss", false) {
                 result.push_str("%S");
-                i += 2;
-            } else if remaining.starts_with("ff") {
+            } else if cursor.consume_prefix("ff", false) {
                 // Fractional seconds
                 result.push_str("%f");
-                i += 2;
                 // Skip digits after ff (ff3, ff6, ff9)
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
+                while cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    cursor.next_char();
                 }
-            } else if remaining.starts_with("am") || remaining.starts_with("pm") {
+            } else if cursor.consume_prefix("am", false) || cursor.consume_prefix("pm", false) {
                 result.push_str("%p");
-                i += 2;
-            } else if remaining.starts_with("tz") {
+            } else if cursor.consume_prefix("tz", false) {
                 result.push_str("%Z");
-                i += 2;
             } else {
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result
@@ -38635,62 +38698,45 @@ impl Generator {
     /// Convert Snowflake normalized format to Spark format (Java-style)
     fn snowflake_format_to_spark(format: &str) -> String {
         let mut result = String::new();
-        let chars: Vec<char> = format.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let remaining = &format[i..];
-            if remaining.starts_with("yyyy") {
+        let mut cursor = crate::format_tokens::FormatTokenCursor::new(format);
+        while let Some(ch) = cursor.peek() {
+            if cursor.consume_prefix("yyyy", false) {
                 result.push_str("yyyy");
-                i += 4;
-            } else if remaining.starts_with("yy") {
+            } else if cursor.consume_prefix("yy", false) {
                 result.push_str("yy");
-                i += 2;
-            } else if remaining.starts_with("mmmm") {
+            } else if cursor.consume_prefix("mmmm", false) {
                 result.push_str("MMMM"); // full month name
-                i += 4;
-            } else if remaining.starts_with("mon") {
+            } else if cursor.consume_prefix("mon", false) {
                 result.push_str("MMM"); // abbreviated month
-                i += 3;
-            } else if remaining.starts_with("mm") {
+            } else if cursor.consume_prefix("mm", false) {
                 result.push('M');
-                i += 2;
-            } else if remaining.starts_with("DD") {
+            } else if cursor.consume_prefix("DD", false) {
                 result.push('d');
-                i += 2;
-            } else if remaining.starts_with("dy") {
+            } else if cursor.consume_prefix("dy", false) {
                 result.push_str("EEE"); // abbreviated day name
-                i += 2;
-            } else if remaining.starts_with("hh24") {
+            } else if cursor.consume_prefix("hh24", false) {
                 result.push('H');
-                i += 4;
-            } else if remaining.starts_with("hh12") {
+            } else if cursor.consume_prefix("hh12", false) {
                 result.push('h');
-                i += 4;
-            } else if remaining.starts_with("hh") {
+            } else if cursor.consume_prefix("hh", false) {
                 result.push_str("HH");
-                i += 2;
-            } else if remaining.starts_with("mi") {
+            } else if cursor.consume_prefix("mi", false) {
                 result.push('m');
-                i += 2;
-            } else if remaining.starts_with("ss") {
+            } else if cursor.consume_prefix("ss", false) {
                 result.push('s');
-                i += 2;
-            } else if remaining.starts_with("ff") {
-                result.push_str("SSS"); // milliseconds
-                i += 2;
-                // Skip digits after ff
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
+            } else if cursor.consume_prefix("ff", false) {
+                // Emit milliseconds and skip digits after ff.
+                result.push_str("SSS");
+                while cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    cursor.next_char();
                 }
-            } else if remaining.starts_with("am") || remaining.starts_with("pm") {
+            } else if cursor.consume_prefix("am", false) || cursor.consume_prefix("pm", false) {
                 result.push_str("a");
-                i += 2;
-            } else if remaining.starts_with("tz") {
+            } else if cursor.consume_prefix("tz", false) {
                 result.push_str("z");
-                i += 2;
             } else {
-                result.push(chars[i]);
-                i += 1;
+                result.push(ch);
+                cursor.next_char();
             }
         }
         result
@@ -41793,6 +41839,219 @@ mod tests {
     }
 
     #[test]
+    fn test_date_time_format_converters_preserve_unicode() {
+        let converters: &[(&str, fn(&str) -> String, &str, &str)] = &[
+            (
+                "Snowflake to strftime",
+                Generator::snowflake_format_to_strftime,
+                "yyyy",
+                "%Y",
+            ),
+            (
+                "Snowflake to Spark",
+                Generator::snowflake_format_to_spark,
+                "yyyy",
+                "yyyy",
+            ),
+            (
+                "strftime to Teradata",
+                Generator::strftime_to_teradata_format,
+                "%Y",
+                "YYYY",
+            ),
+            (
+                "strftime to Java",
+                Generator::strftime_to_java_format_static,
+                "%Y",
+                "yyyy",
+            ),
+            (
+                "strftime to non-padded Java",
+                Generator::strftime_to_java_format_non_padded_static,
+                "%Y",
+                "yyyy",
+            ),
+            (
+                "strftime to TSQL",
+                Generator::strftime_to_tsql_format,
+                "%Y",
+                "yyyy",
+            ),
+            (
+                "strftime to PostgreSQL",
+                Generator::strftime_to_postgres_format,
+                "%Y",
+                "YYYY",
+            ),
+            (
+                "strftime to Snowflake",
+                Generator::strftime_to_snowflake_format,
+                "%Y",
+                "yyyy",
+            ),
+        ];
+        for (name, convert, token, expected_token) in converters {
+            assert_eq!(convert(""), "", "{name}");
+            for literal in ["é", "年", "🦀", "e\u{301}", "ß", "ſ"] {
+                assert_eq!(convert(literal), literal, "{name}");
+                assert_eq!(
+                    convert(&format!("{literal}{token}{literal}{token}{literal}")),
+                    format!("{literal}{expected_token}{literal}{expected_token}{literal}"),
+                    "{name}: {literal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_date_time_format_unicode_direct_asts() {
+        let normalized_time = Expression::StrToTime(Box::new(StrToTime {
+            this: Box::new(test_column("x")),
+            format: "éyyyy年mm月DD日".into(),
+            zone: None,
+            safe: None,
+            target_type: None,
+        }));
+        let strftime_time = Expression::StrToTime(Box::new(StrToTime {
+            this: Box::new(test_column("x")),
+            format: "%Y年%m月%d日".into(),
+            zone: None,
+            safe: None,
+            target_type: None,
+        }));
+        let date = Expression::StrToDate(Box::new(StrToDate {
+            this: Box::new(test_column("x")),
+            format: Some("%Y年%m月%d日".into()),
+            safe: None,
+        }));
+        let formatted = Expression::TimeToStr(Box::new(TimeToStr {
+            this: Box::new(test_column("x")),
+            format: "%Y年%m月%d日".into(),
+            culture: None,
+            zone: None,
+        }));
+        for (expression, dialect, expected) in [
+            (
+                &normalized_time,
+                DialectType::DuckDB,
+                "STRPTIME(x, 'é%Y年%m月%d日')",
+            ),
+            (
+                &normalized_time,
+                DialectType::Spark,
+                "TO_TIMESTAMP(x, 'éyyyy年M月d日')",
+            ),
+            (
+                &strftime_time,
+                DialectType::Spark,
+                "TO_TIMESTAMP(x, 'yyyy年M月d日')",
+            ),
+            (
+                &strftime_time,
+                DialectType::PostgreSQL,
+                "TO_TIMESTAMP(x, 'YYYY年MM月DD日')",
+            ),
+            (
+                &date,
+                DialectType::Teradata,
+                "CAST(x AS DATE FORMAT 'YYYY年MM月DD日')",
+            ),
+            (&date, DialectType::Spark, "TO_DATE(x, 'yyyy年MM月dd日')"),
+            (
+                &date,
+                DialectType::PostgreSQL,
+                "TO_DATE(x, 'YYYY年MM月DD日')",
+            ),
+            (&formatted, DialectType::TSQL, "FORMAT(x, 'yyyy年MM月dd日')"),
+            (
+                &formatted,
+                DialectType::Fabric,
+                "FORMAT(x, 'yyyy年MM月dd日')",
+            ),
+            (
+                &formatted,
+                DialectType::Snowflake,
+                "TO_CHAR(x, 'yyyy年mm月DD日')",
+            ),
+            (
+                &formatted,
+                DialectType::Spark,
+                "DATE_FORMAT(x, 'yyyy年MM月dd日')",
+            ),
+        ] {
+            let actual = Generator::with_config(GeneratorConfig {
+                dialect: Some(dialect),
+                ..Default::default()
+            })
+            .generate(expression)
+            .expect("Unicode formats should generate");
+            assert_eq!(actual, expected, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn test_date_time_format_converters_preserve_directives_and_escapes() {
+        let snowflake = "yyyy yy mmmm mon mm DD dy hh24 hh12 hh mi ss ff ff3 ff69 am pm tz";
+        assert_eq!(
+            Generator::snowflake_format_to_strftime(snowflake),
+            "%Y %y %B %b %m %d %a %H %I %H %M %S %f %f %f %p %p %Z"
+        );
+        assert_eq!(
+            Generator::snowflake_format_to_spark(snowflake),
+            "yyyy yy MMMM MMM M d EEE H h HH m s SSS SSS SSS a a z"
+        );
+        assert_eq!(
+            Generator::snowflake_format_to_strftime("éff9年yyyy"),
+            "é%f年%Y"
+        );
+        assert_eq!(
+            Generator::snowflake_format_to_spark("éff9年yyyy"),
+            "éSSS年yyyy"
+        );
+        let strftime = "%Y %y %m %B %b %d %j %H %I %M %S %f %A %a %-d %-m %-H %-I %-M %-S";
+        assert_eq!(
+            Generator::strftime_to_java_format_static(strftime),
+            "yyyy yy MM MMMM MMM dd DDD HH %I mm ss SSSSSS EEEE EEE d M H h m s"
+        );
+        assert_eq!(
+            Generator::strftime_to_java_format_non_padded_static(strftime),
+            "yyyy yy M MMMM MMM d DDD H %I m s SSSSSS EEEE EEE d M H h m s"
+        );
+        assert_eq!(
+            Generator::strftime_to_tsql_format(strftime),
+            "yyyy yy MM MMMM MMM dd DDD HH hh mm ss ffffff dddd ddd d M H %-I m s"
+        );
+        assert_eq!(
+            Generator::strftime_to_postgres_format(strftime),
+            "YYYY YY MM Month Mon DD DDD HH24 %I MI SS US Day Dy FMDD FMMM FMHH24 %-I FMMI FMSS"
+        );
+        assert_eq!(
+            Generator::strftime_to_snowflake_format(strftime),
+            "yyyy yy mm %B %b DD %j hh24 %I mi ss ff %A %a dd mm %-H %-I %-M %-S"
+        );
+        assert_eq!(
+            Generator::strftime_to_teradata_format(strftime),
+            "YYYY YY MM MMMM MMM DD DDD HH %I MI SS SSSSSS EEEE EEE %-d %-m %-H %-I %-M %-S"
+        );
+        for convert in [
+            Generator::strftime_to_java_format_static,
+            Generator::strftime_to_java_format_non_padded_static,
+            Generator::strftime_to_tsql_format,
+            Generator::strftime_to_postgres_format,
+            Generator::strftime_to_snowflake_format,
+            Generator::strftime_to_teradata_format,
+        ] {
+            assert_eq!(convert("%q %-q %% %é %-年 %"), "%q %-q %% %é %-年 %");
+        }
+        for convert in [
+            Generator::strftime_to_java_format_static,
+            Generator::strftime_to_java_format_non_padded_static,
+        ] {
+            assert_eq!(convert("\\é\\年\\🦀\\'%Y\\"), "\\é\\年\\🦀\\''yyyy\\");
+        }
+    }
+
+    #[test]
     fn test_programmatic_infix_ast_preserves_grouping() {
         let cases = [
             (
@@ -42171,5 +42430,107 @@ mod tests {
 
         let sql = Generator::sql(&expr).expect("deep OR chain should generate");
         assert!(sql.contains("c2499 = 2499"), "{}", sql);
+    }
+
+    /// A non-ASCII function name must not panic the generator.
+    ///
+    /// `WITH ORDINALITY` is carried on the function name and detected from the name's last
+    /// 16 bytes. `len()` counts bytes, so that detection used to slice the name at
+    /// `len - 16`, which panics when the index lands inside a multi-byte character. The
+    /// name here is 18 bytes with a two-byte character across bytes 1..3, so the index is
+    /// byte 2 -- mid-character. Reachable from ordinary SQL, quoted or bare.
+    #[test]
+    fn test_non_ascii_function_name_does_not_panic() {
+        let name = format!("a\u{e9}{}", "x".repeat(15));
+        assert_eq!(name.len(), 18, "the repro depends on this byte length");
+        assert!(
+            !name.is_char_boundary(name.len() - " WITH ORDINALITY".len()),
+            "the repro depends on that index being mid-character"
+        );
+
+        assert_eq!(
+            roundtrip(&format!("SELECT \"{name}\"(1)")),
+            "SELECT A\u{e9}XXXXXXXXXXXXXXX(1)"
+        );
+        assert_eq!(
+            roundtrip(&format!("SELECT {name}(1)")),
+            "SELECT A\u{e9}XXXXXXXXXXXXXXX(1)"
+        );
+        // A name whose last byte is multi-byte: the index is a boundary here, so this was
+        // always fine, and is kept so the two sides of the comparison stay covered.
+        let trailing = format!("{}\u{e9}", "x".repeat(16));
+        assert_eq!(
+            roundtrip(&format!("SELECT \"{trailing}\"(1)")),
+            "SELECT XXXXXXXXXXXXXXXX\u{e9}(1)"
+        );
+    }
+
+    /// The suffix detection the fix rewrote, still detecting the suffix.
+    ///
+    /// The `UNNEST` statements are the shipped fixtures that use the syntax, and they are
+    /// here so the fix cannot break them -- but they parse to typed `Unnest` nodes, which
+    /// the generator renders by another path, so they do not reach the rewritten comparison.
+    /// The table-valued calls below do: their suffix is carried on a function name, which is
+    /// the only thing that comparison looks at.
+    #[test]
+    fn test_with_ordinality_survives_the_byte_comparison() {
+        for sql in [
+            "SELECT student, score FROM tests CROSS JOIN UNNEST(scores) WITH ORDINALITY AS t(a, b)",
+            "SELECT * FROM UNNEST(x) WITH ORDINALITY UNION ALL SELECT * FROM UNNEST(y) WITH ORDINALITY",
+            "SELECT * FROM FOO(x) WITH ORDINALITY",
+        ] {
+            assert_eq!(roundtrip(sql), sql);
+        }
+
+        // A non-ASCII name carrying the suffix already worked: the ASCII suffix puts
+        // `len - 16` on a character boundary. Keep its output covered as a positive case.
+        assert_eq!(
+            roundtrip("SELECT * FROM a\u{e9}(x) WITH ORDINALITY"),
+            "SELECT * FROM A\u{e9}(x) WITH ORDINALITY"
+        );
+
+        // Build a mixed-case suffix to cover both SQL parsing and direct AST generation.
+        // The parser normalizes the suffix to uppercase, so only the direct AST case
+        // exercises the generator's case-insensitive comparison itself.
+        let mixed: String = " WITH ORDINALITY"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        assert_ne!(mixed, " WITH ORDINALITY", "the suffix should be mixed case");
+        for (name, expected_name) in [("FOO", "FOO"), ("a\u{e9}", "A\u{e9}")] {
+            assert_eq!(
+                roundtrip(&format!("SELECT * FROM {name}(x){mixed}")),
+                format!("SELECT * FROM {expected_name}(x) WITH ORDINALITY")
+            );
+
+            let expression = Expression::Function(Box::new(Function::new(
+                format!("{name}{mixed}"),
+                vec![test_column("x")],
+            )));
+            assert_eq!(
+                Generator::sql(&expression).expect("a mixed-case suffix should generate"),
+                format!("{expected_name}(x) WITH ORDINALITY")
+            );
+        }
+    }
+
+    /// The input that found this, kept as recorded: raw bytes through a lossy decode, which
+    /// is how the fuzz harness that produced it delivers them. The four `0xff` bytes become
+    /// replacement characters, one of which lands 16 bytes from the end of a function name.
+    /// The generated SQL is not asserted -- the input is malformed and what it parses to is
+    /// not the point. Returning at all is.
+    #[test]
+    fn test_recorded_non_ascii_crash_input_does_not_panic() {
+        let recorded: &[u8] = b"TUNm(MS~\"mrrNU\xff\xff\xff\xff(^_eur\"(DIInCTIST_subs63atue))";
+        let sql = format!("SELECT {}", String::from_utf8_lossy(recorded));
+        let ast = Parser::parse_sql(&sql).expect("the recorded input parses");
+        Generator::sql(&ast[0]).expect("and generates without panicking");
     }
 }

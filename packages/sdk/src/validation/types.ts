@@ -29,9 +29,9 @@ export interface ValidationError {
   severity: ValidationSeverity;
   /** Error code (e.g., "E001", "W001") */
   code: string;
-  /** Start byte offset of the error range */
+  /** Start Unicode character offset of the error range (not UTF-16 code units) */
   start?: number;
-  /** End byte offset of the error range (exclusive) */
+  /** End Unicode character offset of the error range (exclusive) */
   end?: number;
 }
 
@@ -51,8 +51,8 @@ export interface ValidationResult {
 export interface ValidationOptions {
   /**
    * Enable semantic validation in addition to syntax checking.
-   * Semantic validation checks for issues like SELECT * usage,
-   * aggregate functions without GROUP BY, etc.
+   * Reports correctness errors E230-E232 for invalid grouping and misplaced
+   * aggregate/window functions, plus query-quality warnings W001-W004.
    * @default false
    */
   semantic?: boolean;

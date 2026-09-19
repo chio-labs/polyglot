@@ -198,6 +198,26 @@ branches, transform kinds, conservative projection `nullability`, optional type
 hints, and upstream column references. The API is additive and uses the same
 optional `ValidationSchema` shape as schema-aware validation and lineage.
 Each set-operation branch is classified as a `value` or `filter` contribution.
+`columnUses` separately groups references used in joins, filters, grouping,
+HAVING/QUALIFY, window partition/order/frame expressions, ordering, aggregate
+filters/ordering, and set-operation filter branches. Each fact includes a
+`context`, `scopePath`, `expressionPath`, dialect-rendered `expressionSql`, and
+`references` using the existing source identity and confidence vocabulary.
+For example, `SELECT o.id FROM orders o WHERE o.amount > 0` reports an `amount`
+use with context `filter`; the `id` projection's upstream facts are unchanged.
+
+Paths distinguish CTEs, derived tables, subqueries and nested set-operation
+branches (for example `root.branches[1]`). They are deterministic within an
+analysis, not persistent identifiers across edits. References preserve repeated
+occurrences; multiple upstream dependencies may share a use's location.
+Optional `span` objects contain half-open `start`/`end` Unicode-character offsets
+into the original SQL, not UTF-8 bytes or JavaScript UTF-16 offsets. Reference
+spans locate the original use, including uses of CTE columns or output aliases.
+Complete expression spans are returned only when available; generated SQL is
+not used to invent source locations. Implicit NATURAL JOIN keys need complete
+source columns; otherwise an `unknown` wildcard reference records that gap.
+These are direct query-analysis facts, not cross-query impact analysis.
+
 Validation uses broad type families, while query analysis preserves detailed
 schema type strings such as `DECIMAL(10,2)` for `typeHint` values when they can
 be parsed.
@@ -286,7 +306,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.9.4", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.12.0", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.
@@ -394,6 +414,19 @@ Optional dialect function catalogs are provided via `crates/polyglot-sql-functio
 - Intended behavior: compile-time inclusion, one-time load in core, auto-use during schema validation type checks.
 
 ## Testing
+
+CI runs four Rust suites in parallel for pull requests, pushes to `main`, and
+`v*` release tags: core/debug, release fixtures, bindings, and feature gates.
+The required `rust-test` check succeeds only when every suite and the quality
+job pass. Go integration tests reuse the bindings suite's FFI release library;
+published multi-platform FFI archives remain separate.
+
+To reproduce one suite locally, run `make test-rust-ci-core`,
+`make test-rust-ci-release-fixtures`, `make test-rust-ci-bindings`, or
+`make test-rust-ci-feature-gates`. Extract fixtures first with
+`make extract-fixtures` for core or `make extract-all-fixtures` for release
+fixtures. `make test-rust-verify` remains the sequential local verification
+command and shares its test recipes with CI.
 
 Polyglot currently runs **11,333 SQLGlot fixture cases** plus additional project-specific suites. All strict pass/fail suites are at **100%** in the latest verification run.
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import subprocess
@@ -29,6 +30,35 @@ MARKETING_PATHS = (
     Path("packages/sdk/README.md"),
 )
 MARKETING_DIALECT_PHRASE = "more than 30 sql dialects"
+
+# Share the exact same references between validation and release updates. Keep
+# historical changelogs and benchmark reports outside this explicit active set.
+RUST_DEPENDENCY_VERSION = re.compile(
+    r"(?m)^[ \t]*polyglot-sql[ \t]*=[ \t]*"
+    r"(?:\{[^}]*?\bversion\s*=\s*)?"
+    r"(?P<quote>[\"'])(?P<version>[^\"'\r\n]+)(?P=quote)"
+)
+VERSION_REFERENCES = (
+    *(
+        (Path(path), RUST_DEPENDENCY_VERSION, "Rust dependency version")
+        for path in (
+            "README.md",
+            "crates/polyglot-sql/README.md",
+            "crates/polyglot-sql-function-catalogs/README.md",
+            "examples/rust/Cargo.toml",
+        )
+    ),
+    (
+        Path("packages/go/types.go"),
+        re.compile(r'const sdkVersion = "(?P<version>[^"]+)"'),
+        "Go SDK version",
+    ),
+    (
+        Path("packages/go/README.md"),
+        re.compile(r"`packages/go/v(?P<version>[^`]+)`"),
+        "Go release tag example",
+    ),
+)
 
 
 def load_toml(path: Path) -> dict:
@@ -57,6 +87,47 @@ def workspace_version(root: Path) -> str:
 
 def _version_requirement_matches(requirement: str, version: str) -> bool:
     return requirement == "*" or requirement.lstrip("^=~") == version
+
+
+def check_version_references(root: Path, expected: str) -> list[str]:
+    issues: list[str] = []
+    for path, pattern, description in VERSION_REFERENCES:
+        text = read_text(root, path)
+        matches = list(pattern.finditer(text))
+        if not matches:
+            issues.append(f"{path}: missing {description}")
+        for match in matches:
+            actual = match.group("version")
+            if actual != expected:
+                line = text.count("\n", 0, match.start("version")) + 1
+                issues.append(
+                    f"{path}:{line}: {description} {actual!r} "
+                    f"does not match workspace version {expected!r}"
+                )
+    return issues
+
+
+def sync_version_references(root: Path) -> list[Path]:
+    """Update active references from Cargo.toml without changing other content."""
+    expected = workspace_version(root)
+    changes: list[tuple[Path, str]] = []
+    for path, pattern, description in VERSION_REFERENCES:
+        text = read_text(root, path)
+        matches = list(pattern.finditer(text))
+        if not matches:
+            raise ValueError(f"{path}: missing {description}")
+        updated = text
+        for match in reversed(matches):
+            start, end = match.span("version")
+            updated = updated[:start] + expected + updated[end:]
+        if updated != text:
+            changes.append((path, updated))
+
+    # Find missing references before writing anything, so malformed inputs do
+    # not leave an only partially synchronized release.
+    for path, updated in changes:
+        (root / path).write_text(updated, encoding="utf-8")
+    return [path for path, _ in changes]
 
 
 def check_versions(root: Path, metadata: dict | None = None) -> list[str]:
@@ -116,26 +187,7 @@ def check_versions(root: Path, metadata: dict | None = None) -> list[str]:
                 f"does not match workspace version {expected!r}"
             )
 
-    go_types_path = root / "packages/go/types.go"
-    go_types = go_types_path.read_text(encoding="utf-8")
-    go_match = re.search(r'const sdkVersion = "([^"]+)"', go_types)
-    if not go_match or go_match.group(1) != expected:
-        actual = go_match.group(1) if go_match else "missing"
-        issues.append(
-            f"{go_types_path}: sdkVersion {actual!r} does not match workspace version {expected!r}"
-        )
-
-    for readme_path in (root / "README.md", root / "crates/polyglot-sql/README.md"):
-        readme = readme_path.read_text(encoding="utf-8")
-        readme_versions = re.findall(r'polyglot-sql = \{ version = "([^"]+)"', readme)
-        if not readme_versions:
-            issues.append(f"{readme_path}: missing versioned Rust dependency example")
-        for actual in readme_versions:
-            if actual != expected:
-                issues.append(
-                    f"{readme_path}: Rust dependency example version {actual!r} "
-                    f"does not match workspace version {expected!r}"
-                )
+    issues.extend(check_version_references(root, expected))
 
     example_path = root / "examples/rust/Cargo.toml"
     example = load_toml(example_path)
@@ -322,6 +374,22 @@ def run_checks(root: Path = PROJECT_ROOT) -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--sync-version-references",
+        action="store_true",
+        help="update active docs, Go SDK, and Rust example references to the workspace version",
+    )
+    args = parser.parse_args()
+    if args.sync_version_references:
+        try:
+            for path in sync_version_references(PROJECT_ROOT):
+                print(f"Updated {path}")
+        except (KeyError, OSError, ValueError) as error:
+            print(f"Version synchronization failed: {error}", file=sys.stderr)
+            return 1
+        return 0
+
     issues = run_checks()
     if issues:
         print("Project consistency checks failed:", file=sys.stderr)

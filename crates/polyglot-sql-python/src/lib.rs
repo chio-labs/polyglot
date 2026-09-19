@@ -31,6 +31,7 @@ fn _polyglot_sql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate::generate, m)?)?;
     m.add_function(wrap_pyfunction!(format::format_sql, m)?)?;
     m.add_function(wrap_pyfunction!(validate::validate, m)?)?;
+    m.add_function(wrap_pyfunction!(validate::validate_with_schema, m)?)?;
     m.add_function(wrap_pyfunction!(optimize::optimize, m)?)?;
     m.add_function(wrap_pyfunction!(lineage::lineage, m)?)?;
     m.add_function(wrap_pyfunction!(lineage::lineage_with_schema, m)?)?;

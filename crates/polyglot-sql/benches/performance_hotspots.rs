@@ -81,6 +81,7 @@ fn many_numbers() -> String {
 
 fn disabled_guards() -> ComplexityGuardOptions {
     ComplexityGuardOptions {
+        max_parser_depth: None,
         max_input_bytes: None,
         max_tokens: None,
         max_ast_nodes: None,
@@ -209,10 +210,70 @@ fn bench_tokenize_and_parse(c: &mut Criterion) {
     guards.finish();
 }
 
+fn bench_validation_and_analysis(c: &mut Criterion) {
+    #[cfg(all(feature = "semantic", feature = "generate"))]
+    {
+        use polyglot_sql::{
+            analyze_query, validate_with_schema, AnalyzeQueryOptions, SchemaValidationOptions,
+            ValidationSchema,
+        };
+        let schema: ValidationSchema = serde_json::from_value(
+            serde_json::json!({"tables": [{"name":"t", "columns":[{"name":"x", "type":"INT"}]}]}),
+        )
+        .unwrap();
+        let mut group = c.benchmark_group("validation_analysis");
+        group.sample_size(10);
+        for width in [100, 200, 400] {
+            let sql = format!(
+                "SELECT {} FROM t",
+                (0..width)
+                    .map(|i| format!("x + {i} AS c{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            group.bench_with_input(BenchmarkId::new("analysis_width", width), &sql, |b, sql| {
+                b.iter(|| {
+                    analyze_query(
+                        black_box(sql),
+                        AnalyzeQueryOptions {
+                            schema: Some(schema.clone()),
+                            dialect: DialectType::PostgreSQL,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                });
+            });
+            group.bench_with_input(
+                BenchmarkId::new("validation_width", width),
+                &sql,
+                |b, sql| {
+                    b.iter(|| {
+                        validate_with_schema(
+                            black_box(sql),
+                            DialectType::PostgreSQL,
+                            &schema,
+                            &SchemaValidationOptions {
+                                check_types: true,
+                                semantic: true,
+                                ..Default::default()
+                            },
+                        )
+                    });
+                },
+            );
+        }
+        group.finish();
+    }
+    #[cfg(not(all(feature = "semantic", feature = "generate")))]
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_dialect_construction,
     bench_fresh_vs_reused_dialect,
-    bench_tokenize_and_parse
+    bench_tokenize_and_parse,
+    bench_validation_and_analysis
 );
 criterion_main!(benches);

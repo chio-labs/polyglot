@@ -1236,7 +1236,7 @@ fn subquery_identity_key(expr: &Expression) -> String {
 }
 
 fn structural_subquery_key(expr: &Expression) -> String {
-    serde_json::to_string(expr).unwrap_or_else(|_| format!("{expr:?}"))
+    super::structural_identity_key(expr)
 }
 
 /// Unnest correlated subqueries where possible.
@@ -1317,6 +1317,31 @@ fn collect_table_refs(expr: &Expression, tables: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_structural_subquery_key_ignores_source_spans() {
+        let left = crate::Parser::parse_sql("SELECT a.x AS y FROM t AS a")
+            .unwrap()
+            .remove(0);
+        let right = crate::Parser::parse_sql("  SELECT a.x AS y FROM t AS a")
+            .unwrap()
+            .remove(0);
+        assert_ne!(
+            serde_json::to_value(&left).unwrap(),
+            serde_json::to_value(&right).unwrap()
+        );
+        assert_eq!(
+            structural_subquery_key(&left),
+            structural_subquery_key(&right)
+        );
+        let different = crate::Parser::parse_sql("SELECT a.z AS y FROM t AS a")
+            .unwrap()
+            .remove(0);
+        assert_ne!(
+            structural_subquery_key(&left),
+            structural_subquery_key(&different)
+        );
+    }
     use crate::generator::Generator;
     use crate::parser::Parser;
 

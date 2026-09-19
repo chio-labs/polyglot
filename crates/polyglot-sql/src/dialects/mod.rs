@@ -87,7 +87,7 @@ mod teradata;
 mod tidb;
 #[cfg(feature = "dialect-trino")]
 mod trino;
-#[cfg(feature = "dialect-tsql")]
+#[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 mod tsql;
 
 pub use generic::GenericDialect; // Always available
@@ -180,7 +180,7 @@ use crate::generator::UnsupportedLevel;
 use crate::generator::{Generator, GeneratorConfig};
 #[cfg(feature = "transpile")]
 use crate::guard::enforce_generate_ast;
-use crate::guard::{enforce_input, ComplexityGuardOptions};
+use crate::guard::{enforce_input, ComplexityGuardOptions, ParseOptions};
 #[cfg(feature = "transpile")]
 use crate::helper::find_new_name;
 use crate::parser::Parser;
@@ -278,11 +278,12 @@ pub enum DialectType {
 
 impl DialectType {
     /// Whether SELECT projections may use string literals as column aliases.
-    pub(crate) const fn supports_string_aliases(self) -> bool {
+    /// DuckDB permits this only when the alias has an explicit AS keyword.
+    pub(crate) const fn supports_string_aliases(self, explicit_as: bool) -> bool {
         matches!(
             self,
             DialectType::TSQL | DialectType::Fabric | DialectType::MySQL | DialectType::SQLite
-        )
+        ) || (matches!(self, DialectType::DuckDB) && explicit_as)
     }
 }
 
@@ -2939,6 +2940,16 @@ impl Dialect {
         self.parse_with_guard(sql, self.default_complexity_guard())
     }
 
+    /// Parse using per-call limits without changing this dialect's defaults.
+    pub fn parse_with_options(&self, sql: &str, options: &ParseOptions) -> Result<Vec<Expression>> {
+        self.parse_with_guard(
+            sql,
+            options
+                .complexity_guard
+                .unwrap_or_else(|| self.default_complexity_guard()),
+        )
+    }
+
     fn parse_with_guard(
         &self,
         sql: &str,
@@ -2992,7 +3003,18 @@ impl Dialect {
     /// This accepts type strings such as `DECIMAL(10, 2)`, `INT[]`, or
     /// `STRUCT(a INT, b VARCHAR)` without requiring a surrounding statement.
     pub fn parse_data_type(&self, sql: &str) -> Result<DataType> {
-        let complexity_guard = self.default_complexity_guard();
+        self.parse_data_type_with_options(sql, &ParseOptions::default())
+    }
+
+    /// Parse a standalone data type using per-call complexity limits.
+    pub fn parse_data_type_with_options(
+        &self,
+        sql: &str,
+        options: &ParseOptions,
+    ) -> Result<DataType> {
+        let complexity_guard = options
+            .complexity_guard
+            .unwrap_or_else(|| self.default_complexity_guard());
         enforce_input(sql, &complexity_guard)?;
         let source: Arc<str> = Arc::from(sql);
         let (tokens, token_guard_stats) = self.tokenizer.tokenize_for_parser(&source)?;
@@ -3038,23 +3060,28 @@ impl Dialect {
         generator.generate(expr)
     }
 
-    /// Generate SQL from an expression with pretty printing enabled
+    /// Generate SQL with pretty printing, retaining explicit null-ordering clauses.
     #[cfg(feature = "generate")]
     pub fn generate_pretty(&self, expr: &Expression) -> Result<String> {
         let mut config = self.get_config_for_expr(expr);
         config.pretty = true;
-        let mut generator = Generator::with_config(config);
+        let mut generator = Generator::with_config(config).with_preserved_null_ordering();
         generator.generate(expr)
     }
 
-    /// Generate pretty SQL while preserving optional syntax explicitly authored by the user.
-    #[cfg(feature = "generate")]
-    pub(crate) fn generate_pretty_for_format(&self, expr: &Expression) -> Result<String> {
+    /// Render analysis facts with the same AST limits used to accept the input.
+    #[cfg(all(feature = "semantic", feature = "generate"))]
+    pub(crate) fn generate_with_guard(
+        &self,
+        expr: &Expression,
+        guard: Option<ComplexityGuardOptions>,
+    ) -> Result<String> {
+        let Some(guard) = guard else {
+            return self.generate(expr);
+        };
         let mut config = self.get_config_for_expr(expr);
-        config.pretty = true;
-        config.preserve_explicit_null_ordering = true;
-        let mut generator = Generator::with_config(config);
-        generator.generate(expr)
+        config.complexity_guard = guard;
+        Generator::with_config(config).generate(expr)
     }
 
     /// Generate SQL from an expression with source dialect info (for transpilation)

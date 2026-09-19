@@ -1,10 +1,12 @@
 use crate::errors::{parse_statement_count_error, unknown_dialect_error, GenerateError};
 use crate::expr::PyExpression;
 use polyglot_sql::dialects::Dialect;
-use polyglot_sql::{ast_json, DataType, Expression, UnsupportedLevel};
+use polyglot_sql::{
+    ast_json, ComplexityGuardOptions, DataType, Expression, ParseOptions, UnsupportedLevel,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::types::{PyAny, PyBool, PyDict, PyInt, PyList};
 use pythonize::{depythonize, pythonize};
 use serde::Serialize;
 use serde_json::Value;
@@ -18,12 +20,47 @@ where
     Ok(py.detach(f))
 }
 
-pub fn parse_detached(py: Python<'_>, dialect: &Dialect, sql: &str) -> PyResult<Vec<Expression>> {
+pub fn decode_complexity_guard(
+    value: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<ComplexityGuardOptions>> {
+    value
+        .map(|value| {
+            // bool is an int subclass; floats must not become null and disable a guard.
+            for (_, limit) in value.iter() {
+                if !limit.is_none()
+                    && (limit.is_instance_of::<PyBool>() || !limit.is_instance_of::<PyInt>())
+                {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "Complexity guard limits must be nonnegative integers or None",
+                    ));
+                }
+            }
+            let value: Value = depythonize(value).map_err(|error| {
+                PyValueError::new_err(format!("Invalid complexity guard options: {error}"))
+            })?;
+            serde_json::from_value(value).map_err(|error| {
+                PyValueError::new_err(format!("Invalid complexity guard options: {error}"))
+            })
+        })
+        .transpose()
+}
+
+pub fn parse_detached(
+    py: Python<'_>,
+    dialect: &Dialect,
+    sql: &str,
+    guard: Option<ComplexityGuardOptions>,
+) -> PyResult<Vec<Expression>> {
     let dialect_type = dialect.dialect_type();
     let sql_owned = sql.to_owned();
     run_detached(py, move || {
         let d = Dialect::get(dialect_type);
-        d.parse(&sql_owned)
+        d.parse_with_options(
+            &sql_owned,
+            &ParseOptions {
+                complexity_guard: guard,
+            },
+        )
     })?
     .map_err(crate::errors::map_parse_error)
 }
@@ -32,12 +69,18 @@ pub fn parse_data_type_detached(
     py: Python<'_>,
     dialect: &Dialect,
     sql: &str,
+    guard: Option<ComplexityGuardOptions>,
 ) -> PyResult<DataType> {
     let dialect_type = dialect.dialect_type();
     let sql_owned = sql.to_owned();
     run_detached(py, move || {
         let d = Dialect::get(dialect_type);
-        d.parse_data_type(&sql_owned)
+        d.parse_data_type_with_options(
+            &sql_owned,
+            &ParseOptions {
+                complexity_guard: guard,
+            },
+        )
     })?
     .map_err(crate::errors::map_parse_error)
 }

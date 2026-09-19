@@ -35,6 +35,7 @@ pub(crate) enum SetOperationLayoutError {
     MissingRequiredColumn(String),
 }
 
+#[cfg(feature = "semantic")]
 impl SetOperationLayoutError {
     pub(crate) fn is_indeterminate(&self) -> bool {
         matches!(self, Self::Indeterminate(_))

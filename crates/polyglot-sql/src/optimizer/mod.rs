@@ -75,6 +75,30 @@ pub use simplify::{always_false, always_true, is_false, is_null, is_zero, simpli
 /// Subquery merging, unnesting, and correlation analysis
 pub use subquery::{is_correlated, is_mergeable, merge_subqueries, unnest_subqueries};
 
+/// Structural identity for optimizer keys, independent of source metadata.
+/// Unlike generated SQL this also works in builds without the `generate` feature.
+fn structural_identity_key(expr: &crate::expressions::Expression) -> String {
+    fn remove_spans(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.remove("span");
+                for value in fields.values_mut() {
+                    remove_spans(value);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    remove_spans(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(expr).expect("expression serializes");
+    remove_spans(&mut value);
+    value.to_string()
+}
+
 /// Qualify a schema-aware expression without changing physical table aliases.
 ///
 /// Anonymous derived tables need stable aliases before column qualification so

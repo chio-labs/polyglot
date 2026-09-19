@@ -30,17 +30,25 @@ pub fn parse_dollar_string_token(text: &str) -> (Option<String>, String) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Span {
-    /// Starting byte offset
+    /// Starting Unicode character offset (not a UTF-8 byte or UTF-16 code-unit offset).
     pub start: usize,
-    /// Ending byte offset (exclusive)
+    /// Ending Unicode character offset (exclusive).
     pub end: usize,
-    /// Line number (1-based)
+    /// Cursor line after consuming the token (1-based).
     pub line: usize,
-    /// Column number (1-based)
+    /// Cursor column after consuming the token (1-based, in Unicode characters).
     pub column: usize,
 }
 
 impl Span {
+    /// Cover two source ranges, retaining the ending range's cursor location.
+    pub(crate) fn through(self, end: Self) -> Self {
+        Self {
+            start: self.start,
+            ..end
+        }
+    }
+
     pub fn new(start: usize, end: usize, line: usize, column: usize) -> Self {
         Self {
             start,
@@ -837,6 +845,10 @@ pub enum TokenType {
     Restart,
 
     // Special
+    /// Never produced by [`Tokenizer`]: the token stream is not terminated, and the
+    /// parser detects the end of input from the stream length instead. A caller can
+    /// still put one at the end of a stream it builds itself and hands to
+    /// `Parser::new`, which the parser honours; see `explicit_eof_token_tests`.
     Eof,
 }
 
@@ -1478,6 +1490,8 @@ pub struct TokenizerConfig {
     pub quotes: HashMap<String, String>,
     /// Identifier quote characters (start -> end)
     pub identifiers: HashMap<char, char>,
+    /// Whether quoted identifiers use string-style backslash escapes (BigQuery/ClickHouse).
+    pub identifier_backslash_escapes: bool,
     /// Comment definitions (start -> optional end)
     pub comments: HashMap<String, Option<String>>,
     /// String escape characters
@@ -1546,6 +1560,7 @@ impl Default for TokenizerConfig {
             single_tokens: DEFAULT_SINGLE_TOKENS.clone(),
             quotes: DEFAULT_QUOTES.clone(),
             identifiers: DEFAULT_IDENTIFIERS.clone(),
+            identifier_backslash_escapes: false,
             comments: DEFAULT_COMMENTS.clone(),
             // Standard SQL: only '' (doubled quote) escapes a quote
             // Backslash escapes are dialect-specific (MySQL, etc.)
@@ -2921,11 +2936,13 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                     self.current,
                 ));
             }
-            if end_quote == '`' && self.peek() == '\\' && self.peek_next() == end_quote {
-                // ClickHouse allows escaped backticks inside backtick-quoted identifiers.
-                value.push(end_quote);
-                self.advance(); // skip backslash
-                self.advance(); // skip escaped quote
+            if self.config.identifier_backslash_escapes && self.peek() == '\\' {
+                if self.peek_next() == end_quote {
+                    value.push(end_quote);
+                    self.advance_count(2);
+                } else {
+                    self.scan_backslash_escape(&mut value);
+                }
                 continue;
             }
             if self.peek() == end_quote {

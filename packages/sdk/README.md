@@ -51,9 +51,17 @@ if (!strict.success) {
 ```typescript
 import { parse, generate, Dialect } from '@polyglot-sql/sdk';
 
-const { ast } = parse('SELECT 1 + 2', Dialect.Generic);
-const { sql } = generate(ast, Dialect.PostgreSQL);
-console.log(sql[0]); // SELECT 1 + 2
+const result = parse('SELECT 1 + 2', Dialect.Generic);
+if (!result.success) {
+  throw new Error(result.error);
+}
+
+const generated = generate(result.ast, Dialect.PostgreSQL);
+if (!generated.success || !generated.sql) {
+  throw new Error(generated.error);
+}
+
+console.log(generated.sql[0]); // SELECT 1 + 2
 ```
 
 ### Data Types
@@ -74,6 +82,14 @@ if (parsed.success) {
   console.log(rendered.sql); // DECIMAL(10, 2)
 }
 ```
+
+`generateDataType` also accepts programmatically constructed data types. Named
+`STRUCT`, `UNION`, and structured `OBJECT` fields are rendered as identifiers:
+names such as `field name` or `a"b` are quoted and escaped for the target dialect.
+Existing delimited name strings remain supported. Parsed quoted field names use
+double-quote delimiters with doubled internal quotes in the AST; generation
+translates those delimiters to the target dialect. An empty struct field name
+continues to represent an anonymous field.
 
 ### Format
 
@@ -377,46 +393,46 @@ except(q1, q2).toSql();
 Walk, search, and transform parsed AST nodes.
 
 ```typescript
-import {
-  parse, Dialect, col, walk, transform, findAll, findFirst, findByType,
-  getColumns, getColumnNames, getTableNames, renameColumns, renameTables,
-  addWhere, removeWhere, setLimit, setOffset, setOrderBy, setDistinct, qualifyColumns,
-  getAggregateFunctions, hasSubqueries, nodeCount,
-} from '@polyglot-sql/sdk';
+import { ast, Dialect, parse } from '@polyglot-sql/sdk';
 
-const { ast } = parse('SELECT a, b FROM t WHERE x > 1', Dialect.Generic);
+const result = parse('SELECT a, b FROM t WHERE x > 1', Dialect.Generic);
+if (!result.success) {
+  throw new Error(result.error);
+}
+
+const statement = result.ast[0];
 
 // Walk all nodes with visitor callbacks
-walk(ast, {
+ast.walk(statement, {
   enter: (node) => console.log('Entering:', node),
   column: (node) => console.log('Found column:', node),
 });
 
 // Search for nodes
-const columns = getColumns(ast);
-const first = findFirst(ast, (node) => getExprType(node) === 'column');
-const selects = findByType(ast, 'select');
+const columns = ast.getColumns(statement);
+const first = ast.findFirst(statement, (node) => ast.getExprType(node) === 'column');
+const selects = ast.findByType(statement, 'select');
 
 // Get names as strings
-const colNames = getColumnNames(ast);   // ['a', 'b']
-const tableNames = getTableNames(ast);  // ['t']
+const colNames = ast.getColumnNames(statement);   // ['a', 'b', 'x']
+const tableNames = ast.getTableNames(statement);  // ['t']
 
 // Check for specific constructs
-const hasAggs = hasAggregates(ast);
-const hasSubs = hasSubqueries(ast);
-const count = nodeCount(ast);
+const hasAggs = ast.hasAggregates(statement);
+const hasSubs = ast.hasSubqueries(statement);
+const count = ast.nodeCount(statement);
 
 // Transform AST nodes
-const renamed = renameColumns(ast, { a: 'alpha', b: 'beta' });
-const renamedTables = renameTables(ast, { t: 'users' });
-const qualified = qualifyColumns(ast, 'users');
+const renamed = ast.renameColumns(statement, { a: 'alpha', b: 'beta' });
+const renamedTables = ast.renameTables(statement, { t: 'users' });
+const qualified = ast.qualifyColumns(statement, 'users');
 
 // Modify query structure
-const withLimit = setLimit(ast, 100);
-const withOffset = setOffset(withLimit, 10);
-const ordered = setOrderBy(withOffset, col('a').toJSON());
-const distinct = setDistinct(ast, true);
-const noWhere = removeWhere(ast);
+const withLimit = ast.setLimit(statement, 100);
+const withOffset = ast.setOffset(withLimit, 10);
+const ordered = ast.setOrderBy(withOffset, columns[0]);
+const distinct = ast.setDistinct(statement, true);
+const noWhere = ast.removeWhere(statement);
 ```
 
 ## Validation
@@ -445,9 +461,12 @@ const result = validate('SELECT * FROM users', 'postgresql', { semantic: true })
 // May also report warnings like "SELECT * is discouraged"
 ```
 
-Basic syntax, strict-syntax checks, and semantic warnings W001-W004 are
-computed by the Rust core in one WASM call. Semantic warnings do not make the
-result invalid.
+Syntax, strict-syntax checks, and semantic checks are computed by the Rust core
+in one WASM call. With `semantic: true`, invalid grouping (`E230`), aggregate
+placement/nesting (`E231`), and window placement/nesting (`E232`) make the result
+invalid, even with schema validation's `strict: false`. Quality hints W001-W004
+remain warnings; W002 is reserved for uncertain grouping cases. Unknown schema
+and option fields are rejected, including nested schema metadata.
 
 ### Schema Validation
 
@@ -678,10 +697,31 @@ projection `typeHint` values. `cteFacts` reports top-level CTE definitions,
 `starProjections` records original star projections and schema-expanded
 columns, and each projection includes conservative `nullability`: `'non_null'`,
 `'nullable'`, or `'unknown'`.
+Types propagate through CTE and derived-table outputs. `transformKind` and
+`castType` describe the current projection, not transformations earlier in its
+lineage: a passthrough of a cast column is still `direct`, with the cast's result
+type in `typeHint`. Compact `upstream` references identify base dependencies;
+use the full lineage API to inspect intermediate CTEs and expressions.
 Each `setOperations[].branches[]` entry has a `role`: both `UNION` branches are
 `'value'`, while the right branch of `EXCEPT` and `INTERSECT` is `'filter'`.
 For physical relation facts, `name` remains the qualified display name while
 `catalog`, `schema`, and `table` expose parsed identifier parts.
+
+`columnUses` adds scoped facts for joins, filters (including aggregate FILTER),
+grouping, HAVING/QUALIFY, window keys/frames, ordering, and set-operation filter
+inputs. Each fact has `context`, `scopePath`, `expressionPath`, dialect-rendered
+`expressionSql`, and `references`. For example, `SELECT o.id FROM orders o WHERE
+o.amount > 0` reports a `filter` use of `orders.amount` without adding it to the
+`id` projection's upstream references. Paths distinguish nested scopes and
+branches; they are not persistent IDs across query edits.
+
+Optional `span` objects use half-open Unicode-character offsets into original
+SQL. To slice in JavaScript, use `Array.from(sql).slice(start, end).join('')`, not
+`sql.slice(start, end)`. Reference spans locate occurrences, not upstream
+definitions; complete expression spans are omitted when unavailable. Repeated
+occurrences are retained. Uncertain ownership is `ambiguous` or `unknown`.
+The TypeScript `columnUses` property is optional only to accommodate older WASM
+runtimes; current builds always return an array.
 
 ```typescript
 import { analyzeQuery, Dialect } from '@polyglot-sql/sdk';
@@ -853,7 +893,7 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `parse(sql, dialect?)` | Parse SQL into AST |
 | `generate(ast, dialect?)` | Generate SQL from AST |
 | `parseDataType(sql, dialect?)` | Parse one standalone SQL data type |
-| `generateDataType(dataType, dialect?)` | Generate SQL from a parsed data type |
+| `generateDataType(dataType, dialect?)` | Generate SQL from a parsed or constructed data type |
 | `format(sql, dialect?)` | Pretty-print SQL |
 | `formatWithOptions(sql, dialect?, options?)` | Pretty-print SQL with guard overrides |
 | `tokenize(sql, dialect?)` | Tokenize SQL into a token stream with source spans |
@@ -862,7 +902,13 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `getDialects()` | List supported dialect names |
 | `getVersion()` | Get library version |
 
-`transpile` accepts `TranspileOptions` with `pretty`, `unsupportedLevel`, `maxUnsupported`, and optional `complexityGuard` limits (`maxInputBytes`, `maxTokens`, `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, `maxFunctionCallDepth`) for recursion-heavy inputs.
+`transpile` accepts `TranspileOptions` with `pretty`, `unsupportedLevel`, `maxUnsupported`, and optional `complexityGuard` limits (`maxParserDepth`, `maxInputBytes`, `maxTokens`, `maxAstNodes`, `maxAstDepth`, `maxParenthesisDepth`, `maxFunctionCallDepth`) for recursion-heavy inputs.
+
+`maxParserDepth` bounds logical nesting during parsing, before an AST exists. The shared Rust core uses a conservative default of 32 on WASM and 1024 on native targets because their available stacks differ. Omit it for the target's default, supply a nonnegative integer to override it, or use `null` to disable only that check. Zero rejects parsing descents. Other limits remain independent; `maxAstDepth` checks the constructed AST instead.
+
+Raising or disabling this limit can permit resource exhaustion and native process termination or WASM traps. It does not increase stack space or establish a general time/memory budget. Overrides should be controlled by the application owner, not arbitrary SQL submitters. Parsing APIs without an options argument inherit the default protection.
+
+This limit covers recursive parsing, not arbitrary programmatic AST construction or the stack use of later generation and traversal stages.
 
 ### Analysis Functions
 
