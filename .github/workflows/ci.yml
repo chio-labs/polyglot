@@ -50,9 +50,16 @@ jobs:
       - name: Check project consistency
         run: make check-consistency
 
-  rust-test:
+  # All four suites run for PRs, main pushes, and release tags alike.
+  rust-test-suite:
+    name: rust-test (${{ matrix.suite }})
     needs: quality
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        suite: [core, release-fixtures, bindings, feature-gates]
     env:
       POLYGLOT_API_CONTRACT: ${{ github.workspace }}/docs/api-capabilities.json
     steps:
@@ -61,68 +68,55 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-test-${{ matrix.suite }}
 
       - name: Setup Python
+        if: matrix.suite == 'core' || matrix.suite == 'release-fixtures'
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Install uv
+        if: matrix.suite == 'core' || matrix.suite == 'release-fixtures'
         uses: astral-sh/setup-uv@v7
 
-      - name: Extract test fixtures
+      - name: Extract core fixtures
+        if: matrix.suite == 'core'
+        run: make extract-fixtures
+
+      - name: Extract release-test fixtures
+        if: matrix.suite == 'release-fixtures'
         run: make extract-all-fixtures
 
-      - name: Lib unit tests
-        run: cargo test --lib -p polyglot-sql
+      - name: Run Rust suite
+        run: make test-rust-ci-${{ matrix.suite }}
 
-      - name: Compile standalone Rust example
-        run: cargo check --manifest-path examples/rust/Cargo.toml
+      # Not named ffi-*: this is an internal same-run artifact, not a release archive.
+      - name: Upload FFI library for Go integration tests
+        if: matrix.suite == 'bindings'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-ci-ffi-linux-x86_64
+          path: target/ffi_release/libpolyglot_sql_ffi.so
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Compile performance benchmarks
-        run: cargo check -p polyglot-sql --benches
-
-      - name: WASM Rust unit tests
-        run: cargo test -p polyglot-sql-wasm --lib -- --nocapture
-
-      - name: FFI Rust tests
-        run: cargo test -p polyglot-sql-ffi -- --nocapture
-
-      - name: FFI release build
-        run: cargo build -p polyglot-sql-ffi --profile ffi_release
-
-      - name: Generic identity tests
-        run: cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture
-
-      - name: Dialect identity tests
-        run: cargo test --test sqlglot_dialect_identity test_sqlglot_dialect_identity_all -p polyglot-sql -- --nocapture
-
-      - name: Transpilation tests
-        run: cargo test --test sqlglot_transpilation test_sqlglot_transpilation_all -p polyglot-sql -- --nocapture
-
-      - name: Transpile generic tests
-        run: cargo test --test sqlglot_transpile test_sqlglot_transpile_all -p polyglot-sql -- --nocapture
-
-      - name: Parser tests
-        run: cargo test --test sqlglot_parser test_sqlglot_parser_all -p polyglot-sql -- --nocapture
-
-      - name: Pretty-print tests
-        run: RUST_MIN_STACK=16777216 cargo test --test sqlglot_pretty test_sqlglot_pretty_all -p polyglot-sql --release -- --nocapture
-
-      - name: Custom dialect tests
-        run: cargo test --test custom_dialect_tests -p polyglot-sql -- --nocapture
-
-      - name: ClickHouse parser tests
-        run: RUST_MIN_STACK=16777216 cargo test --test custom_clickhouse_parser -p polyglot-sql --release -- --nocapture
-
-      - name: ClickHouse coverage tests (report-only)
-        run: RUST_MIN_STACK=16777216 cargo test --test custom_clickhouse_coverage -p polyglot-sql --release -- --nocapture
-
-      - name: Feature-gate check (single dialect)
-        run: cargo check -p polyglot-sql --no-default-features --features dialect-clickhouse
-
-      - name: Feature-gate check (WASM single dialect)
-        run: cargo check -p polyglot-sql-wasm --no-default-features --features "console_error_panic_hook,dialect-clickhouse"
+  # Preserve the required check name and all existing downstream needs: rust-test.
+  rust-test:
+    if: always()
+    needs: [quality, rust-test-suite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Rust suite to pass
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          SUITES_RESULT: ${{ needs.rust-test-suite.result }}
+        run: |
+          if [[ "$QUALITY_RESULT" != success || "$SUITES_RESULT" != success ]]; then
+            echo "::error::Rust verification did not pass (quality=$QUALITY_RESULT, suites=$SUITES_RESULT)"
+            exit 1
+          fi
 
   python-fast-check:
     runs-on: ubuntu-latest
@@ -162,10 +156,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
@@ -178,8 +168,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: cd packages/go && POLYGLOT_GO_EXPECTED_VERSION="${GITHUB_REF_NAME#v}" go test ./...
 
-      - name: Build FFI for Go integration tests
-        run: cargo build -p polyglot-sql-ffi --profile ffi_release
+      - name: Download tested FFI build
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-ci-ffi-linux-x86_64
+          path: target/ffi_release/
 
       - name: Go SDK integration tests
         run: cd packages/go && POLYGLOT_SQL_FFI_PATH="../../target/ffi_release/libpolyglot_sql_ffi.so" go test ./...
