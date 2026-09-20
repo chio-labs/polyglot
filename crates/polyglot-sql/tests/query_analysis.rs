@@ -3270,3 +3270,22 @@ fn analyze_query_resolves_pivot_alias_columns_and_generated_outputs() {
         reference.table.as_deref() == Some("sales") && reference.column == "amt"
     }));
 }
+
+#[test]
+fn analyze_query_resolves_snowflake_dynamic_pivot_over_cte_without_recursion() {
+    let analysis = analyze_query(
+        "WITH pivot_input AS (\
+           SELECT customer_id, category, amount FROM staged_orders\
+         ) \
+         SELECT * FROM pivot_input \
+         PIVOT(MAX(amount) FOR category IN (ANY ORDER BY category))",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::Snowflake,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    assert!(!analysis.projections.is_empty());
+}
