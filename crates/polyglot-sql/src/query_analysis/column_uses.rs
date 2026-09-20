@@ -755,7 +755,25 @@ pub(super) fn collect_uncertain_occurrences(
     uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
 ) {
     let selected = selected_reference_scope(scope);
-    let mut resolver = Resolver::new(&selected, schema, false);
+    collect_uncertain_occurrences_in_selected_scope(&selected, schema, uncertain);
+    for child in scope
+        .cte_scopes
+        .iter()
+        .chain(&scope.derived_table_scopes)
+        .chain(&scope.subquery_scopes)
+        .chain(&scope.udtf_scopes)
+        .chain(&scope.union_scopes)
+    {
+        collect_uncertain_occurrences(child, schema, uncertain);
+    }
+}
+
+pub(super) fn collect_uncertain_occurrences_in_selected_scope(
+    selected: &Scope,
+    schema: &MappingSchema,
+    uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
+) {
+    let mut resolver = Resolver::new(selected, schema, false);
     let open: Vec<_> = selected
         .sources
         .keys()
@@ -789,6 +807,20 @@ pub(super) fn collect_uncertain_occurrences(
             }
         }
     }
+}
+
+pub(super) fn collect_uncertain_occurrences_with_selected_scopes(
+    scope: &Scope,
+    selected_scopes: &HashMap<*const Scope, Scope>,
+    schema: &MappingSchema,
+    uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
+) {
+    if let Some(selected) = selected_scopes.get(&(scope as *const Scope)) {
+        collect_uncertain_occurrences_in_selected_scope(selected, schema, uncertain);
+    } else {
+        let selected = selected_reference_scope(scope);
+        collect_uncertain_occurrences_in_selected_scope(&selected, schema, uncertain);
+    }
     for child in scope
         .cte_scopes
         .iter()
@@ -797,6 +829,11 @@ pub(super) fn collect_uncertain_occurrences(
         .chain(&scope.udtf_scopes)
         .chain(&scope.union_scopes)
     {
-        collect_uncertain_occurrences(child, schema, uncertain);
+        collect_uncertain_occurrences_with_selected_scopes(
+            child,
+            selected_scopes,
+            schema,
+            uncertain,
+        );
     }
 }
