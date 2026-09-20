@@ -2198,18 +2198,35 @@ fn attach_pivot_input_column(
                 .map(|identifier| identifier.name.as_str())
                 .unwrap_or(table.name.name.as_str());
             if scope.cte_sources.contains_key(table_name) {
-                resolve_qualified_column(
-                    node,
-                    context,
-                    scope_id,
-                    dialect,
-                    table_name,
-                    &col_ref.column,
-                    &node.name.clone(),
-                    trim_selects,
-                    all_cte_scopes,
-                    depth + 1,
-                );
+                let mut attached = false;
+                if let Some(child_scope_id) =
+                    find_child_scope_in(context, all_cte_scopes, scope_id, table_name)
+                {
+                    if let Ok(child) = to_node_inner(
+                        ColumnRef::Name(&col_ref.column),
+                        context,
+                        child_scope_id,
+                        dialect,
+                        &node.name.clone(),
+                        table_name,
+                        &node.name.clone(),
+                        trim_selects,
+                        all_cte_scopes,
+                        depth + 1,
+                    ) {
+                        node.downstream.push(child);
+                        attached = true;
+                    }
+                }
+                if !attached {
+                    if let Some(source_info) = scope.cte_sources.get(table_name) {
+                        node.downstream.push(make_table_column_node_from_source(
+                            table_name,
+                            &col_ref.column,
+                            source_info,
+                        ));
+                    }
+                }
             } else {
                 let mut source = ScopeSourceInfo::new(
                     Expression::Table(Box::new(table.as_ref().clone())),
