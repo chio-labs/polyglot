@@ -1205,6 +1205,45 @@ fn analyze_query_for_project_projections_omits_unconsumed_fact_graphs() {
 }
 
 #[test]
+fn analyze_query_for_project_projections_preserves_complete_single_source_confidence() {
+    let options = AnalyzeQueryOptions {
+        complexity_guard: None,
+        dialect: DialectType::DuckDB,
+        schema: Some(
+            serde_json::from_value(json!({
+                "tables": [{
+                    "name": "orders",
+                    "columns": [
+                        {"name": "order_id", "type": "BIGINT", "nullable": false},
+                        {"name": "amount", "type": "DOUBLE", "nullable": true}
+                    ]
+                }]
+            }))
+            .unwrap(),
+        ),
+    };
+    let resolved = analyze_query_for_project_projections(
+        "SELECT order_id, CAST(amount AS DOUBLE) AS amount FROM orders",
+        options.clone(),
+    )
+    .unwrap();
+    let missing =
+        analyze_query_for_project_projections("SELECT missing_column FROM orders", options)
+            .unwrap();
+
+    assert!(resolved.projections.iter().all(|projection| {
+        projection
+            .upstream
+            .iter()
+            .all(|reference| reference.confidence == ReferenceConfidence::Resolved)
+    }));
+    assert_eq!(
+        missing.projections[0].upstream[0].confidence,
+        ReferenceConfidence::Unknown
+    );
+}
+
+#[test]
 fn analyze_query_for_project_projections_retains_root_star_presence() {
     let analysis = analyze_query_for_project_projections(
         "SELECT * FROM orders",

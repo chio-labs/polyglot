@@ -372,11 +372,13 @@ fn analyze_query_inner(
     let original_scope = original_expression.as_ref().map(build_scope);
     let empty_schema = MappingSchema::with_dialect(options.dialect);
     let mut uncertain_columns = HashMap::new();
-    column_uses::collect_uncertain_occurrences(
-        original_scope.as_ref().unwrap_or(&scope),
-        mapping_schema.as_ref().unwrap_or(&empty_schema),
-        &mut uncertain_columns,
-    );
+    if !can_skip_uncertain_occurrences(mode, &scope, options.schema.as_ref()) {
+        column_uses::collect_uncertain_occurrences(
+            original_scope.as_ref().unwrap_or(&scope),
+            mapping_schema.as_ref().unwrap_or(&empty_schema),
+            &mut uncertain_columns,
+        );
+    }
     let nullability_context = NullabilityContext::new(
         &scope,
         schema_info.as_ref(),
@@ -441,6 +443,69 @@ fn analyze_query_inner(
             Vec::new()
         },
     })
+}
+
+fn can_skip_uncertain_occurrences(
+    mode: QueryAnalysisMode,
+    scope: &Scope,
+    schema: Option<&ValidationSchema>,
+) -> bool {
+    if mode != QueryAnalysisMode::ProjectProjections
+        || scope.sources.len() != 1
+        || !scope
+            .sources
+            .values()
+            .all(|source| source.kind == SourceKind::Table)
+        || !scope.lateral_sources.is_empty()
+        || !scope.cte_sources.is_empty()
+        || !scope.subquery_scopes.is_empty()
+        || !scope.derived_table_scopes.is_empty()
+        || !scope.cte_scopes.is_empty()
+        || !scope.udtf_scopes.is_empty()
+        || !scope.union_scopes.is_empty()
+    {
+        return false;
+    }
+    let Some(schema) = schema else {
+        return false;
+    };
+    if schema.tables.len() != 1 || schema.tables[0].columns.is_empty() {
+        return false;
+    }
+    let schema_table = &schema.tables[0];
+    let Some(source) = scope.sources.values().next() else {
+        return false;
+    };
+    let Expression::Table(source_table) = &source.expression else {
+        return false;
+    };
+    let source_name_matches = source_table
+        .name
+        .name
+        .eq_ignore_ascii_case(&schema_table.name)
+        || schema_table
+            .aliases
+            .iter()
+            .any(|alias| source_table.name.name.eq_ignore_ascii_case(alias));
+    let source_schema_matches = source_table.schema.as_ref().is_none_or(|source_schema| {
+        schema_table
+            .schema
+            .as_ref()
+            .is_some_and(|schema| source_schema.name.eq_ignore_ascii_case(schema))
+    });
+    if !source_name_matches || !source_schema_matches {
+        return false;
+    }
+    let known_columns: HashSet<&str> = schema_table
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    !known_columns.contains("*")
+        && scope.expression.dfs().all(|expression| match expression {
+            Expression::Column(column) => known_columns.contains(column.name.name.as_str()),
+            _ => true,
+        })
 }
 
 fn analysis_mapping_schema(schema: &ValidationSchema, dialect: DialectType) -> MappingSchema {
