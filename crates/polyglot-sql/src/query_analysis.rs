@@ -294,7 +294,6 @@ fn analyze_query_inner(
     options: AnalyzeQueryOptions,
     mode: QueryAnalysisMode,
 ) -> Result<QueryAnalysis> {
-    let include_cte_projections = mode != QueryAnalysisMode::Default;
     let include_extended_facts = mode != QueryAnalysisMode::ProjectProjections;
     let mut expression = parse_one_with_options(
         sql,
@@ -306,6 +305,7 @@ fn analyze_query_inner(
     expression = effective_query(expression);
     ensure_query(&expression)?;
     expression = crate::binding::bind_lambdas(expression, options.dialect);
+    let include_cte_projections = mode != QueryAnalysisMode::Default;
     let has_root_star = select_expressions_for_query(&expression)
         .iter()
         .any(|projection| projection_is_star(unwrap_projection_alias(projection)));
@@ -320,6 +320,7 @@ fn analyze_query_inner(
         original_expression.as_ref().unwrap_or(&expression),
         options.dialect,
         options.complexity_guard,
+        mode != QueryAnalysisMode::ProjectProjections,
     )?;
     let star_projections = if include_extended_facts {
         star_projection_facts(
@@ -520,6 +521,7 @@ impl AnalysisSchemaInfo {
 struct NullabilityContext<'a> {
     lineage: RefCell<HashMap<*const Scope, ScopedLineage<'a>>>,
     terminal_lineage: RefCell<HashMap<(*const Scope, String, String), Vec<ColumnReferenceFact>>>,
+    schema_columns: RefCell<HashMap<String, HashSet<String>>>,
     schema: Option<&'a AnalysisSchemaInfo>,
     mapping_schema: Option<&'a MappingSchema>,
     empty_schema: MappingSchema,
@@ -552,6 +554,7 @@ impl<'a> NullabilityContext<'a> {
         let mut context = Self {
             lineage: RefCell::new(HashMap::new()),
             terminal_lineage: RefCell::new(HashMap::new()),
+            schema_columns: RefCell::new(HashMap::new()),
             schema,
             mapping_schema,
             empty_schema: MappingSchema::with_dialect(dialect),
@@ -634,6 +637,7 @@ fn top_level_cte_facts(
     expression: &Expression,
     dialect: DialectType,
     guard: Option<ComplexityGuardOptions>,
+    include_rendered_facts: bool,
 ) -> Result<Vec<CteFact>> {
     let Some(with_clause) = with_clause(expression) else {
         return Ok(Vec::new());
@@ -650,8 +654,16 @@ fn top_level_cte_facts(
                     .iter()
                     .map(|column| column.name.clone())
                     .collect(),
-                body_sql: Dialect::get(dialect).generate_with_guard(&cte.this, guard)?,
-                output_columns: get_output_column_names_for_dialect(&cte.this, Some(dialect)),
+                body_sql: if include_rendered_facts {
+                    Dialect::get(dialect).generate_with_guard(&cte.this, guard)?
+                } else {
+                    String::new()
+                },
+                output_columns: if include_rendered_facts {
+                    get_output_column_names_for_dialect(&cte.this, Some(dialect))
+                } else {
+                    Vec::new()
+                },
                 shape: None,
                 projections: Vec::new(),
             })
@@ -1219,7 +1231,13 @@ fn projection_facts_for_query<'a>(
 ) -> Vec<ProjectionFact> {
     let expressions = projection_sources_for_query(expression, dialect);
     let names = get_output_column_names_for_dialect(expression, Some(dialect));
-    let cached_aliases = cached_lineage_output_aliases(expression, expressions.len(), dialect);
+    let cached_lineage = cached_lineage_context(
+        expression,
+        expressions.len(),
+        dialect,
+        scope,
+        nullability_context,
+    );
 
     expressions
         .iter()
@@ -1236,7 +1254,7 @@ fn projection_facts_for_query<'a>(
                 scope,
                 dialect,
                 nullability_context,
-                cached_aliases.as_ref(),
+                cached_lineage.as_ref(),
             );
             if *null_padded {
                 fact.nullability = ProjectionNullability::Nullable;
@@ -1389,13 +1407,13 @@ fn projection_fact<'a>(
     scope: &'a Scope,
     dialect: DialectType,
     nullability_context: &NullabilityContext<'a>,
-    cached_aliases: Option<&HashSet<String>>,
+    cached_lineage: Option<&CachedLineageContext>,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
-    let mut upstream = if cached_aliases.is_some_and(|aliases| {
-        expression_supports_cached_column_lineage(inner, scope, nullability_context, aliases)
-    }) {
+    let mut upstream = if cached_lineage
+        .is_some_and(|cached| expression_supports_cached_column_lineage(inner, cached))
+    {
         cached_terminal_references_for_expression(inner, scope, dialect, nullability_context)
     } else {
         let mut lineage = nullability_context.lineage.borrow_mut();
@@ -1423,24 +1441,11 @@ fn projection_fact<'a>(
             reference.confidence = confidence;
         }
     }
-    if let Some(schema) = nullability_context.mapping_schema {
+    if nullability_context.mapping_schema.is_some() {
         for reference in &mut upstream {
             if let Some(table) = &reference.table {
-                if let Ok(columns) = schema.column_names(table) {
-                    if !columns.is_empty()
-                        && !columns.iter().any(|column| {
-                            column == "*"
-                                || crate::schema::normalize_name(column, Some(dialect), false, true)
-                                    == crate::schema::normalize_name(
-                                        &reference.column,
-                                        Some(dialect),
-                                        false,
-                                        true,
-                                    )
-                        })
-                    {
-                        reference.confidence = ReferenceConfidence::Unknown;
-                    }
+                if !schema_contains_column(nullability_context, table, &reference.column) {
+                    reference.confidence = ReferenceConfidence::Unknown;
                 }
             }
         }
@@ -1484,37 +1489,85 @@ fn projection_fact<'a>(
     }
 }
 
-fn cached_lineage_output_aliases(
+fn schema_contains_column(context: &NullabilityContext<'_>, table: &str, column: &str) -> bool {
+    let normalized_column =
+        crate::schema::normalize_name(column, Some(context.dialect), false, true);
+    if let Some(columns) = context.schema_columns.borrow().get(table) {
+        return columns.is_empty() || columns.contains("*") || columns.contains(&normalized_column);
+    }
+    let columns: HashSet<String> = context
+        .mapping_schema
+        .and_then(|schema| schema.column_names(table).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| crate::schema::normalize_name(&name, Some(context.dialect), false, true))
+        .collect();
+    let contains =
+        columns.is_empty() || columns.contains("*") || columns.contains(&normalized_column);
+    context
+        .schema_columns
+        .borrow_mut()
+        .insert(table.to_string(), columns);
+    contains
+}
+
+struct CachedLineageContext {
+    dialect: DialectType,
+    output_aliases: HashSet<String>,
+    source_name: String,
+    source_alias: Option<String>,
+    source_columns_exact: HashSet<String>,
+    source_columns_folded: HashSet<String>,
+}
+
+fn cached_lineage_context(
     query: &Expression,
     output_count: usize,
     dialect: DialectType,
-) -> Option<HashSet<String>> {
+    scope: &Scope,
+    context: &NullabilityContext<'_>,
+) -> Option<CachedLineageContext> {
     if output_count <= WIDE_PROJECTION_LINEAGE_CACHE_THRESHOLD {
         return None;
     }
     let Expression::Select(select) = unwrap_query_annotations(query) else {
         return None;
     };
-    Some(
-        select
-            .expressions
-            .iter()
-            .filter_map(|expression| match expression {
-                Expression::Alias(alias) => Some(crate::set_operation::identifier_key(
-                    &alias.alias,
-                    Some(dialect),
-                )),
-                _ => None,
-            })
+    let output_aliases = select
+        .expressions
+        .iter()
+        .filter_map(|expression| match expression {
+            Expression::Alias(alias) => Some(crate::set_operation::identifier_key(
+                &alias.alias,
+                Some(dialect),
+            )),
+            _ => None,
+        })
+        .collect();
+    let scope_id = context.scope_ids.get(&(scope as *const Scope))?;
+    let selected = &context.scopes[*scope_id].selected;
+    let mut sources = selected.sources.iter();
+    let (source_name, source) = sources.next()?;
+    if sources.next().is_some() {
+        return None;
+    }
+    let source_columns = source_columns(source, context.mapping_schema, context.dialect);
+    Some(CachedLineageContext {
+        dialect,
+        output_aliases,
+        source_name: source_name.clone(),
+        source_alias: source.alias.clone(),
+        source_columns_exact: source_columns.iter().cloned().collect(),
+        source_columns_folded: source_columns
+            .into_iter()
+            .map(|column| column.to_ascii_lowercase())
             .collect(),
-    )
+    })
 }
 
 fn expression_supports_cached_column_lineage(
     expression: &Expression,
-    scope: &Scope,
-    context: &NullabilityContext<'_>,
-    output_aliases: &HashSet<String>,
+    context: &CachedLineageContext,
 ) -> bool {
     if expression
         .dfs()
@@ -1522,17 +1575,6 @@ fn expression_supports_cached_column_lineage(
     {
         return false;
     }
-    let Some(scope_id) = context.scope_ids.get(&(scope as *const Scope)) else {
-        return false;
-    };
-    let selected = &context.scopes[*scope_id].selected;
-    let Some((source_name, source)) = selected.sources.iter().next() else {
-        return false;
-    };
-    if selected.sources.len() != 1 {
-        return false;
-    }
-    let source_columns = source_columns(source, context.mapping_schema, context.dialect);
     !expression
         .find_all(|candidate| matches!(candidate, Expression::Column(_)))
         .into_iter()
@@ -1540,25 +1582,25 @@ fn expression_supports_cached_column_lineage(
             Expression::Column(column) => {
                 if let Some(table) = &column.table {
                     let matches = if table.quoted {
-                        table.name == *source_name
+                        table.name == context.source_name
                     } else {
-                        table.name.eq_ignore_ascii_case(source_name)
-                            || source
-                                .alias
+                        table.name.eq_ignore_ascii_case(&context.source_name)
+                            || context
+                                .source_alias
                                 .as_deref()
                                 .is_some_and(|alias| alias.eq_ignore_ascii_case(&table.name))
                     };
                     return !matches;
                 }
                 let key = crate::set_operation::identifier_key(&column.name, Some(context.dialect));
-                output_aliases.contains(&key)
-                    && !source_columns.iter().any(|candidate| {
-                        if column.name.quoted {
-                            candidate == &column.name.name
-                        } else {
-                            candidate.eq_ignore_ascii_case(&column.name.name)
-                        }
-                    })
+                context.output_aliases.contains(&key)
+                    && if column.name.quoted {
+                        !context.source_columns_exact.contains(&column.name.name)
+                    } else {
+                        !context
+                            .source_columns_folded
+                            .contains(&column.name.name.to_ascii_lowercase())
+                    }
             }
             _ => false,
         })
