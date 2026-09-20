@@ -274,6 +274,7 @@ impl<'a> Resolver<'a> {
             Expression::Unnest(unnest) => unnest_output_columns(unnest),
             Expression::Lateral(lateral) => lateral_output_columns(lateral),
             Expression::LateralView(lateral_view) => lateral_view_output_columns(lateral_view),
+            Expression::Values(values) => values_output_columns(values),
             Expression::Paren(paren) => self.get_source_columns_for_expression(&paren.this)?,
             _ => Vec::new(),
         };
@@ -635,6 +636,21 @@ impl<'a> Resolver<'a> {
             None
         }
     }
+}
+
+fn values_output_columns(values: &crate::expressions::Values) -> Vec<String> {
+    if !values.column_aliases.is_empty() {
+        return values
+            .column_aliases
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+    }
+    let width = values
+        .expressions
+        .first()
+        .map_or(0, |row| row.expressions.len());
+    (1..=width).map(|index| format!("column{index}")).collect()
 }
 
 fn normalize_column_name(name: &str, dialect: Option<DialectType>) -> String {

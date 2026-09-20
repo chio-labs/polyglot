@@ -824,11 +824,29 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
 
-            let mut derived_scope = scope.branch(subquery.this.clone(), ScopeType::DerivedTable);
+            let scope_type = if subquery.lateral {
+                ScopeType::Udtf
+            } else {
+                ScopeType::DerivedTable
+            };
+            let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
             build_scope_impl(&subquery.this, &mut derived_scope);
 
-            scope.add_source(name.clone(), expr.clone(), true);
-            scope.derived_table_scopes.push(derived_scope);
+            if subquery.lateral {
+                scope.add_lateral_source(name, expr.clone(), true);
+                scope.udtf_scopes.push(derived_scope);
+            } else {
+                scope.add_source(name, expr.clone(), true);
+                scope.derived_table_scopes.push(derived_scope);
+            }
+        }
+        Expression::Values(values) => {
+            let name = values
+                .alias
+                .as_ref()
+                .map(|alias| alias.name.clone())
+                .unwrap_or_else(|| scope.next_virtual_source_name());
+            scope.add_virtual_source(name, expr.clone());
         }
         Expression::Unnest(unnest) => {
             if let Some(alias) = &unnest.alias {
