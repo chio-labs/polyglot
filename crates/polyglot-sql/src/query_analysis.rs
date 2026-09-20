@@ -431,7 +431,7 @@ impl AnalysisSchemaInfo {
 }
 
 struct NullabilityContext<'a> {
-    lineage: RefCell<HashMap<*const Scope, ScopedLineage>>,
+    lineage: RefCell<HashMap<*const Scope, ScopedLineage<'a>>>,
     schema: Option<&'a AnalysisSchemaInfo>,
     mapping_schema: Option<&'a MappingSchema>,
     empty_schema: MappingSchema,
@@ -859,11 +859,11 @@ fn with_clause(expression: &Expression) -> Option<&With> {
     }
 }
 
-fn projection_facts_for_query(
+fn projection_facts_for_query<'a>(
     expression: &Expression,
-    scope: &Scope,
+    scope: &'a Scope,
     dialect: DialectType,
-    nullability_context: &NullabilityContext<'_>,
+    nullability_context: &NullabilityContext<'a>,
 ) -> Vec<ProjectionFact> {
     let expressions = projection_sources_for_query(expression, dialect);
     let names = get_output_column_names_for_dialect(expression, Some(dialect));
@@ -1019,21 +1019,21 @@ fn select_expressions_for_query(expression: &Expression) -> Vec<&Expression> {
     }
 }
 
-fn projection_fact(
+fn projection_fact<'a>(
     index: usize,
     name: Option<String>,
     projection: &Expression,
     _query: &Expression,
-    scope: &Scope,
+    scope: &'a Scope,
     dialect: DialectType,
-    nullability_context: &NullabilityContext<'_>,
+    nullability_context: &NullabilityContext<'a>,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
     let mut lineage = nullability_context.lineage.borrow_mut();
     let prepared = lineage
         .entry(scope as *const Scope)
-        .or_insert_with(|| ScopedLineage::new(scope.clone(), &[], dialect));
+        .or_insert_with(|| ScopedLineage::new(scope, &[], dialect));
     let mut upstream = prepared
         .output(index)
         .map(|node| {
@@ -2037,22 +2037,22 @@ fn table_identity(table: &TableRef) -> RelationIdentity {
     }
 }
 
-fn set_operation_facts(
+fn set_operation_facts<'a>(
     expression: &Expression,
-    scope: &Scope,
+    scope: &'a Scope,
     dialect: DialectType,
-    nullability: &NullabilityContext<'_>,
+    nullability: &NullabilityContext<'a>,
 ) -> Vec<SetOperationFact> {
     let mut facts = Vec::new();
     collect_set_operation_facts(expression, scope, dialect, nullability, &mut facts);
     facts
 }
 
-fn collect_set_operation_facts(
+fn collect_set_operation_facts<'a>(
     expression: &Expression,
-    scope: &Scope,
+    scope: &'a Scope,
     dialect: DialectType,
-    nullability: &NullabilityContext<'_>,
+    nullability: &NullabilityContext<'a>,
     facts: &mut Vec<SetOperationFact>,
 ) {
     match expression {
@@ -2153,13 +2153,13 @@ fn collect_set_operation_facts(
     }
 }
 
-fn set_operation_branches(
+fn set_operation_branches<'a>(
     left: &Expression,
     right: &Expression,
-    scope: &Scope,
+    scope: &'a Scope,
     dialect: DialectType,
     right_role: SetOperationBranchRole,
-    nullability: &NullabilityContext<'_>,
+    nullability: &NullabilityContext<'a>,
 ) -> Vec<SetOperationBranchFact> {
     vec![
         SetOperationBranchFact {

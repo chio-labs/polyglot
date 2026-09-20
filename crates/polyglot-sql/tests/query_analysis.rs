@@ -328,6 +328,35 @@ fn analyze_query_column_uses_cover_windows_qualify_and_aggregate_filters() {
 }
 
 #[test]
+fn analyze_query_column_uses_resolve_unused_named_window_definitions() {
+    use polyglot_sql::ColumnUseContext;
+    let analysis = column_use_analysis(
+        "SELECT o.id FROM orders o WINDOW w AS (PARTITION BY o.customer_id)",
+        true,
+    );
+    let partition = analysis
+        .column_uses
+        .iter()
+        .find(|fact| fact.context == ColumnUseContext::WindowPartition)
+        .unwrap();
+
+    assert_eq!(partition.references.len(), 1);
+    assert_eq!(
+        partition.references[0].reference.source_kind,
+        SourceKind::Table
+    );
+    assert_eq!(
+        partition.references[0].reference.confidence,
+        ReferenceConfidence::Resolved
+    );
+    assert_eq!(
+        partition.references[0].reference.table.as_deref(),
+        Some("orders")
+    );
+    assert_eq!(partition.references[0].reference.column, "customer_id");
+}
+
+#[test]
 fn analyze_query_column_uses_resolve_chained_ctes_and_correlated_scopes() {
     use polyglot_sql::ColumnUseContext;
     let sql = "WITH base AS (SELECT id, amount FROM orders), paid AS (SELECT id, amount * 2 AS amount FROM base WHERE amount > 0) SELECT p.id FROM paid p WHERE p.amount > 10 AND EXISTS (SELECT 1 FROM customers c WHERE c.id = p.id)";
@@ -1214,6 +1243,63 @@ fn analyze_query_reports_set_operations() {
             ]
         );
     }
+}
+
+#[test]
+fn analyze_query_bounds_wide_set_operation_cte_lineage() {
+    let branches = (0..16)
+        .map(|branch| {
+            format!(
+                "SELECT {} AS bucket, {} AS offset_seconds, CAST({} AS DOUBLE) AS adjustment",
+                branch % 5 + 1,
+                branch * 10,
+                branch % 13
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let metrics = (0..32)
+        .map(|metric| {
+            format!(
+                ", CAST(MAX(CASE WHEN bucket = {} AND offset_seconds = {} THEN amount + adjustment END) AS DOUBLE) AS metric_{metric:04}",
+                metric % 5 + 1,
+                metric * 10,
+            )
+        })
+        .collect::<String>();
+    let sql = format!(
+        "WITH offset_grid AS ({branches}), measurements AS (\
+         SELECT source.id, source.amount, 'active' AS status, grid.bucket, \
+         grid.offset_seconds, grid.adjustment FROM orders AS source \
+         CROSS JOIN offset_grid AS grid) \
+         SELECT CAST(MAX(id) AS INT) AS id, \
+         CAST(MAX(amount) AS DOUBLE) AS amount, MAX(status) AS status{metrics} \
+         FROM measurements"
+    );
+
+    let analysis = analyze_query(
+        &sql,
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.projections.len(), 35);
+    assert_eq!(analysis.cte_facts.len(), 2);
+    assert!(analysis
+        .base_tables
+        .iter()
+        .any(|relation| relation.name == "orders"));
+    assert!(analysis.column_uses.is_empty());
+    assert!(analysis.projections[3..].iter().all(|projection| {
+        projection
+            .upstream
+            .iter()
+            .any(|reference| reference.column == "amount")
+    }));
 }
 
 #[test]
