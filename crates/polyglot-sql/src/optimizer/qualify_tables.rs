@@ -239,6 +239,10 @@ fn reserve_anonymous_virtual_source_names(select: &Select, names: &mut HashSet<S
 fn virtual_source_kind(expression: &Expression) -> (bool, bool) {
     match expression {
         Expression::Values(values) => (true, values.alias.is_none()),
+        Expression::Subquery(subquery) => {
+            let (is_virtual, is_anonymous) = virtual_source_kind(&subquery.this);
+            (is_virtual, is_anonymous && subquery.alias.is_none())
+        }
         Expression::Unnest(unnest) => (unnest.alias.is_some(), false),
         Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => (true, false),
         Expression::Lateral(lateral) => (lateral.alias.is_some(), false),
