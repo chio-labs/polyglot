@@ -22,6 +22,8 @@ use std::collections::{HashMap, HashSet};
 
 mod column_uses;
 
+const WIDE_PROJECTION_LINEAGE_CACHE_THRESHOLD: usize = 64;
+
 /// Options for [`analyze_query`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -125,6 +127,10 @@ pub struct ProjectionFact {
     pub type_hint: Option<String>,
     pub nullability: ProjectionNullability,
     pub upstream: Vec<ColumnReferenceFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_column: Option<String>,
 }
 
 /// Compact fact about a function-like projection transform.
@@ -144,6 +150,10 @@ pub struct CteFact {
     pub columns: Vec<String>,
     pub body_sql: String,
     pub output_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<QueryShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projections: Vec<ProjectionFact>,
 }
 
 /// Compact fact about one original star projection.
@@ -241,6 +251,22 @@ pub enum ProjectionNullability {
 
 /// Analyze a single SELECT or set-operation query.
 pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAnalysis> {
+    analyze_query_inner(sql, options, false)
+}
+
+/// Analyze a query and include output facts for each top-level CTE.
+pub fn analyze_query_with_cte_projections(
+    sql: &str,
+    options: AnalyzeQueryOptions,
+) -> Result<QueryAnalysis> {
+    analyze_query_inner(sql, options, true)
+}
+
+fn analyze_query_inner(
+    sql: &str,
+    options: AnalyzeQueryOptions,
+    include_cte_projections: bool,
+) -> Result<QueryAnalysis> {
     let mut expression = parse_one_with_options(
         sql,
         options.dialect,
@@ -258,7 +284,7 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         .as_ref()
         .map(|schema| analysis_mapping_schema(schema, options.dialect));
     let schema_info = options.schema.as_ref().map(AnalysisSchemaInfo::from_schema);
-    let cte_facts = top_level_cte_facts(
+    let mut cte_facts = top_level_cte_facts(
         &original_expression,
         options.dialect,
         options.complexity_guard,
@@ -324,26 +350,32 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     } else {
         QueryShape::Select
     };
+    let mut projections =
+        projection_facts_for_query(&expression, &scope, options.dialect, &nullability_context);
+    if include_cte_projections {
+        enrich_projection_passthrough_sources(&scope, &mut projections);
+        refine_filtered_projection_nullability(&expression, &mut projections);
+    }
+    let set_operations =
+        set_operation_facts(&expression, &scope, options.dialect, &nullability_context);
+    if include_cte_projections {
+        enrich_cte_facts(
+            &mut cte_facts,
+            &scope,
+            options.dialect,
+            &nullability_context,
+        );
+    }
 
     Ok(QueryAnalysis {
         shape,
         ctes: collect_cte_names(&expression),
         cte_facts,
-        projections: projection_facts_for_query(
-            &expression,
-            &scope,
-            options.dialect,
-            &nullability_context,
-        ),
+        projections,
         relations: relation_facts(&scope, mapping_schema.as_ref(), options.dialect),
         base_tables: base_table_facts(&scope, mapping_schema.as_ref(), options.dialect),
         star_projections,
-        set_operations: set_operation_facts(
-            &expression,
-            &scope,
-            options.dialect,
-            &nullability_context,
-        ),
+        set_operations,
         column_uses: column_uses::collect(
             &original_scope,
             &scope,
@@ -432,6 +464,7 @@ impl AnalysisSchemaInfo {
 
 struct NullabilityContext<'a> {
     lineage: RefCell<HashMap<*const Scope, ScopedLineage<'a>>>,
+    terminal_lineage: RefCell<HashMap<(*const Scope, String, String), Vec<ColumnReferenceFact>>>,
     schema: Option<&'a AnalysisSchemaInfo>,
     mapping_schema: Option<&'a MappingSchema>,
     empty_schema: MappingSchema,
@@ -463,6 +496,7 @@ impl<'a> NullabilityContext<'a> {
     ) -> Self {
         let mut context = Self {
             lineage: RefCell::new(HashMap::new()),
+            terminal_lineage: RefCell::new(HashMap::new()),
             schema,
             mapping_schema,
             empty_schema: MappingSchema::with_dialect(dialect),
@@ -563,9 +597,201 @@ fn top_level_cte_facts(
                     .collect(),
                 body_sql: Dialect::get(dialect).generate_with_guard(&cte.this, guard)?,
                 output_columns: get_output_column_names_for_dialect(&cte.this, Some(dialect)),
+                shape: None,
+                projections: Vec::new(),
             })
         })
         .collect()
+}
+
+fn enrich_cte_facts<'a>(
+    facts: &mut [CteFact],
+    scope: &'a Scope,
+    dialect: DialectType,
+    nullability_context: &NullabilityContext<'a>,
+) {
+    let scopes_by_name: HashMap<&str, &Scope> = scope
+        .cte_scopes
+        .iter()
+        .filter_map(|cte_scope| match &cte_scope.expression {
+            Expression::Cte(cte) => Some((cte.alias.name.as_str(), cte_scope)),
+            _ => None,
+        })
+        .collect();
+    for fact in facts {
+        let Some(cte_scope) = scopes_by_name.get(fact.name.as_str()).copied() else {
+            continue;
+        };
+        let query = crate::scope::scope_query(&cte_scope.expression);
+        fact.shape = Some(if is_set_operation(query) {
+            QueryShape::SetOperation
+        } else {
+            QueryShape::Select
+        });
+        fact.projections =
+            projection_facts_for_query(query, cte_scope, dialect, nullability_context);
+        enrich_projection_passthrough_sources(cte_scope, &mut fact.projections);
+        refine_filtered_projection_nullability(query, &mut fact.projections);
+        for (projection, alias) in fact.projections.iter_mut().zip(&fact.columns) {
+            projection.name = Some(alias.clone());
+        }
+    }
+}
+
+fn enrich_projection_passthrough_sources(scope: &Scope, projections: &mut [ProjectionFact]) {
+    let Some(projection_scope) = representative_projection_scope(scope) else {
+        return;
+    };
+    let selected = crate::scope::selected_reference_scope(projection_scope);
+    let query = crate::scope::scope_query(&projection_scope.expression);
+    let Expression::Select(select) = query else {
+        return;
+    };
+    for projection in projections {
+        let Some(column) = select
+            .expressions
+            .get(projection.index)
+            .and_then(direct_projected_column)
+        else {
+            continue;
+        };
+        let source = match &column.table {
+            Some(table) if table.quoted => selected.sources.get_key_value(&table.name),
+            Some(table) => selected
+                .sources
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&table.name))
+                .map(|(name, source)| (name, source)),
+            None if selected.sources.len() == 1 => selected.sources.iter().next(),
+            None => None,
+        };
+        let Some((source_name, source)) =
+            source.filter(|(_, source)| source.kind == SourceKind::Cte)
+        else {
+            continue;
+        };
+        projection.passthrough_source = source
+            .lineage_name
+            .clone()
+            .or_else(|| Some(source_name.clone()));
+        projection.passthrough_column = Some(column.name.name.clone());
+    }
+}
+
+fn representative_projection_scope(scope: &Scope) -> Option<&Scope> {
+    match crate::scope::scope_query(&scope.expression) {
+        Expression::Select(_) => Some(scope),
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => scope
+            .union_scopes
+            .first()
+            .and_then(representative_projection_scope),
+        _ => None,
+    }
+}
+
+fn refine_filtered_projection_nullability(
+    expression: &Expression,
+    projections: &mut [ProjectionFact],
+) {
+    let Expression::Select(select) = crate::scope::scope_query(expression) else {
+        return;
+    };
+    let Some(where_clause) = &select.where_clause else {
+        return;
+    };
+    let mut filtered_columns = Vec::new();
+    collect_non_null_conjunct_columns(&where_clause.this, &mut filtered_columns);
+    if filtered_columns.is_empty() {
+        return;
+    }
+    for projection in projections {
+        let projected_column = select
+            .expressions
+            .get(projection.index)
+            .and_then(direct_projected_column);
+        if projected_column.is_some_and(|projected| {
+            filtered_columns
+                .iter()
+                .any(|filtered| columns_identical_in_scope(projected, filtered))
+        }) {
+            projection.nullability = ProjectionNullability::NonNull;
+        }
+    }
+}
+
+fn collect_non_null_conjunct_columns<'a>(
+    expression: &'a Expression,
+    columns: &mut Vec<&'a crate::expressions::Column>,
+) {
+    match expression {
+        Expression::Paren(paren) => collect_non_null_conjunct_columns(&paren.this, columns),
+        Expression::And(and) => {
+            collect_non_null_conjunct_columns(&and.left, columns);
+            collect_non_null_conjunct_columns(&and.right, columns);
+        }
+        Expression::IsNull(is_null) if is_null.not => {
+            if let Some(column) = direct_filter_column(&is_null.this) {
+                columns.push(column);
+            }
+        }
+        Expression::Not(not) => {
+            if let Expression::IsNull(is_null) = unwrap_parentheses(&not.this) {
+                if !is_null.not {
+                    if let Some(column) = direct_filter_column(&is_null.this) {
+                        columns.push(column);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn direct_filter_column(expression: &Expression) -> Option<&crate::expressions::Column> {
+    match unwrap_parentheses(expression) {
+        Expression::Column(column) => Some(column),
+        _ => None,
+    }
+}
+
+fn direct_projected_column(expression: &Expression) -> Option<&crate::expressions::Column> {
+    match unwrap_parentheses(expression) {
+        Expression::Alias(alias) => direct_projected_column(&alias.this),
+        Expression::Column(column) => Some(column),
+        _ => None,
+    }
+}
+
+fn unwrap_parentheses(mut expression: &Expression) -> &Expression {
+    while let Expression::Paren(paren) = expression {
+        expression = &paren.this;
+    }
+    expression
+}
+
+fn columns_identical_in_scope(
+    projected: &crate::expressions::Column,
+    filtered: &crate::expressions::Column,
+) -> bool {
+    if !identifiers_match(&projected.name, &filtered.name) {
+        return false;
+    }
+    match (&projected.table, &filtered.table) {
+        (Some(left), Some(right)) => identifiers_match(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn identifiers_match(
+    left: &crate::expressions::Identifier,
+    right: &crate::expressions::Identifier,
+) -> bool {
+    match (left.quoted, right.quoted) {
+        (false, false) => left.name.eq_ignore_ascii_case(&right.name),
+        (true, true) => left.name == right.name,
+        _ => false,
+    }
 }
 
 fn star_projection_facts(
@@ -867,6 +1093,7 @@ fn projection_facts_for_query<'a>(
 ) -> Vec<ProjectionFact> {
     let expressions = projection_sources_for_query(expression, dialect);
     let names = get_output_column_names_for_dialect(expression, Some(dialect));
+    let reuse_column_lineage = expressions.len() > WIDE_PROJECTION_LINEAGE_CACHE_THRESHOLD;
 
     expressions
         .iter()
@@ -883,6 +1110,7 @@ fn projection_facts_for_query<'a>(
                 scope,
                 dialect,
                 nullability_context,
+                reuse_column_lineage,
             );
             if *null_padded {
                 fact.nullability = ProjectionNullability::Nullable;
@@ -1027,28 +1255,35 @@ fn projection_fact<'a>(
     scope: &'a Scope,
     dialect: DialectType,
     nullability_context: &NullabilityContext<'a>,
+    reuse_column_lineage: bool,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
-    let mut lineage = nullability_context.lineage.borrow_mut();
-    let prepared = lineage
-        .entry(scope as *const Scope)
-        .or_insert_with(|| ScopedLineage::new(scope, &[], dialect));
-    let mut upstream = prepared
-        .output(index)
-        .map(|node| {
-            let uncertain = lineage_uncertainty(&node, nullability_context.uncertain_columns);
-            let mut references = terminal_references_from_lineage(&node);
-            if let Some(confidence) = uncertain {
-                for reference in &mut references {
-                    reference.confidence = confidence;
+    let mut upstream = if reuse_column_lineage
+        && expression_supports_cached_column_lineage(inner, scope, nullability_context)
+    {
+        cached_terminal_references_for_expression(inner, scope, dialect, nullability_context)
+    } else {
+        let mut lineage = nullability_context.lineage.borrow_mut();
+        let prepared = lineage
+            .entry(scope as *const Scope)
+            .or_insert_with(|| ScopedLineage::new(scope, &[], dialect));
+        prepared
+            .output(index)
+            .map(|node| {
+                let uncertain = lineage_uncertainty(&node, nullability_context.uncertain_columns);
+                let mut references = terminal_references_from_lineage(&node);
+                if let Some(confidence) = uncertain {
+                    for reference in &mut references {
+                        reference.confidence = confidence;
+                    }
                 }
-            }
-            references
-        })
-        .ok()
-        .filter(|refs| !refs.is_empty())
-        .unwrap_or_else(|| fallback_column_references(inner, scope));
+                references
+            })
+            .ok()
+            .filter(|refs| !refs.is_empty())
+            .unwrap_or_else(|| fallback_column_references(inner, scope))
+    };
     if let Some(confidence) = expression_uncertainty(inner, nullability_context.uncertain_columns) {
         for reference in &mut upstream {
             reference.confidence = confidence;
@@ -1110,7 +1345,92 @@ fn projection_fact<'a>(
             .map(|id| nullability_context.output(*id, index, 0))
             .unwrap_or(ProjectionNullability::Unknown),
         upstream,
+        passthrough_source: None,
+        passthrough_column: None,
     }
+}
+
+fn expression_supports_cached_column_lineage(
+    expression: &Expression,
+    scope: &Scope,
+    context: &NullabilityContext<'_>,
+) -> bool {
+    if expression
+        .dfs()
+        .any(|node| matches!(node, Expression::Subquery(_)))
+    {
+        return false;
+    }
+    let Some(scope_id) = context.scope_ids.get(&(scope as *const Scope)) else {
+        return false;
+    };
+    let scope_facts = &context.scopes[*scope_id];
+    let bindings = &scope_facts.bindings;
+    !expression
+        .find_all(|candidate| matches!(candidate, Expression::Column(_)))
+        .into_iter()
+        .any(|candidate| match candidate {
+            Expression::Column(column) if column.table.is_none() => {
+                scope_facts.selected.sources.len() > 1
+                    || bindings.contains_key(&crate::set_operation::identifier_key(
+                        &column.name,
+                        Some(context.dialect),
+                    ))
+            }
+            _ => false,
+        })
+}
+
+fn cached_terminal_references_for_expression<'a>(
+    expression: &Expression,
+    scope: &'a Scope,
+    dialect: DialectType,
+    context: &NullabilityContext<'a>,
+) -> Vec<ColumnReferenceFact> {
+    let immediate_scope = context
+        .scope_ids
+        .get(&(scope as *const Scope))
+        .map(|scope_id| &context.scopes[*scope_id].selected)
+        .unwrap_or(scope);
+    let immediate = fallback_column_references(expression, immediate_scope);
+    let mut terminal = Vec::new();
+    for reference in immediate {
+        let Some(source) = reference.source_name.as_ref() else {
+            terminal.push(reference);
+            continue;
+        };
+        if reference.source_kind == SourceKind::Unknown {
+            terminal.push(reference);
+            continue;
+        }
+        let key = (
+            scope as *const Scope,
+            source.clone(),
+            reference.column.clone(),
+        );
+        let cached = context.terminal_lineage.borrow().get(&key).cloned();
+        let resolved = cached.unwrap_or_else(|| {
+            let node = {
+                let mut lineage = context.lineage.borrow_mut();
+                lineage
+                    .entry(scope as *const Scope)
+                    .or_insert_with(|| ScopedLineage::new(scope, &[], dialect))
+                    .column(source, &reference.column)
+            };
+            let references = terminal_references_from_lineage(&node);
+            context
+                .terminal_lineage
+                .borrow_mut()
+                .insert(key, references.clone());
+            references
+        });
+        if resolved.is_empty() {
+            terminal.push(reference);
+        } else {
+            terminal.extend(resolved);
+        }
+    }
+    dedupe_column_refs(terminal)
 }
 
 fn expression_uncertainty(
