@@ -118,11 +118,11 @@ pub use optimizer::{
 pub use parser::Parser;
 #[cfg(all(feature = "semantic", feature = "generate"))]
 pub use query_analysis::{
-    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, ColumnUseContext, ColumnUseFact,
-    ColumnUseReferenceFact, CteFact, ProjectionFact, ProjectionNullability, QueryAnalysis,
-    QueryShape, QuerySourceSpan, ReferenceConfidence, RelationFact, SetOperationBranchFact,
-    SetOperationBranchRole, SetOperationFact, StarProjectionFact, TransformFunctionFact,
-    TransformKind,
+    analyze_query, analyze_query_for_project_projections, AnalyzeQueryOptions, ColumnReferenceFact,
+    ColumnUseContext, ColumnUseFact, ColumnUseReferenceFact, CteFact, ProjectionFact,
+    ProjectionNullability, QueryAnalysis, QueryShape, QuerySourceSpan, ReferenceConfidence,
+    RelationFact, SetOperationBranchFact, SetOperationBranchRole, SetOperationFact,
+    StarProjectionFact, TransformFunctionFact, TransformKind,
 };
 #[cfg(feature = "semantic")]
 pub use resolver::{is_column_ambiguous, resolve_column, Resolver, ResolverError, ResolverResult};

@@ -438,6 +438,7 @@ fn has_lineage_with_clause(expr: &Expression) -> bool {
                 || has_lineage_with_clause(&except.right)
         }
         Expression::Paren(paren) => has_lineage_with_clause(&paren.this),
+        Expression::Annotated(annotated) => has_lineage_with_clause(&annotated.this),
         _ => false,
     }
 }
@@ -476,11 +477,7 @@ pub fn expand_cte_stars(expr: &mut Expression, schema: Option<&dyn Schema>) {
         return;
     }
 
-    let resolved_cte_columns = {
-        let with = match query_with_mut(expr) {
-            Some(with) => with,
-            None => return,
-        };
+    let resolved_cte_columns = if let Some(with) = query_with_mut(expr) {
         let is_recursive_with = with.recursive;
         let mut resolved_cte_columns: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -509,8 +506,9 @@ pub fn expand_cte_stars(expr: &mut Expression, schema: Option<&dyn Schema>) {
                 resolved_cte_columns.insert(cte_name, columns);
             }
         }
-
         resolved_cte_columns
+    } else {
+        HashMap::new()
     };
 
     // Also expand stars in every arm of the outer query. WITH can be attached
@@ -530,6 +528,7 @@ fn query_with_mut(expr: &mut Expression) -> Option<&mut With> {
             Expression::Except(except) => return except.with.as_mut(),
             Expression::Paren(p) => current = &mut p.this,
             Expression::Subquery(subquery) => current = &mut subquery.this,
+            Expression::Annotated(annotated) => current = &mut annotated.this,
             _ => return None,
         }
     }
@@ -566,6 +565,7 @@ fn query_references_source(expr: &Expression, source_name: &str) -> bool {
             }
             Expression::Paren(paren) => stack.push(&paren.this),
             Expression::Subquery(subquery) => stack.push(&subquery.this),
+            Expression::Annotated(annotated) => stack.push(&annotated.this),
             _ => {}
         }
     }
@@ -609,6 +609,7 @@ fn rewrite_stars_in_query(
             }
             Expression::Paren(paren) => stack.push(&mut paren.this),
             Expression::Subquery(subquery) => stack.push(&mut subquery.this),
+            Expression::Annotated(annotated) => stack.push(&mut annotated.this),
             _ => {}
         }
     }

@@ -254,7 +254,9 @@ fn qualify_query_inner(
             }
             // A CTE cannot capture sources of its containing SELECT, but it may
             // reference a genuinely enclosing correlated query.
-            cte.this = qualify_nested_queries(cte.this.clone(), schema, options, &ctes, outer)?;
+            let query =
+                std::mem::replace(&mut cte.this, Expression::Null(crate::expressions::Null));
+            cte.this = qualify_nested_queries(query, schema, options, &ctes, outer)?;
             ctes.retain(|existing, _| {
                 normalize_name(existing, dialect, true, true)
                     != normalize_name(&name, dialect, true, true)
@@ -368,8 +370,10 @@ fn qualify_query_inner(
             Expression::Except(query) => (&mut query.left, &mut query.right),
             _ => unreachable!(),
         };
-        *left = qualify_nested_queries(left.clone(), schema, options, &ctes, outer)?;
-        *right = qualify_nested_queries(right.clone(), schema, options, &ctes, outer)?;
+        let left_query = std::mem::replace(left, Expression::Null(crate::expressions::Null));
+        let right_query = std::mem::replace(right, Expression::Null(crate::expressions::Null));
+        *left = qualify_nested_queries(left_query, schema, options, &ctes, outer)?;
+        *right = qualify_nested_queries(right_query, schema, options, &ctes, outer)?;
         match &mut expression {
             Expression::Union(query) => query.with = with,
             Expression::Intersect(query) => query.with = with,
