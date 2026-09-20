@@ -1261,6 +1261,86 @@ fn analyze_query_for_project_projections_retains_root_star_presence() {
 }
 
 #[test]
+fn analyze_query_for_project_projections_preserves_wide_computed_alias_lineage() {
+    let mut expressions = vec![
+        "amount AS adjusted_amount".to_string(),
+        "adjusted_amount + id AS combined_amount".to_string(),
+    ];
+    expressions.extend((0..63).map(|index| format!("{index} AS constant_{index}")));
+    let analysis = analyze_query_for_project_projections(
+        &format!("SELECT {} FROM orders", expressions.join(", ")),
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    let combined = &analysis.projections[1];
+    assert_eq!(combined.name.as_deref(), Some("combined_amount"));
+    assert!(combined.upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("orders") && reference.column == "amount"
+    }));
+    assert!(combined.upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("orders") && reference.column == "id"
+    }));
+    assert!(combined
+        .upstream
+        .iter()
+        .all(|reference| reference.confidence == ReferenceConfidence::Resolved));
+}
+
+#[test]
+fn analyze_query_for_project_projections_preserves_ambiguous_unqualified_confidence() {
+    let analysis = analyze_query_for_project_projections(
+        "SELECT id FROM orders o JOIN customers c ON o.customer_id = c.id",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert!(!analysis.projections[0].upstream.is_empty());
+    assert!(analysis.projections[0]
+        .upstream
+        .iter()
+        .all(|reference| reference.confidence == ReferenceConfidence::Ambiguous));
+}
+
+#[test]
+fn analyze_query_for_project_projections_preserves_cte_set_operation_facts() {
+    let analysis = analyze_query_for_project_projections(
+        "WITH combined AS (SELECT a AS value FROM x UNION ALL SELECT b FROM y) \
+         SELECT value FROM combined",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.cte_facts.len(), 1);
+    assert_eq!(analysis.cte_facts[0].shape, Some(QueryShape::SetOperation));
+    assert_eq!(analysis.cte_facts[0].projections.len(), 1);
+    assert!(analysis.cte_facts[0].projections[0]
+        .upstream
+        .iter()
+        .any(|reference| reference.table.as_deref() == Some("x") && reference.column == "a"));
+    assert_eq!(
+        analysis.projections[0].passthrough_source.as_deref(),
+        Some("combined")
+    );
+    assert_eq!(
+        analysis.projections[0].passthrough_column.as_deref(),
+        Some("value")
+    );
+}
+
+#[test]
 fn analyze_query_reports_set_operation_cte_projection_facts() {
     let analysis = analyze_query_with_cte_projections(
         r#"WITH current_orders AS (

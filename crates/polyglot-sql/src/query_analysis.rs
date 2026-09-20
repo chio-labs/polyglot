@@ -372,12 +372,23 @@ fn analyze_query_inner(
     let original_scope = original_expression.as_ref().map(build_scope);
     let empty_schema = MappingSchema::with_dialect(options.dialect);
     let mut uncertain_columns = HashMap::new();
+    let selected_scopes =
+        (mode == QueryAnalysisMode::ProjectProjections).then(|| selected_reference_scopes(&scope));
     if !can_skip_uncertain_occurrences(mode, &scope, options.schema.as_ref()) {
-        column_uses::collect_uncertain_occurrences(
-            original_scope.as_ref().unwrap_or(&scope),
-            mapping_schema.as_ref().unwrap_or(&empty_schema),
-            &mut uncertain_columns,
-        );
+        if let Some(selected_scopes) = selected_scopes.as_ref() {
+            column_uses::collect_uncertain_occurrences_with_selected_scopes(
+                &scope,
+                selected_scopes,
+                mapping_schema.as_ref().unwrap_or(&empty_schema),
+                &mut uncertain_columns,
+            );
+        } else {
+            column_uses::collect_uncertain_occurrences(
+                original_scope.as_ref().unwrap_or(&scope),
+                mapping_schema.as_ref().unwrap_or(&empty_schema),
+                &mut uncertain_columns,
+            );
+        }
     }
     let nullability_context = NullabilityContext::new(
         &scope,
@@ -385,6 +396,7 @@ fn analyze_query_inner(
         mapping_schema.as_ref(),
         options.dialect,
         &uncertain_columns,
+        selected_scopes,
     );
     let shape = if is_set_operation(&expression) {
         QueryShape::SetOperation
@@ -399,6 +411,7 @@ fn analyze_query_inner(
             &mut projections,
             mapping_schema.as_ref(),
             options.dialect,
+            Some(&nullability_context),
         );
         refine_filtered_projection_nullability(&expression, &mut projections);
     }
@@ -508,6 +521,29 @@ fn can_skip_uncertain_occurrences(
         })
 }
 
+fn selected_reference_scopes(scope: &Scope) -> HashMap<*const Scope, Scope> {
+    fn collect(scope: &Scope, selected: &mut HashMap<*const Scope, Scope>) {
+        selected.insert(
+            scope as *const Scope,
+            crate::scope::selected_reference_scope(scope),
+        );
+        for child in scope
+            .cte_scopes
+            .iter()
+            .chain(&scope.derived_table_scopes)
+            .chain(&scope.subquery_scopes)
+            .chain(&scope.udtf_scopes)
+            .chain(&scope.union_scopes)
+        {
+            collect(child, selected);
+        }
+    }
+
+    let mut selected = HashMap::new();
+    collect(scope, &mut selected);
+    selected
+}
+
 fn analysis_mapping_schema(schema: &ValidationSchema, dialect: DialectType) -> MappingSchema {
     mapping_schema_from_validation_schema_with_dialect(schema, dialect)
 }
@@ -615,6 +651,7 @@ impl<'a> NullabilityContext<'a> {
         mapping_schema: Option<&'a MappingSchema>,
         dialect: DialectType,
         uncertain_columns: &'a HashMap<(usize, usize), ReferenceConfidence>,
+        mut selected_scopes: Option<HashMap<*const Scope, Scope>>,
     ) -> Self {
         let mut context = Self {
             lineage: RefCell::new(HashMap::new()),
@@ -630,8 +667,14 @@ impl<'a> NullabilityContext<'a> {
             resolving: RefCell::new(HashSet::new()),
             uncertain_columns,
         };
-        context.index_scope(scope, HashMap::new(), None);
+        context.index_scope(scope, HashMap::new(), None, selected_scopes.as_mut());
         context
+    }
+
+    fn selected_scope(&self, scope: &Scope) -> Option<&Scope> {
+        self.scope_ids
+            .get(&(scope as *const Scope))
+            .map(|id| &self.scopes[*id].selected)
     }
 
     // Keep each CTE's definition environment, rather than resolving it in the
@@ -641,6 +684,7 @@ impl<'a> NullabilityContext<'a> {
         scope: &'a Scope,
         mut ctes: HashMap<String, usize>,
         recursive_name: Option<&Identifier>,
+        mut selected_scopes: Option<&mut HashMap<*const Scope, Scope>>,
     ) -> usize {
         let id = self.scopes.len();
         self.scope_ids.insert(scope, id);
@@ -664,9 +708,13 @@ impl<'a> NullabilityContext<'a> {
         } else {
             HashMap::new()
         };
+        let selected = selected_scopes
+            .as_deref_mut()
+            .and_then(|scopes| scopes.remove(&(scope as *const Scope)))
+            .unwrap_or_else(|| crate::scope::selected_reference_scope(scope));
         self.scopes.push(NullabilityScope {
             scope,
-            selected: crate::scope::selected_reference_scope(scope),
+            selected,
             bindings,
             ctes: HashMap::new(),
             derived: Vec::new(),
@@ -678,7 +726,12 @@ impl<'a> NullabilityContext<'a> {
         for child in &scope.cte_scopes {
             if let Expression::Cte(cte) = &child.expression {
                 let name = &cte.alias;
-                let child_id = self.index_scope(child, ctes.clone(), recursive.then_some(name));
+                let child_id = self.index_scope(
+                    child,
+                    ctes.clone(),
+                    recursive.then_some(name),
+                    selected_scopes.as_deref_mut(),
+                );
                 ctes.insert(
                     crate::set_operation::identifier_key(name, Some(self.dialect)),
                     child_id,
@@ -687,11 +740,13 @@ impl<'a> NullabilityContext<'a> {
         }
         self.scopes[id].ctes = ctes.clone();
         for child in &scope.derived_table_scopes {
-            let child_id = self.index_scope(child, ctes.clone(), None);
+            let child_id =
+                self.index_scope(child, ctes.clone(), None, selected_scopes.as_deref_mut());
             self.scopes[id].derived.push(child_id);
         }
         for child in &scope.union_scopes {
-            let child_id = self.index_scope(child, ctes.clone(), None);
+            let child_id =
+                self.index_scope(child, ctes.clone(), None, selected_scopes.as_deref_mut());
             self.scopes[id].branches.push(child_id);
         }
         id
@@ -767,6 +822,7 @@ fn enrich_cte_facts<'a>(
             &mut fact.projections,
             nullability_context.mapping_schema,
             dialect,
+            Some(nullability_context),
         );
         refine_filtered_projection_nullability(query, &mut fact.projections);
         for (projection, alias) in fact.projections.iter_mut().zip(&fact.columns) {
@@ -780,11 +836,20 @@ fn enrich_projection_passthrough_sources(
     projections: &mut [ProjectionFact],
     mapping_schema: Option<&MappingSchema>,
     dialect: DialectType,
+    nullability_context: Option<&NullabilityContext<'_>>,
 ) {
     let Some(projection_scope) = representative_projection_scope(scope) else {
         return;
     };
-    let selected = crate::scope::selected_reference_scope(projection_scope);
+    let fallback_selected;
+    let selected = if let Some(selected) =
+        nullability_context.and_then(|context| context.selected_scope(projection_scope))
+    {
+        selected
+    } else {
+        fallback_selected = crate::scope::selected_reference_scope(projection_scope);
+        &fallback_selected
+    };
     let query = unwrap_query_annotations(crate::scope::scope_query(&projection_scope.expression));
     let Expression::Select(select) = query else {
         return;
