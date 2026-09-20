@@ -40,6 +40,10 @@ pub struct AnalyzeQueryOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryAnalysis {
+    /// Whether the root query syntactically projects a star. This compact flag
+    /// is retained even when project-only analysis omits standalone star facts.
+    #[serde(skip)]
+    pub has_root_star: bool,
     pub shape: QueryShape,
     pub ctes: Vec<String>,
     pub cte_facts: Vec<CteFact>,
@@ -251,22 +255,47 @@ pub enum ProjectionNullability {
 
 /// Analyze a single SELECT or set-operation query.
 pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAnalysis> {
-    analyze_query_inner(sql, options, false)
+    analyze_query_inner(sql, options, QueryAnalysisMode::Default)
 }
 
 /// Analyze a query and include output facts for each top-level CTE.
+///
+/// This compact path retains original relation bindings instead of rewriting a
+/// fully qualified AST. The supplied schema still drives star expansion, type
+/// annotation, nullability, and conservative reference resolution.
 pub fn analyze_query_with_cte_projections(
     sql: &str,
     options: AnalyzeQueryOptions,
 ) -> Result<QueryAnalysis> {
-    analyze_query_inner(sql, options, true)
+    analyze_query_inner(sql, options, QueryAnalysisMode::CteProjections)
+}
+
+/// Analyze only the projection and CTE facts required by a project compiler.
+///
+/// Relation inventories, standalone star facts, set-operation reports, and
+/// clause-level column uses are omitted to avoid constructing fact graphs that
+/// the project projection does not consume.
+pub fn analyze_query_for_project_projections(
+    sql: &str,
+    options: AnalyzeQueryOptions,
+) -> Result<QueryAnalysis> {
+    analyze_query_inner(sql, options, QueryAnalysisMode::ProjectProjections)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryAnalysisMode {
+    Default,
+    CteProjections,
+    ProjectProjections,
 }
 
 fn analyze_query_inner(
     sql: &str,
     options: AnalyzeQueryOptions,
-    include_cte_projections: bool,
+    mode: QueryAnalysisMode,
 ) -> Result<QueryAnalysis> {
+    let include_cte_projections = mode != QueryAnalysisMode::Default;
+    let include_extended_facts = mode != QueryAnalysisMode::ProjectProjections;
     let mut expression = parse_one_with_options(
         sql,
         options.dialect,
@@ -277,7 +306,10 @@ fn analyze_query_inner(
     expression = effective_query(expression);
     ensure_query(&expression)?;
     expression = crate::binding::bind_lambdas(expression, options.dialect);
-    let original_expression = expression.clone();
+    let has_root_star = select_expressions_for_query(&expression)
+        .iter()
+        .any(|projection| projection_is_star(unwrap_projection_alias(projection)));
+    let original_expression = include_extended_facts.then(|| expression.clone());
 
     let mapping_schema = options
         .schema
@@ -285,38 +317,44 @@ fn analyze_query_inner(
         .map(|schema| analysis_mapping_schema(schema, options.dialect));
     let schema_info = options.schema.as_ref().map(AnalysisSchemaInfo::from_schema);
     let mut cte_facts = top_level_cte_facts(
-        &original_expression,
+        original_expression.as_ref().unwrap_or(&expression),
         options.dialect,
         options.complexity_guard,
     )?;
-    let star_projections = star_projection_facts(
-        &original_expression,
-        mapping_schema.as_ref(),
-        options.dialect,
-    );
+    let star_projections = if include_extended_facts {
+        star_projection_facts(
+            original_expression.as_ref().unwrap_or(&expression),
+            mapping_schema.as_ref(),
+            options.dialect,
+        )
+    } else {
+        Vec::new()
+    };
 
-    if let Some(schema) = mapping_schema.as_ref() {
-        use crate::optimizer::qualify_columns::QualifyColumnsError;
-        expression = match qualify_schema_aware_expression(
-            expression.clone(),
-            schema,
-            Some(options.dialect),
-        ) {
-            Ok(qualified) => qualified,
-            // Analysis is not validation. Incomplete schemas and unresolved
-            // lexical references must still yield conservative usage facts.
-            Err(
-                QualifyColumnsError::UnknownTable(_)
-                | QualifyColumnsError::UnknownColumn(_)
-                | QualifyColumnsError::AmbiguousColumn(_)
-                | QualifyColumnsError::ColumnNotResolved { .. },
-            ) => expression,
-            Err(error) => {
-                return Err(Error::internal(format!(
-                    "query analysis qualification failed: {error}"
-                )))
-            }
-        };
+    if mode == QueryAnalysisMode::Default {
+        if let Some(schema) = mapping_schema.as_ref() {
+            use crate::optimizer::qualify_columns::QualifyColumnsError;
+            expression = match qualify_schema_aware_expression(
+                expression.clone(),
+                schema,
+                Some(options.dialect),
+            ) {
+                Ok(qualified) => qualified,
+                // Analysis is not validation. Incomplete schemas and unresolved
+                // lexical references must still yield conservative usage facts.
+                Err(
+                    QualifyColumnsError::UnknownTable(_)
+                    | QualifyColumnsError::UnknownColumn(_)
+                    | QualifyColumnsError::AmbiguousColumn(_)
+                    | QualifyColumnsError::ColumnNotResolved { .. },
+                ) => expression,
+                Err(error) => {
+                    return Err(Error::internal(format!(
+                        "query analysis qualification failed: {error}"
+                    )))
+                }
+            };
+        }
     }
 
     crate::lineage::expand_cte_stars(
@@ -330,11 +368,11 @@ fn analyze_query_inner(
     );
 
     let scope = build_scope(&expression);
-    let original_scope = build_scope(&original_expression);
+    let original_scope = original_expression.as_ref().map(build_scope);
     let empty_schema = MappingSchema::with_dialect(options.dialect);
     let mut uncertain_columns = HashMap::new();
     column_uses::collect_uncertain_occurrences(
-        &original_scope,
+        original_scope.as_ref().unwrap_or(&scope),
         mapping_schema.as_ref().unwrap_or(&empty_schema),
         &mut uncertain_columns,
     );
@@ -353,11 +391,19 @@ fn analyze_query_inner(
     let mut projections =
         projection_facts_for_query(&expression, &scope, options.dialect, &nullability_context);
     if include_cte_projections {
-        enrich_projection_passthrough_sources(&scope, &mut projections);
+        enrich_projection_passthrough_sources(
+            &scope,
+            &mut projections,
+            mapping_schema.as_ref(),
+            options.dialect,
+        );
         refine_filtered_projection_nullability(&expression, &mut projections);
     }
-    let set_operations =
-        set_operation_facts(&expression, &scope, options.dialect, &nullability_context);
+    let set_operations = if include_extended_facts {
+        set_operation_facts(&expression, &scope, options.dialect, &nullability_context)
+    } else {
+        Vec::new()
+    };
     if include_cte_projections {
         enrich_cte_facts(
             &mut cte_facts,
@@ -368,22 +414,31 @@ fn analyze_query_inner(
     }
 
     Ok(QueryAnalysis {
+        has_root_star,
         shape,
         ctes: collect_cte_names(&expression),
         cte_facts,
         projections,
-        relations: relation_facts(&scope, mapping_schema.as_ref(), options.dialect),
-        base_tables: base_table_facts(&scope, mapping_schema.as_ref(), options.dialect),
+        relations: include_extended_facts
+            .then(|| relation_facts(&scope, mapping_schema.as_ref(), options.dialect))
+            .unwrap_or_default(),
+        base_tables: include_extended_facts
+            .then(|| base_table_facts(&scope, mapping_schema.as_ref(), options.dialect))
+            .unwrap_or_default(),
         star_projections,
         set_operations,
-        column_uses: column_uses::collect(
-            &original_scope,
-            &scope,
-            mapping_schema.as_ref(),
-            options.dialect,
-            &uncertain_columns,
-            options.complexity_guard,
-        ),
+        column_uses: if let Some(original_scope) = original_scope.as_ref() {
+            column_uses::collect(
+                original_scope,
+                &scope,
+                mapping_schema.as_ref(),
+                options.dialect,
+                &uncertain_columns,
+                options.complexity_guard,
+            )
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -630,7 +685,12 @@ fn enrich_cte_facts<'a>(
         });
         fact.projections =
             projection_facts_for_query(query, cte_scope, dialect, nullability_context);
-        enrich_projection_passthrough_sources(cte_scope, &mut fact.projections);
+        enrich_projection_passthrough_sources(
+            cte_scope,
+            &mut fact.projections,
+            nullability_context.mapping_schema,
+            dialect,
+        );
         refine_filtered_projection_nullability(query, &mut fact.projections);
         for (projection, alias) in fact.projections.iter_mut().zip(&fact.columns) {
             projection.name = Some(alias.clone());
@@ -638,12 +698,17 @@ fn enrich_cte_facts<'a>(
     }
 }
 
-fn enrich_projection_passthrough_sources(scope: &Scope, projections: &mut [ProjectionFact]) {
+fn enrich_projection_passthrough_sources(
+    scope: &Scope,
+    projections: &mut [ProjectionFact],
+    mapping_schema: Option<&MappingSchema>,
+    dialect: DialectType,
+) {
     let Some(projection_scope) = representative_projection_scope(scope) else {
         return;
     };
     let selected = crate::scope::selected_reference_scope(projection_scope);
-    let query = crate::scope::scope_query(&projection_scope.expression);
+    let query = unwrap_query_annotations(crate::scope::scope_query(&projection_scope.expression));
     let Expression::Select(select) = query else {
         return;
     };
@@ -655,6 +720,11 @@ fn enrich_projection_passthrough_sources(scope: &Scope, projections: &mut [Proje
         else {
             continue;
         };
+        if let Some(source) = projection_cte_passthrough(projection, &column.name.name) {
+            projection.passthrough_source = source.source_name.clone().or(source.table.clone());
+            projection.passthrough_column = Some(column.name.name.clone());
+            continue;
+        }
         let source = match &column.table {
             Some(table) if table.quoted => selected.sources.get_key_value(&table.name),
             Some(table) => selected
@@ -663,23 +733,72 @@ fn enrich_projection_passthrough_sources(scope: &Scope, projections: &mut [Proje
                 .find(|(name, _)| name.eq_ignore_ascii_case(&table.name))
                 .map(|(name, source)| (name, source)),
             None if selected.sources.len() == 1 => selected.sources.iter().next(),
-            None => None,
+            None => unique_source_for_column(&selected, &column.name, mapping_schema, dialect),
         };
-        let Some((source_name, source)) =
-            source.filter(|(_, source)| source.kind == SourceKind::Cte)
-        else {
+        let Some((source_name, source)) = source else {
             continue;
         };
-        projection.passthrough_source = source
+        if source.kind != SourceKind::Cte {
+            continue;
+        }
+        let cte_name = source
             .lineage_name
             .clone()
-            .or_else(|| Some(source_name.clone()));
+            .unwrap_or_else(|| source_name.clone());
+        projection.passthrough_source = Some(cte_name);
         projection.passthrough_column = Some(column.name.name.clone());
     }
 }
 
+fn unique_source_for_column<'a>(
+    scope: &'a Scope,
+    column: &Identifier,
+    mapping_schema: Option<&MappingSchema>,
+    dialect: DialectType,
+) -> Option<(&'a String, &'a SourceInfo)> {
+    let mut matching = None;
+    for (name, source) in &scope.sources {
+        let columns = source_columns(source, mapping_schema, dialect);
+        if columns.is_empty() {
+            return None;
+        }
+        let exposes_column = columns.iter().any(|candidate| {
+            if column.quoted {
+                candidate == &column.name
+            } else {
+                candidate.eq_ignore_ascii_case(&column.name)
+            }
+        });
+        if !exposes_column {
+            continue;
+        }
+        if matching.is_some() {
+            return None;
+        }
+        matching = Some((name, source));
+    }
+    matching
+}
+
+fn projection_cte_passthrough<'a>(
+    projection: &'a ProjectionFact,
+    column: &str,
+) -> Option<&'a ColumnReferenceFact> {
+    let mut matching = projection.upstream.iter().filter(|reference| {
+        reference.source_kind == SourceKind::Cte && reference.column.eq_ignore_ascii_case(column)
+    });
+    let first = matching.next()?;
+    matching
+        .all(|reference| {
+            reference.source_name == first.source_name
+                && reference.table == first.table
+                && reference.column.eq_ignore_ascii_case(&first.column)
+        })
+        .then_some(first)
+}
+
 fn representative_projection_scope(scope: &Scope) -> Option<&Scope> {
-    match crate::scope::scope_query(&scope.expression) {
+    match unwrap_query_annotations(crate::scope::scope_query(&scope.expression)) {
         Expression::Select(_) => Some(scope),
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => scope
             .union_scopes
@@ -799,10 +918,17 @@ fn star_projection_facts(
     mapping_schema: Option<&MappingSchema>,
     dialect: DialectType,
 ) -> Vec<StarProjectionFact> {
+    let projections = select_expressions_for_query(expression);
+    if !projections
+        .iter()
+        .any(|projection| projection_is_star(unwrap_projection_alias(projection)))
+    {
+        return Vec::new();
+    }
     let scope = build_scope(expression);
     let ordered_sources = ordered_source_names_for_query(expression);
 
-    select_expressions_for_query(expression)
+    projections
         .iter()
         .enumerate()
         .filter_map(|(index, projection)| {
@@ -1093,7 +1219,7 @@ fn projection_facts_for_query<'a>(
 ) -> Vec<ProjectionFact> {
     let expressions = projection_sources_for_query(expression, dialect);
     let names = get_output_column_names_for_dialect(expression, Some(dialect));
-    let reuse_column_lineage = expressions.len() > WIDE_PROJECTION_LINEAGE_CACHE_THRESHOLD;
+    let cached_aliases = cached_lineage_output_aliases(expression, expressions.len(), dialect);
 
     expressions
         .iter()
@@ -1110,7 +1236,7 @@ fn projection_facts_for_query<'a>(
                 scope,
                 dialect,
                 nullability_context,
-                reuse_column_lineage,
+                cached_aliases.as_ref(),
             );
             if *null_padded {
                 fact.nullability = ProjectionNullability::Nullable;
@@ -1167,6 +1293,7 @@ fn projection_source_for_ordinal(
     ordinal: usize,
     dialect: DialectType,
 ) -> Option<(&Expression, bool)> {
+    let expression = unwrap_query_annotations(expression);
     match crate::set_operation::set_operation_layout(expression, Some(dialect)) {
         Ok(Some(layout)) => {
             let output = layout.outputs.get(ordinal)?;
@@ -1219,7 +1346,7 @@ fn projection_source_for_ordinal(
 }
 
 fn set_operation_left(expression: &Expression) -> Option<&Expression> {
-    match expression {
+    match unwrap_query_annotations(expression) {
         Expression::Union(set_op) => Some(&set_op.left),
         Expression::Intersect(set_op) => Some(&set_op.left),
         Expression::Except(set_op) => Some(&set_op.left),
@@ -1228,7 +1355,7 @@ fn set_operation_left(expression: &Expression) -> Option<&Expression> {
 }
 
 fn set_operation_right(expression: &Expression) -> Option<&Expression> {
-    match expression {
+    match unwrap_query_annotations(expression) {
         Expression::Union(set_op) => Some(&set_op.right),
         Expression::Intersect(set_op) => Some(&set_op.right),
         Expression::Except(set_op) => Some(&set_op.right),
@@ -1237,13 +1364,20 @@ fn set_operation_right(expression: &Expression) -> Option<&Expression> {
 }
 
 fn select_expressions_for_query(expression: &Expression) -> Vec<&Expression> {
-    match expression {
+    match unwrap_query_annotations(expression) {
         Expression::Select(select) => select.expressions.iter().collect(),
         Expression::Union(union) => select_expressions_for_query(&union.left),
         Expression::Intersect(intersect) => select_expressions_for_query(&intersect.left),
         Expression::Except(except) => select_expressions_for_query(&except.left),
         Expression::Subquery(subquery) => select_expressions_for_query(&subquery.this),
         _ => Vec::new(),
+    }
+}
+
+fn unwrap_query_annotations(expression: &Expression) -> &Expression {
+    match expression {
+        Expression::Annotated(annotated) => unwrap_query_annotations(&annotated.this),
+        _ => expression,
     }
 }
 
@@ -1255,13 +1389,13 @@ fn projection_fact<'a>(
     scope: &'a Scope,
     dialect: DialectType,
     nullability_context: &NullabilityContext<'a>,
-    reuse_column_lineage: bool,
+    cached_aliases: Option<&HashSet<String>>,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
-    let mut upstream = if reuse_column_lineage
-        && expression_supports_cached_column_lineage(inner, scope, nullability_context)
-    {
+    let mut upstream = if cached_aliases.is_some_and(|aliases| {
+        expression_supports_cached_column_lineage(inner, scope, nullability_context, aliases)
+    }) {
         cached_terminal_references_for_expression(inner, scope, dialect, nullability_context)
     } else {
         let mut lineage = nullability_context.lineage.borrow_mut();
@@ -1350,10 +1484,37 @@ fn projection_fact<'a>(
     }
 }
 
+fn cached_lineage_output_aliases(
+    query: &Expression,
+    output_count: usize,
+    dialect: DialectType,
+) -> Option<HashSet<String>> {
+    if output_count <= WIDE_PROJECTION_LINEAGE_CACHE_THRESHOLD {
+        return None;
+    }
+    let Expression::Select(select) = unwrap_query_annotations(query) else {
+        return None;
+    };
+    Some(
+        select
+            .expressions
+            .iter()
+            .filter_map(|expression| match expression {
+                Expression::Alias(alias) => Some(crate::set_operation::identifier_key(
+                    &alias.alias,
+                    Some(dialect),
+                )),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 fn expression_supports_cached_column_lineage(
     expression: &Expression,
     scope: &Scope,
     context: &NullabilityContext<'_>,
+    output_aliases: &HashSet<String>,
 ) -> bool {
     if expression
         .dfs()
@@ -1364,18 +1525,40 @@ fn expression_supports_cached_column_lineage(
     let Some(scope_id) = context.scope_ids.get(&(scope as *const Scope)) else {
         return false;
     };
-    let scope_facts = &context.scopes[*scope_id];
-    let bindings = &scope_facts.bindings;
+    let selected = &context.scopes[*scope_id].selected;
+    let Some((source_name, source)) = selected.sources.iter().next() else {
+        return false;
+    };
+    if selected.sources.len() != 1 {
+        return false;
+    }
+    let source_columns = source_columns(source, context.mapping_schema, context.dialect);
     !expression
         .find_all(|candidate| matches!(candidate, Expression::Column(_)))
         .into_iter()
         .any(|candidate| match candidate {
-            Expression::Column(column) if column.table.is_none() => {
-                scope_facts.selected.sources.len() > 1
-                    || bindings.contains_key(&crate::set_operation::identifier_key(
-                        &column.name,
-                        Some(context.dialect),
-                    ))
+            Expression::Column(column) => {
+                if let Some(table) = &column.table {
+                    let matches = if table.quoted {
+                        table.name == *source_name
+                    } else {
+                        table.name.eq_ignore_ascii_case(source_name)
+                            || source
+                                .alias
+                                .as_deref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(&table.name))
+                    };
+                    return !matches;
+                }
+                let key = crate::set_operation::identifier_key(&column.name, Some(context.dialect));
+                output_aliases.contains(&key)
+                    && !source_columns.iter().any(|candidate| {
+                        if column.name.quoted {
+                            candidate == &column.name.name
+                        } else {
+                            candidate.eq_ignore_ascii_case(&column.name.name)
+                        }
+                    })
             }
             _ => false,
         })
@@ -1417,7 +1600,13 @@ fn cached_terminal_references_for_expression<'a>(
                     .or_insert_with(|| ScopedLineage::new(scope, &[], dialect))
                     .column(source, &reference.column)
             };
-            let references = terminal_references_from_lineage(&node);
+            let uncertain = lineage_uncertainty(&node, context.uncertain_columns);
+            let mut references = terminal_references_from_lineage(&node);
+            if let Some(confidence) = uncertain {
+                for reference in &mut references {
+                    reference.confidence = confidence;
+                }
+            }
             context
                 .terminal_lineage
                 .borrow_mut()

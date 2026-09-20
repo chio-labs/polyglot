@@ -11,7 +11,7 @@ use crate::helper::name_sequence;
 use crate::optimizer::normalize_identifiers::{
     get_normalization_strategy, normalize_identifier, NormalizationStrategy,
 };
-use crate::scope::traverse_scope;
+use crate::traversal::ExpressionWalk;
 use std::collections::{HashMap, HashSet};
 
 /// Options for table qualification
@@ -134,9 +134,8 @@ pub fn qualify_tables(expression: Expression, options: &QualifyTablesOptions) ->
     } else {
         &options.alias_prefix
     };
-    let mut reserved_aliases: HashSet<String> = traverse_scope(&expression)
+    let mut reserved_aliases: HashSet<String> = reserved_source_names(&expression)
         .into_iter()
-        .flat_map(|scope| scope.sources.into_keys())
         .filter(|name| !name.is_empty())
         .map(|name| normalize_identifier(Identifier::new(name), strategy).name)
         .collect();
@@ -150,6 +149,114 @@ pub fn qualify_tables(expression: Expression, options: &QualifyTablesOptions) ->
     };
 
     qualify_tables_inner(expression, options, strategy, &mut next_alias)
+}
+
+fn reserved_source_names(expression: &Expression) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for node in expression.dfs() {
+        match node {
+            Expression::Select(select) => {
+                names.extend(
+                    select
+                        .lateral_views
+                        .iter()
+                        .filter_map(|view| view.table_alias.as_ref())
+                        .map(|alias| alias.name.clone()),
+                );
+                reserve_anonymous_virtual_source_names(select, &mut names);
+            }
+            Expression::Table(table) => {
+                names.insert(table.alias.as_ref().unwrap_or(&table.name).name.clone());
+            }
+            Expression::Subquery(subquery) => {
+                if let Some(alias) = &subquery.alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            Expression::Values(values) => {
+                if let Some(alias) = &values.alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            Expression::Unnest(unnest) => {
+                if let Some(alias) = &unnest.alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            Expression::Alias(alias)
+                if is_query_relation(&alias.this)
+                    || matches!(&alias.this, Expression::Unnest(_)) =>
+            {
+                names.insert(alias.alias.name.clone());
+            }
+            Expression::Lateral(lateral) => {
+                if let Some(alias) = &lateral.alias {
+                    names.insert(alias.clone());
+                }
+            }
+            Expression::Cte(cte) => {
+                names.insert(cte.alias.name.clone());
+            }
+            Expression::Pivot(pivot) => {
+                if let Some(alias) = &pivot.alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            Expression::Unpivot(unpivot) => {
+                if let Some(alias) = &unpivot.alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            Expression::LateralView(lateral_view) => {
+                if let Some(alias) = &lateral_view.table_alias {
+                    names.insert(alias.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn reserve_anonymous_virtual_source_names(select: &Select, names: &mut HashSet<String>) {
+    let mut virtual_index = 0;
+    let relations = select
+        .from
+        .iter()
+        .flat_map(|from| from.expressions.iter())
+        .chain(select.joins.iter().map(|join| &join.this));
+    for relation in relations {
+        let (is_virtual, is_anonymous) = virtual_source_kind(relation);
+        if is_virtual {
+            if is_anonymous {
+                names.insert(format!("_{virtual_index}"));
+            }
+            virtual_index += 1;
+        }
+    }
+}
+
+fn virtual_source_kind(expression: &Expression) -> (bool, bool) {
+    match expression {
+        Expression::Values(values) => (true, values.alias.is_none()),
+        Expression::Unnest(unnest) => (unnest.alias.is_some(), false),
+        Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => (true, false),
+        Expression::Lateral(lateral) => (lateral.alias.is_some(), false),
+        Expression::Paren(paren) => virtual_source_kind(&paren.this),
+        _ => (false, false),
+    }
+}
+
+fn is_query_relation(expression: &Expression) -> bool {
+    match expression {
+        Expression::Select(_)
+        | Expression::Subquery(_)
+        | Expression::Union(_)
+        | Expression::Intersect(_)
+        | Expression::Except(_) => true,
+        Expression::Paren(paren) => is_query_relation(&paren.this),
+        _ => false,
+    }
 }
 
 fn qualify_tables_inner(
@@ -214,7 +321,8 @@ fn qualify_select(
     // Qualify CTEs first
     if let Some(ref mut with) = select.with {
         for cte in &mut with.ctes {
-            cte.this = qualify_tables_inner(cte.this.clone(), options, strategy, next_alias);
+            let query = std::mem::replace(&mut cte.this, Expression::Null(Null));
+            cte.this = qualify_tables_inner(query, options, strategy, next_alias);
         }
     }
 
@@ -800,6 +908,27 @@ mod tests {
             sql,
             "SELECT _0.a, b FROM first_table AS _0 CROSS JOIN (SELECT b FROM second_table) AS _1"
         );
+    }
+
+    #[test]
+    fn test_reserved_source_names_include_explicit_virtual_aliases() {
+        for sql in [
+            "SELECT * FROM UNNEST([1, 2]) AS _0",
+            "SELECT a FROM test UNPIVOT(x FOR y IN (z, q)) AS _0",
+            "SELECT * FROM t LATERAL VIEW EXPLODE(arr) _0 AS x",
+        ] {
+            assert!(reserved_source_names(&parse(sql)).contains("_0"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_anonymous_virtual_names_are_reused_across_scopes() {
+        let names = reserved_source_names(&parse(
+            "SELECT * FROM (VALUES (1)) UNION ALL SELECT * FROM (VALUES (2))",
+        ));
+
+        assert!(names.contains("_0"));
+        assert!(!names.contains("_1"));
     }
 
     #[test]

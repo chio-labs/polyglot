@@ -62,6 +62,7 @@ pub(crate) fn scope_query(expression: &Expression) -> &Expression {
         Expression::Subquery(subquery) => scope_query(&subquery.this),
         Expression::Paren(paren) => scope_query(&paren.this),
         Expression::Alias(alias) => scope_query(&alias.this),
+        Expression::Annotated(annotated) => scope_query(&annotated.this),
         Expression::Prepare(prepare) => scope_query(&prepare.statement),
         Expression::CreateTable(create) if create.as_select.is_some() => {
             scope_query(create.as_select.as_ref().unwrap())
@@ -754,6 +755,9 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
         }
         Expression::Paren(paren) => {
             build_scope_impl(&paren.this, current_scope);
+        }
+        Expression::Annotated(annotated) => {
+            build_scope_impl(&annotated.this, current_scope);
         }
         _ => {}
     }

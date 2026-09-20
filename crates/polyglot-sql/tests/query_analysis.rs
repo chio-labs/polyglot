@@ -1,4 +1,6 @@
-use polyglot_sql::query_analysis::analyze_query_with_cte_projections;
+use polyglot_sql::query_analysis::{
+    analyze_query_for_project_projections, analyze_query_with_cte_projections,
+};
 use polyglot_sql::{
     analyze_query, scope::SourceKind, AnalyzeQueryOptions, DialectType, ProjectionNullability,
     QueryShape, ReferenceConfidence, SetOperationBranchRole, TransformKind, ValidationSchema,
@@ -1176,13 +1178,59 @@ fn analyze_query_reports_top_level_cte_facts() {
 }
 
 #[test]
+fn analyze_query_for_project_projections_omits_unconsumed_fact_graphs() {
+    let analysis = analyze_query_for_project_projections(
+        "WITH base AS (SELECT id, amount FROM orders) SELECT id, amount FROM base",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.projections.len(), 2);
+    assert!(!analysis.has_root_star);
+    assert_eq!(analysis.cte_facts.len(), 1);
+    assert_eq!(analysis.projections[0].type_hint.as_deref(), Some("INT"));
+    assert_eq!(
+        analysis.projections[0].passthrough_source.as_deref(),
+        Some("base")
+    );
+    assert!(analysis.relations.is_empty());
+    assert!(analysis.base_tables.is_empty());
+    assert!(analysis.star_projections.is_empty());
+    assert!(analysis.set_operations.is_empty());
+    assert!(analysis.column_uses.is_empty());
+}
+
+#[test]
+fn analyze_query_for_project_projections_retains_root_star_presence() {
+    let analysis = analyze_query_for_project_projections(
+        "SELECT * FROM orders",
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert!(analysis.has_root_star);
+    assert!(analysis.star_projections.is_empty());
+    assert!(!analysis.projections.is_empty());
+}
+
+#[test]
 fn analyze_query_reports_set_operation_cte_projection_facts() {
     let analysis = analyze_query_with_cte_projections(
-        "WITH current_orders AS (\
-           SELECT CAST(amount AS VARCHAR(3)) AS value FROM orders\
-         ), combined AS (\
-           SELECT value FROM current_orders UNION ALL SELECT CAST(NULL AS VARCHAR(3)) FROM orders\
-         ) SELECT value FROM combined",
+        r#"WITH current_orders AS (
+             SELECT CAST(amount AS VARCHAR(3)) AS value FROM orders
+           ), combined AS (
+             SELECT value FROM current_orders
+             -- Preserve archived records.
+             UNION ALL SELECT CAST(NULL AS VARCHAR(3)) FROM orders
+           ) SELECT value FROM combined"#,
         AnalyzeQueryOptions {
             complexity_guard: None,
             dialect: DialectType::Generic,
@@ -1201,11 +1249,140 @@ fn analyze_query_reports_set_operation_cte_projection_facts() {
     assert_eq!(analysis.cte_facts[1].shape, Some(QueryShape::SetOperation));
     assert_eq!(analysis.cte_facts[1].projections.len(), 1);
     assert_eq!(
-        analysis.cte_facts[1].projections[0].upstream[0]
-            .source_name
+        analysis.cte_facts[1].projections[0]
+            .passthrough_source
             .as_deref(),
         Some("current_orders")
     );
+}
+
+fn compact_schema() -> ValidationSchema {
+    serde_json::from_value(json!({
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type": "INT", "nullable": false},
+                    {"name": "amount", "type": "DECIMAL(10,2)", "nullable": true}
+                ]
+            },
+            {
+                "name": "products",
+                "columns": [
+                    {"name": "product_id", "type": "INT", "nullable": false}
+                ]
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+fn compact_options() -> AnalyzeQueryOptions {
+    AnalyzeQueryOptions {
+        complexity_guard: None,
+        dialect: DialectType::DuckDB,
+        schema: Some(compact_schema()),
+    }
+}
+
+#[test]
+fn analyze_query_with_cte_projections_expands_schema_backed_root_stars() {
+    let analysis = analyze_query_with_cte_projections(
+        "SELECT * FROM orders o JOIN products p ON o.id = p.product_id",
+        compact_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        analysis
+            .projections
+            .iter()
+            .map(|projection| projection.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("id"), Some("amount"), Some("product_id")]
+    );
+    assert_eq!(
+        analysis
+            .projections
+            .iter()
+            .map(|projection| projection.type_hint.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("INT"), Some("DECIMAL(10, 2)"), Some("INT")]
+    );
+    assert_eq!(
+        analysis.projections[0].nullability,
+        ProjectionNullability::NonNull
+    );
+    assert_eq!(
+        analysis.projections[1].nullability,
+        ProjectionNullability::Nullable
+    );
+}
+
+#[test]
+fn analyze_query_with_cte_projections_expands_comment_wrapped_union_stars() {
+    let analysis = analyze_query_with_cte_projections(
+        r#"WITH c AS (
+             SELECT * FROM orders
+           ), d AS (
+             SELECT * FROM c
+             -- Preserve archived records.
+             UNION ALL SELECT * FROM c
+           )
+           SELECT * FROM d"#,
+        compact_options(),
+    )
+    .unwrap();
+
+    assert_eq!(analysis.cte_facts[1].projections.len(), 2);
+    assert_eq!(
+        analysis.cte_facts[1]
+            .projections
+            .iter()
+            .map(|projection| projection.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("id"), Some("amount")]
+    );
+    assert_eq!(analysis.projections.len(), 2);
+    assert_eq!(
+        analysis.projections[0].nullability,
+        ProjectionNullability::NonNull
+    );
+    assert_eq!(
+        analysis.projections[1].nullability,
+        ProjectionNullability::Nullable
+    );
+}
+
+#[test]
+fn analyze_query_with_cte_projections_recovers_only_real_cte_passthroughs() {
+    let joined = analyze_query_with_cte_projections(
+        "WITH c AS (SELECT id FROM orders), d AS (\
+         SELECT id FROM c JOIN products p ON c.id = p.product_id\
+         ) SELECT * FROM d",
+        compact_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        joined.cte_facts[1].projections[0]
+            .passthrough_source
+            .as_deref(),
+        Some("c")
+    );
+    assert_eq!(
+        joined.cte_facts[1].projections[0]
+            .passthrough_column
+            .as_deref(),
+        Some("id")
+    );
+
+    let shadowed = analyze_query_with_cte_projections(
+        "WITH c AS (SELECT id FROM orders) SELECT c.product_id FROM products c",
+        compact_options(),
+    )
+    .unwrap();
+    assert_eq!(shadowed.projections[0].passthrough_source, None);
+    assert_eq!(shadowed.projections[0].passthrough_column, None);
 }
 
 #[test]
@@ -1471,7 +1648,7 @@ fn analyze_query_reports_set_operations() {
 
 #[test]
 fn analyze_query_bounds_wide_set_operation_cte_lineage() {
-    let branches = (0..16)
+    let branches = (0..267)
         .map(|branch| {
             format!(
                 "SELECT {} AS bucket, {} AS offset_seconds, CAST({} AS DOUBLE) AS adjustment",
@@ -1482,7 +1659,7 @@ fn analyze_query_bounds_wide_set_operation_cte_lineage() {
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let metrics = (0..70)
+    let metrics = (0..270)
         .map(|metric| {
             format!(
                 ", CAST(MAX(CASE WHEN bucket = {} AND offset_seconds = {} THEN amount + adjustment END) AS DOUBLE) AS metric_{metric:04}",
@@ -1501,17 +1678,24 @@ fn analyze_query_bounds_wide_set_operation_cte_lineage() {
          FROM measurements"
     );
 
-    let analysis = analyze_query(
-        &sql,
-        AnalyzeQueryOptions {
-            complexity_guard: None,
-            dialect: DialectType::DuckDB,
-            schema: Some(schema()),
-        },
-    )
-    .unwrap();
+    let analysis = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    complexity_guard: None,
+                    dialect: DialectType::DuckDB,
+                    schema: Some(schema()),
+                },
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(analysis.projections.len(), 73);
+    assert_eq!(analysis.projections.len(), 273);
     assert_eq!(analysis.cte_facts.len(), 2);
     assert!(analysis
         .base_tables
@@ -1524,6 +1708,65 @@ fn analyze_query_bounds_wide_set_operation_cte_lineage() {
             .iter()
             .any(|reference| reference.column == "amount")
     }));
+}
+
+#[test]
+fn analyze_query_wide_lineage_cache_preserves_resolution_boundaries() {
+    let constants = (0..65)
+        .map(|index| format!(", {index} AS constant_{index}"))
+        .collect::<String>();
+    let same_select = analyze_query(
+        &format!("SELECT id AS x, x + 1 AS y{constants} FROM orders"),
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(compact_schema()),
+        },
+    )
+    .unwrap();
+    assert!(same_select.projections[1].upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("orders")
+            && reference.column == "id"
+            && reference.confidence == ReferenceConfidence::Resolved
+    }));
+
+    let set_operation = analyze_query(
+        &format!(
+            "SELECT id{constants} FROM orders UNION ALL \
+             SELECT product_id{constants} FROM products"
+        ),
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(compact_schema()),
+        },
+    )
+    .unwrap();
+    assert!(set_operation.projections[0]
+        .upstream
+        .iter()
+        .any(|reference| reference.table.as_deref() == Some("orders")));
+    assert!(set_operation.projections[0]
+        .upstream
+        .iter()
+        .any(|reference| reference.table.as_deref() == Some("products")));
+
+    let ambiguous = analyze_query(
+        &format!(
+            "WITH c AS (SELECT id FROM orders a CROSS JOIN customers b) \
+             SELECT c.id{constants} FROM c"
+        ),
+        AnalyzeQueryOptions {
+            complexity_guard: None,
+            dialect: DialectType::DuckDB,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ambiguous.projections[0].upstream[0].confidence,
+        ReferenceConfidence::Ambiguous
+    );
 }
 
 #[test]
