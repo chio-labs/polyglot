@@ -977,16 +977,16 @@ const MAX_LINEAGE_DEPTH: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ScopeId(usize);
 
-struct IndexedScope {
-    scope: Scope,
+struct IndexedScope<'a> {
+    scope: &'a Scope,
     subquery_scopes: Vec<ScopeId>,
     derived_table_scopes: Vec<ScopeId>,
     cte_scopes: Vec<ScopeId>,
     union_scopes: Vec<ScopeId>,
 }
 
-struct LineageScopeContext {
-    scopes: Vec<IndexedScope>,
+struct LineageScopeContext<'a> {
+    scopes: Vec<IndexedScope<'a>>,
     /// Usage analysis must not claim undeclared qualifiers as physical tables.
     conservative: bool,
 }
@@ -996,21 +996,25 @@ struct LineageScopeContext {
 /// This keeps CTE, derived-table, virtual-source and set-operation tracing shared
 /// with projection lineage, without manufacturing SELECT projections.
 #[cfg(feature = "generate")]
-pub(crate) struct ScopedLineage {
-    context: LineageScopeContext,
+pub(crate) struct ScopedLineage<'a> {
+    context: LineageScopeContext<'a>,
     root: ScopeId,
     ctes: Vec<ScopeId>,
     dialect: Option<DialectType>,
 }
 
 #[cfg(feature = "generate")]
-impl ScopedLineage {
-    pub(crate) fn new(scope: Scope, inherited_ctes: &[Scope], dialect: DialectType) -> Self {
+impl<'a> ScopedLineage<'a> {
+    pub(crate) fn new(
+        scope: &'a Scope,
+        inherited_ctes: &[&'a Scope],
+        dialect: DialectType,
+    ) -> Self {
         let visible_ctes = scope.cte_sources.clone();
         let (mut context, root) = LineageScopeContext::from_scope(scope);
         context.conservative = true;
         let mut ctes = context.indexed(root).cte_scopes.clone();
-        for cte_scope in inherited_ctes {
+        for &cte_scope in inherited_ctes {
             if let Expression::Cte(cte) = &cte_scope.expression {
                 if visible_ctes
                     .get(&cte.alias.name)
@@ -1019,7 +1023,7 @@ impl ScopedLineage {
                         .iter()
                         .any(|id| context.scope(*id).expression == cte_scope.expression)
                 {
-                    ctes.push(context.insert_scope(cte_scope.clone()));
+                    ctes.push(context.insert_scope(cte_scope));
                 }
             }
         }
@@ -1096,8 +1100,8 @@ impl ScopedLineage {
     }
 }
 
-impl LineageScopeContext {
-    fn from_scope(scope: Scope) -> (Self, ScopeId) {
+impl<'a> LineageScopeContext<'a> {
+    fn from_scope(scope: &'a Scope) -> (Self, ScopeId) {
         let mut context = Self {
             scopes: Vec::new(),
             conservative: false,
@@ -1106,21 +1110,25 @@ impl LineageScopeContext {
         (context, root)
     }
 
-    fn insert_scope(&mut self, mut scope: Scope) -> ScopeId {
-        let subquery_scopes = std::mem::take(&mut scope.subquery_scopes)
-            .into_iter()
+    fn insert_scope(&mut self, scope: &'a Scope) -> ScopeId {
+        let subquery_scopes = scope
+            .subquery_scopes
+            .iter()
             .map(|child| self.insert_scope(child))
             .collect();
-        let derived_table_scopes = std::mem::take(&mut scope.derived_table_scopes)
-            .into_iter()
+        let derived_table_scopes = scope
+            .derived_table_scopes
+            .iter()
             .map(|child| self.insert_scope(child))
             .collect();
-        let cte_scopes = std::mem::take(&mut scope.cte_scopes)
-            .into_iter()
+        let cte_scopes = scope
+            .cte_scopes
+            .iter()
             .map(|child| self.insert_scope(child))
             .collect();
-        let union_scopes = std::mem::take(&mut scope.union_scopes)
-            .into_iter()
+        let union_scopes = scope
+            .union_scopes
+            .iter()
             .map(|child| self.insert_scope(child))
             .collect();
 
@@ -1135,12 +1143,12 @@ impl LineageScopeContext {
         id
     }
 
-    fn indexed(&self, id: ScopeId) -> &IndexedScope {
+    fn indexed(&self, id: ScopeId) -> &IndexedScope<'a> {
         &self.scopes[id.0]
     }
 
     fn scope(&self, id: ScopeId) -> &Scope {
-        &self.indexed(id).scope
+        self.indexed(id).scope
     }
 }
 
@@ -1154,7 +1162,7 @@ fn to_node(
     reference_node_name: &str,
     trim_selects: bool,
 ) -> Result<LineageNode> {
-    let (context, scope_id) = LineageScopeContext::from_scope(scope);
+    let (context, scope_id) = LineageScopeContext::from_scope(&scope);
     to_node_inner(
         column,
         &context,
@@ -1520,7 +1528,15 @@ fn handle_set_operation(
             .unwrap_or_else(|| format!("_{col_index}")),
     };
 
-    let mut node = LineageNode::new(&col_name, scope_expr.clone(), scope_expr.clone());
+    let mut node = if context.conservative {
+        LineageNode::new(
+            &col_name,
+            Expression::Null(crate::expressions::Null),
+            Expression::Null(crate::expressions::Null),
+        )
+    } else {
+        LineageNode::new(&col_name, scope_expr.clone(), scope_expr.clone())
+    };
     if let Some(scope_type) = scope_type_override {
         apply_scope_context_with_type(
             &mut node,

@@ -33,8 +33,15 @@ pub(super) fn collect(
 struct Frame<'a> {
     path: String,
     selected: Scope,
-    lineage: &'a ScopedLineage,
+    lineage: Option<&'a ScopedLineage<'a>>,
     subqueries: Vec<Expression>,
+}
+
+impl<'a> Frame<'a> {
+    fn lineage(&self) -> &'a ScopedLineage<'a> {
+        self.lineage
+            .expect("column-use scope requiring lineage must initialize it")
+    }
 }
 
 struct Collector<'a> {
@@ -45,6 +52,56 @@ struct Collector<'a> {
     guard: Option<ComplexityGuardOptions>,
 }
 
+fn scope_requires_lineage(query: &Expression, filter_branch: bool) -> bool {
+    match query {
+        Expression::Select(select) => {
+            filter_branch
+                || select.where_clause.is_some()
+                || select
+                    .group_by
+                    .as_ref()
+                    .is_some_and(|group| !group.expressions.is_empty())
+                || select.having.is_some()
+                || select.qualify.is_some()
+                || select
+                    .windows
+                    .as_ref()
+                    .is_some_and(|windows| !windows.is_empty())
+                || select
+                    .order_by
+                    .as_ref()
+                    .is_some_and(|order| !order.expressions.is_empty())
+                || select.joins.iter().any(|join| {
+                    join.on.is_some()
+                        || join.match_condition.is_some()
+                        || !join.using.is_empty()
+                        || matches!(
+                            join.kind,
+                            JoinKind::Natural
+                                | JoinKind::NaturalLeft
+                                | JoinKind::NaturalRight
+                                | JoinKind::NaturalFull
+                        )
+                })
+                || select.expressions.iter().any(|projection| {
+                    projection.dfs().any(|node| {
+                        matches!(
+                            node,
+                            Expression::WindowFunction(_)
+                                | Expression::Filter(_)
+                                | Expression::WithinGroup(_)
+                                | Expression::AggregateFunction(_)
+                        )
+                    })
+                })
+        }
+        Expression::Union(set_operation) => set_operation.order_by.is_some(),
+        Expression::Intersect(set_operation) => set_operation.order_by.is_some(),
+        Expression::Except(set_operation) => set_operation.order_by.is_some(),
+        _ => true,
+    }
+}
+
 impl Collector<'_> {
     fn scope(
         &mut self,
@@ -52,27 +109,35 @@ impl Collector<'_> {
         prepared: &Scope,
         path: &str,
         ancestors: &[&Frame],
-        inherited_ctes: &[Scope],
+        inherited_ctes: &[&Scope],
         filter_branch: bool,
     ) {
-        let lineage = ScopedLineage::new(prepared.clone(), inherited_ctes, self.dialect);
+        let query = scope_query(&original.expression);
+        let requires_lineage = scope_requires_lineage(query, filter_branch)
+            || !original.subquery_scopes.is_empty()
+            || !original.udtf_scopes.is_empty();
+        let lineage =
+            requires_lineage.then(|| ScopedLineage::new(prepared, inherited_ctes, self.dialect));
         let frame = Frame {
             path: path.to_string(),
-            selected: selected_reference_scope(original),
-            lineage: &lineage,
+            selected: if requires_lineage {
+                selected_reference_scope(original)
+            } else {
+                Scope::new(Expression::Null(crate::expressions::Null))
+            },
+            lineage: lineage.as_ref(),
             subqueries: original
                 .subquery_scopes
                 .iter()
                 .map(|scope| scope.expression.clone())
                 .collect(),
         };
-        let query = scope_query(&original.expression);
         self.scan(query, "", &frame, ancestors, filter_branch, true);
         if let Expression::Select(select) = query {
             self.implicit_joins(select, path, &frame, ancestors);
         }
 
-        let mut ctes = prepared.cte_scopes.clone();
+        let mut ctes: Vec<&Scope> = prepared.cte_scopes.iter().collect();
         ctes.extend_from_slice(inherited_ctes);
         let outer: Vec<_> = std::iter::once(&frame)
             .chain(ancestors.iter().copied())
@@ -241,13 +306,13 @@ impl Collector<'_> {
             && projection_is_star(unwrap_projection_alias(expression))
         {
             return frame
-                .lineage
+                .lineage()
                 .output_names()
                 .iter()
                 .enumerate()
                 .flat_map(|(index, _)| {
                     frame
-                        .lineage
+                        .lineage()
                         .output(index)
                         .ok()
                         .map(|node| {
@@ -264,7 +329,7 @@ impl Collector<'_> {
                         value.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
                     {
                         return frame
-                            .lineage
+                            .lineage()
                             .output(ordinal)
                             .ok()
                             .map(|node| self.lineage_references(&node, None, true))
@@ -287,7 +352,7 @@ impl Collector<'_> {
                     .iter()
                     .position(|query| scope_query(query) == scope_query(node))
                 {
-                    if let Ok(lineage) = frame.lineage.subquery_output(index) {
+                    if let Ok(lineage) = frame.lineage().subquery_output(index) {
                         references.extend(self.lineage_references(&lineage, None, false));
                     }
                 }
@@ -369,7 +434,7 @@ impl Collector<'_> {
                     | ColumnUseContext::Qualify
             )
         {
-            let aliases = frame.lineage.output_names();
+            let aliases = frame.lineage().output_names();
             let ordinals: Vec<_> = aliases
                 .iter()
                 .enumerate()
@@ -382,7 +447,7 @@ impl Collector<'_> {
                 return vec![unresolved(column, ReferenceConfidence::Ambiguous)];
             }
             if alias_wins && ordinals.len() == 1 {
-                if let Ok(node) = frame.lineage.output(ordinals[0]) {
+                if let Ok(node) = frame.lineage().output(ordinals[0]) {
                     return self.lineage_references(&node, span, true);
                 }
             }
@@ -408,7 +473,7 @@ impl Collector<'_> {
                     return vec![unresolved(column, ReferenceConfidence::Unknown)];
                 }
                 return self.lineage_references(
-                    &owner.lineage.column(source, &column.name.name),
+                    &owner.lineage().column(source, &column.name.name),
                     span,
                     false,
                 );
@@ -433,7 +498,7 @@ impl Collector<'_> {
                         .iter()
                         .flat_map(|source| {
                             self.lineage_references(
-                                &owner.lineage.column(source, &column.name.name),
+                                &owner.lineage().column(source, &column.name.name),
                                 span,
                                 true,
                             )
@@ -444,14 +509,14 @@ impl Collector<'_> {
             }
             if definite.len() == 1 && open.iter().all(|source| source == &definite[0]) {
                 return self.lineage_references(
-                    &owner.lineage.column(&definite[0], &column.name.name),
+                    &owner.lineage().column(&definite[0], &column.name.name),
                     span,
                     true,
                 );
             }
             if definite.is_empty() && open.len() == 1 {
                 return self.lineage_references(
-                    &owner.lineage.column(&open[0], &column.name.name),
+                    &owner.lineage().column(&open[0], &column.name.name),
                     span,
                     true,
                 );
