@@ -32,7 +32,7 @@ pub enum ScopeType {
 }
 
 /// Semantic kind of a source registered in a scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// Root query or statement context
@@ -163,7 +163,7 @@ pub struct Scope {
     pub lateral_sources: HashMap<String, SourceInfo>,
 
     /// CTE sources available to this scope
-    pub cte_sources: HashMap<String, SourceInfo>,
+    pub cte_sources: std::sync::Arc<HashMap<String, SourceInfo>>,
 
     /// If this is a derived table or CTE with alias columns, this is that list
     /// e.g., `SELECT * FROM (SELECT ...) AS y(col1, col2)` => ["col1", "col2"]
@@ -206,7 +206,7 @@ impl Scope {
             scope_type: ScopeType::Root,
             sources: HashMap::new(),
             lateral_sources: HashMap::new(),
-            cte_sources: HashMap::new(),
+            cte_sources: std::sync::Arc::new(HashMap::new()),
             outer_columns: Vec::new(),
             can_be_correlated: false,
             subquery_scopes: Vec::new(),
@@ -313,7 +313,7 @@ impl Scope {
     /// Add a CTE source to this scope
     pub fn add_cte_source(&mut self, name: String, expression: Expression) {
         let info = SourceInfo::new(expression, true, SourceKind::Cte);
-        self.cte_sources.insert(name.clone(), info.clone());
+        std::sync::Arc::make_mut(&mut self.cte_sources).insert(name.clone(), info.clone());
         self.sources.insert(name, info);
         self.clear_cache();
     }
@@ -657,7 +657,7 @@ pub(crate) fn build_scope_with_ctes(
     ctes: &HashMap<String, SourceInfo>,
 ) -> Scope {
     let mut root = Scope::new(expression.clone());
-    root.cte_sources = ctes.clone();
+    root.cte_sources = std::sync::Arc::new(ctes.clone());
     build_scope_impl(expression, &mut root);
     root
 }

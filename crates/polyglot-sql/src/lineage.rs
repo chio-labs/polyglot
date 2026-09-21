@@ -18,6 +18,7 @@ use crate::scope::{
 };
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// The ordered output description of a query.
@@ -987,9 +988,34 @@ struct IndexedScope<'a> {
 }
 
 struct LineageScopeContext<'a> {
+    projection_indexes: RefCell<HashMap<*const Expression, Option<ProjectionLookupIndex>>>,
     scopes: Vec<IndexedScope<'a>>,
+    scope_ids: HashMap<*const Scope, ScopeId>,
+    resolved_states: RefCell<HashSet<LineageResolutionState>>,
     /// Usage analysis must not claim undeclared qualifiers as physical tables.
     conservative: bool,
+}
+
+struct ProjectionLookupIndex {
+    names: HashMap<String, Vec<usize>>,
+    ordinals: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LineageResolutionColumn {
+    Name(String),
+    Index(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LineageResolutionState {
+    column: LineageResolutionColumn,
+    scope_id: ScopeId,
+    scope_name: String,
+    source_name: String,
+    reference_node_name: String,
+    trim_selects: bool,
+    ancestor_cte_scopes: Vec<ScopeId>,
 }
 
 /// Reuse the lineage resolver for analysis of non-output column occurrences.
@@ -1037,6 +1063,7 @@ impl<'a> ScopedLineage<'a> {
     }
 
     pub(crate) fn column(&self, source: &str, column: &str) -> LineageNode {
+        self.context.reset_resolved_states();
         let mut node = LineageNode::new(
             column,
             Expression::qualified_column(source, column),
@@ -1058,6 +1085,7 @@ impl<'a> ScopedLineage<'a> {
     }
 
     pub(crate) fn output(&self, ordinal: usize) -> Result<LineageNode> {
+        self.context.reset_resolved_states();
         to_node_inner(
             ColumnRef::Index(ordinal),
             &self.context,
@@ -1080,6 +1108,7 @@ impl<'a> ScopedLineage<'a> {
     }
 
     pub(crate) fn subquery_output(&self, index: usize) -> Result<LineageNode> {
+        self.context.reset_resolved_states();
         let scope_id = *self
             .context
             .indexed(self.root)
@@ -1104,7 +1133,10 @@ impl<'a> ScopedLineage<'a> {
 impl<'a> LineageScopeContext<'a> {
     fn from_scope(scope: &'a Scope) -> (Self, ScopeId) {
         let mut context = Self {
+            projection_indexes: RefCell::new(HashMap::new()),
             scopes: Vec::new(),
+            scope_ids: HashMap::new(),
+            resolved_states: RefCell::new(HashSet::new()),
             conservative: false,
         };
         let root = context.insert_scope(scope);
@@ -1112,6 +1144,19 @@ impl<'a> LineageScopeContext<'a> {
     }
 
     fn insert_scope(&mut self, scope: &'a Scope) -> ScopeId {
+        let scope_key = scope as *const Scope;
+        if let Some(id) = self.scope_ids.get(&scope_key) {
+            return *id;
+        }
+        let id = ScopeId(self.scopes.len());
+        self.scope_ids.insert(scope_key, id);
+        self.scopes.push(IndexedScope {
+            scope,
+            subquery_scopes: Vec::new(),
+            derived_table_scopes: Vec::new(),
+            cte_scopes: Vec::new(),
+            union_scopes: Vec::new(),
+        });
         let subquery_scopes = scope
             .subquery_scopes
             .iter()
@@ -1133,14 +1178,13 @@ impl<'a> LineageScopeContext<'a> {
             .map(|child| self.insert_scope(child))
             .collect();
 
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(IndexedScope {
+        self.scopes[id.0] = IndexedScope {
             scope,
             subquery_scopes,
             derived_table_scopes,
             cte_scopes,
             union_scopes,
-        });
+        };
         id
     }
 
@@ -1150,6 +1194,102 @@ impl<'a> LineageScopeContext<'a> {
 
     fn scope(&self, id: ScopeId) -> &Scope {
         self.indexed(id).scope
+    }
+
+    fn select_expression(
+        &self,
+        expression: &Expression,
+        column: &ColumnRef<'_>,
+        dialect: Option<DialectType>,
+    ) -> Result<Expression> {
+        let Expression::Select(select) = expression else {
+            return find_select_expr(expression, column, dialect);
+        };
+        let mut indexes = self.projection_indexes.borrow_mut();
+        let index = indexes
+            .entry(expression as *const Expression)
+            .or_insert_with(|| {
+                let layout = output_layout(select);
+                if layout
+                    .iter()
+                    .any(|entry| matches!(entry.column, OutputColumn::Wildcard { .. }))
+                {
+                    return None;
+                }
+                let mut names: HashMap<String, Vec<usize>> = HashMap::new();
+                let mut ordinals = Vec::with_capacity(layout.len());
+                for entry in layout {
+                    if let OutputColumn::Named { name, .. } = &entry.column {
+                        names
+                            .entry(normalize_column_name(name, dialect))
+                            .or_default()
+                            .push(entry.projection_index);
+                    }
+                    ordinals.push(entry.projection_index);
+                }
+                Some(ProjectionLookupIndex { names, ordinals })
+            });
+        let Some(index) = index else {
+            return find_select_expr(expression, column, dialect);
+        };
+        let projection_index = match column {
+            ColumnRef::Index(ordinal) => *index.ordinals.get(*ordinal).ok_or_else(|| {
+                ordinal_resolution_error(*ordinal, ColumnResolutionReason::NotFound)
+            })?,
+            ColumnRef::Name(name) => match index
+                .names
+                .get(&normalize_column_name(name, dialect))
+                .map(Vec::as_slice)
+            {
+                Some([ordinal]) => *ordinal,
+                Some(_) => {
+                    return Err(name_resolution_error(
+                        name,
+                        ColumnResolutionReason::Ambiguous,
+                    ))
+                }
+                None => {
+                    return Err(name_resolution_error(
+                        name,
+                        ColumnResolutionReason::NotFound,
+                    ))
+                }
+            },
+        };
+        Ok(select.expressions[projection_index].clone())
+    }
+
+    fn reset_resolved_states(&self) {
+        self.resolved_states.borrow_mut().clear();
+    }
+
+    fn observe_resolution_state(
+        &self,
+        column: &ColumnRef<'_>,
+        scope_id: ScopeId,
+        scope_name: &str,
+        source_name: &str,
+        reference_node_name: &str,
+        trim_selects: bool,
+        ancestor_cte_scopes: &[ScopeId],
+    ) -> bool {
+        if !self.conservative {
+            return true;
+        }
+        self.resolved_states
+            .borrow_mut()
+            .insert(LineageResolutionState {
+                column: match column {
+                    ColumnRef::Name(name) => LineageResolutionColumn::Name((*name).to_string()),
+                    ColumnRef::Index(index) => LineageResolutionColumn::Index(*index),
+                },
+                scope_id,
+                scope_name: scope_name.to_string(),
+                source_name: source_name.to_string(),
+                reference_node_name: reference_node_name.to_string(),
+                trim_selects,
+                ancestor_cte_scopes: ancestor_cte_scopes.to_vec(),
+            })
     }
 }
 
@@ -1190,6 +1330,21 @@ fn to_node_inner(
     ancestor_cte_scopes: &[ScopeId],
     depth: usize,
 ) -> Result<LineageNode> {
+    if !context.observe_resolution_state(
+        &column,
+        scope_id,
+        scope_name,
+        source_name,
+        reference_node_name,
+        trim_selects,
+        ancestor_cte_scopes,
+    ) {
+        return Ok(LineageNode::new(
+            "",
+            Expression::Null(crate::expressions::Null),
+            Expression::Null(crate::expressions::Null),
+        ));
+    }
     if depth > MAX_LINEAGE_DEPTH {
         return Err(Error::internal(format!(
             "lineage recursion depth exceeded (>{MAX_LINEAGE_DEPTH}) — possible circular CTE reference for scope '{scope_name}'"
@@ -1247,7 +1402,7 @@ fn to_node_inner(
     }
 
     // 2. Find the select expression for this column
-    let select_expr = find_select_expr(effective_expr, lookup_column, dialect)?;
+    let select_expr = context.select_expression(effective_expr, lookup_column, dialect)?;
     let column_name = resolve_column_name(&column, &select_expr);
 
     // 3. Trim source if requested
@@ -4465,6 +4620,34 @@ mod tests {
             names.iter().any(|name| name == expected),
             "expected {expected} in lineage, got {names:?}"
         );
+    }
+
+    #[test]
+    fn scoped_lineage_indexes_shared_scope_graph_once() {
+        let expression = parse(
+            "WITH base AS (SELECT order_id FROM orders), first_pass AS (SELECT order_id FROM base UNION ALL SELECT order_id FROM base), second_pass AS (SELECT order_id FROM first_pass UNION ALL SELECT order_id FROM first_pass) SELECT order_id FROM second_pass",
+        );
+        let scope = build_scope(&expression);
+        let (context, _) = LineageScopeContext::from_scope(&scope);
+        let mut unique_scopes: HashSet<*const Scope> = HashSet::new();
+        collect_unique_scope_pointers(&scope, &mut unique_scopes);
+
+        assert_eq!(context.scopes.len(), unique_scopes.len());
+    }
+
+    fn collect_unique_scope_pointers(scope: &Scope, pointers: &mut HashSet<*const Scope>) {
+        if !pointers.insert(scope as *const Scope) {
+            return;
+        }
+        for child in scope
+            .subquery_scopes
+            .iter()
+            .chain(&scope.derived_table_scopes)
+            .chain(&scope.cte_scopes)
+            .chain(&scope.union_scopes)
+        {
+            collect_unique_scope_pointers(child, pointers);
+        }
     }
 
     const ISSUE_368_SQL: &str = "with

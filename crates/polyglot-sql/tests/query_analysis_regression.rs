@@ -1,7 +1,9 @@
 use polyglot_sql::lineage::{get_source_tables, lineage};
+use polyglot_sql::scope::SourceKind;
 use polyglot_sql::traversal::get_all_tables;
 use polyglot_sql::{
-    analyze_query, generate, parse, AnalyzeQueryOptions, DialectType, Expression, TransformKind,
+    analyze_query, analyze_query_for_project_projections, generate, parse, AnalyzeQueryOptions,
+    DialectType, Expression, TransformKind, ValidationSchema,
 };
 
 fn first_projection(sql: &str) -> polyglot_sql::ProjectionFact {
@@ -19,6 +21,69 @@ fn first_projection(sql: &str) -> polyglot_sql::ProjectionFact {
         .into_iter()
         .next()
         .expect("expected one projection")
+}
+
+#[test]
+fn project_analysis_deduplicates_repeated_cte_lineage_states() {
+    let mut ctes = vec!["base AS (SELECT order_id FROM orders)".to_string()];
+    for index in 1..=24 {
+        let previous = if index == 1 {
+            "base".to_string()
+        } else {
+            format!("stage_{}", index - 1)
+        };
+        ctes.push(format!(
+            "stage_{index} AS (SELECT order_id FROM {previous} UNION ALL SELECT order_id FROM {previous})"
+        ));
+    }
+    let sql = format!("WITH {} SELECT order_id FROM stage_24", ctes.join(", "));
+
+    let analysis = analyze_query_for_project_projections(
+        &sql,
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            ..Default::default()
+        },
+    )
+    .expect("repeated CTE lineage should remain bounded");
+    let projection = analysis
+        .projections
+        .first()
+        .expect("expected one projection");
+
+    assert_eq!(projection.upstream.len(), 1);
+    assert_eq!(projection.upstream[0].source_kind, SourceKind::Table);
+    assert_eq!(projection.upstream[0].table.as_deref(), Some("orders"));
+    assert_eq!(projection.upstream[0].column, "order_id");
+}
+
+#[test]
+fn project_analysis_preserves_declared_type_spelling_for_direct_columns() {
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({
+        "tables": [{
+            "name": "orders",
+            "columns": [{"name": "attributes", "type": "VARIANT"}]
+        }]
+    }))
+    .expect("schema should deserialize");
+    let analysis = analyze_query_for_project_projections(
+        "WITH base AS (SELECT attributes FROM orders UNION ALL SELECT attributes FROM orders), selected AS (SELECT attributes FROM base) SELECT attributes FROM selected",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Snowflake,
+            schema: Some(schema),
+            ..Default::default()
+        },
+    )
+    .expect("query should analyze");
+
+    assert_eq!(
+        analysis.projections[0].type_hint.as_deref(),
+        Some("VARIANT")
+    );
+    assert_eq!(
+        analysis.cte_facts[0].projections[0].type_hint.as_deref(),
+        Some("VARIANT")
+    );
 }
 
 fn parse_one_statement(sql: &str, dialect: DialectType) -> Expression {
@@ -87,6 +152,25 @@ fn analyze_query_reports_transform_function_wrapped_in_cast() {
     assert_eq!(transform.column_args.len(), 1);
     assert_eq!(transform.column_args[0].table.as_deref(), Some("orders"));
     assert_eq!(transform.column_args[0].column, "created_at");
+}
+
+#[test]
+fn analyze_query_reports_specialized_aggregate_transform_function() {
+    let analysis = analyze_query(
+        "SELECT OBJECT_AGG(product_id, TO_VARIANT(quantity)) AS inventory FROM products",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Snowflake,
+            ..Default::default()
+        },
+    )
+    .expect("query should analyze");
+    let transform = analysis.projections[0]
+        .transform_function
+        .as_ref()
+        .expect("OBJECT_AGG should be reported");
+
+    assert_eq!(transform.name, "OBJECT_AGG");
+    assert_eq!(transform.column_args.len(), 2);
 }
 
 #[test]

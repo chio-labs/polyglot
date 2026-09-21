@@ -640,6 +640,7 @@ pub fn mapping_schema_from_validation_schema_with_dialect(
     let broad_schema = build_resolver_schema(schema);
     let dialect_impl = Dialect::get(dialect);
     let mut mapping = MappingSchema::with_dialect(dialect);
+    let mut parsed_types: HashMap<&str, DataType> = HashMap::new();
 
     for table in &schema.tables {
         let fallback_table = lower(&table.name);
@@ -647,13 +648,20 @@ pub fn mapping_schema_from_validation_schema_with_dialect(
             .columns
             .iter()
             .map(|column| {
-                let data_type = dialect_impl
-                    .parse_data_type(column.data_type.trim())
-                    .unwrap_or_else(|_| {
-                        broad_schema
+                let type_text = column.data_type.trim();
+                let data_type = if let Some(data_type) = parsed_types.get(type_text) {
+                    data_type.clone()
+                } else {
+                    match dialect_impl.parse_data_type(type_text) {
+                        Ok(data_type) => {
+                            parsed_types.insert(type_text, data_type.clone());
+                            data_type
+                        }
+                        Err(_) => broad_schema
                             .get_column_type(&fallback_table, &column.name)
-                            .unwrap_or(DataType::Unknown)
-                    });
+                            .unwrap_or(DataType::Unknown),
+                    }
+                };
                 (column.name.clone(), data_type)
             })
             .collect();
