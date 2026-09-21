@@ -927,9 +927,13 @@ fn projection_sources_for_query(
     dialect: DialectType,
 ) -> Vec<(&Expression, bool)> {
     match expression {
-        Expression::Subquery(subquery) => return projection_sources_for_query(&subquery.this, dialect),
+        Expression::Subquery(subquery) => {
+            return projection_sources_for_query(&subquery.this, dialect)
+        }
         Expression::Paren(paren) => return projection_sources_for_query(&paren.this, dialect),
-        Expression::Annotated(annotated) => return projection_sources_for_query(&annotated.this, dialect),
+        Expression::Annotated(annotated) => {
+            return projection_sources_for_query(&annotated.this, dialect)
+        }
         _ => {}
     }
     match crate::set_operation::set_operation_layout(expression, Some(dialect)) {
