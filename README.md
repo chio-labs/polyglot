@@ -306,7 +306,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.12.0", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.12.1", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.
@@ -350,10 +350,14 @@ cargo run --manifest-path examples/rust/Cargo.toml
 
 ```bash
 cd examples/typescript
-pnpm install --ignore-workspace && pnpm start
+pnpm install && pnpm start
 ```
 
 ## Building from Source
+
+Use pnpm 12 for the JavaScript workspace (CI uses pnpm 12.4.2 and Node.js 24).
+Run `pnpm install --frozen-lockfile` from the repository root before building.
+Required dependency build scripts are approved in `pnpm-workspace.yaml`.
 
 ```bash
 # Build Rust core

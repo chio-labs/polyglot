@@ -5,6 +5,8 @@
 
 /// Type annotation and coercion for SQL expressions
 pub mod annotate_types;
+/// Internal relation-output typing, separate from scalar expression coercion.
+pub(crate) mod set_operation_types;
 /// Canonicalization of SQL expressions into standard form
 pub mod canonicalize;
 /// Elimination of unused Common Table Expressions

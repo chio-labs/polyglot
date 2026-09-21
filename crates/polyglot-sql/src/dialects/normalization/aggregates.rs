@@ -681,11 +681,31 @@ pub(super) fn rewrite(
                         ))))
                     }
                     DialectType::DuckDB => {
-                        let name = if is_max { "ARG_MAX" } else { "ARG_MIN" };
-                        Ok(Expression::Function(Box::new(Function::new(
-                            name.to_string(),
-                            args,
-                        ))))
+                        let preserve_null_value = args.len() == 2
+                            && matches!(
+                                context.source,
+                                DialectType::Athena | DialectType::Presto | DialectType::Trino
+                            );
+                        // Trino/Presto retain a NULL value when its key wins.
+                        // DuckDB's ordinary ARG_MAX/ARG_MIN skip such rows.
+                        let name = match (is_max, preserve_null_value) {
+                            (true, true) => "ARG_MAX_NULL",
+                            (false, true) => "ARG_MIN_NULL",
+                            (true, false) => "ARG_MAX",
+                            (false, false) => "ARG_MIN",
+                        };
+                        // Renaming must retain FILTER and other aggregate modifiers.
+                        match e {
+                            Expression::AggregateFunction(mut af) => {
+                                af.name = name.to_string();
+                                Ok(Expression::AggregateFunction(af))
+                            }
+                            Expression::Function(mut f) => {
+                                f.name = name.to_string();
+                                Ok(Expression::Function(f))
+                            }
+                            _ => Ok(e),
+                        }
                     }
                     DialectType::Spark | DialectType::Databricks => {
                         let mut args = args;

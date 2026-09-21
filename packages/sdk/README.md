@@ -702,6 +702,14 @@ Types propagate through CTE and derived-table outputs. `transformKind` and
 lineage: a passthrough of a cast column is still `direct`, with the cast's result
 type in `typeHint`. Compact `upstream` references identify base dependencies;
 use the full lineage API to inspect intermediate CTEs and expressions.
+For set operations, `typeHint` describes the dialect's combined output type
+after positional or name alignment. For example, Snowflake INTEGER/FLOAT
+branches produce `FLOAT`. The combined `castType` is present only when every
+contributing branch explicitly casts to the same resolved type; branch facts
+retain their own casts. Unknown inputs, incompatible types, ambiguous layouts,
+and coercions that depend on unavailable engine settings leave `typeHint`
+unset. See [set-operation typing](../../docs/set-operation-types.md) for dialect
+rules and conservative limits.
 Each `setOperations[].branches[]` entry has a `role`: both `UNION` branches are
 `'value'`, while the right branch of `EXCEPT` and `INTERSECT` is `'filter'`.
 For physical relation facts, `name` remains the qualified display name while

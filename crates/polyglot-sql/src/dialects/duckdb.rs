@@ -7514,6 +7514,179 @@ mod tests {
     }
 
     #[test]
+    fn test_athena_max_by_preserves_filter() {
+        let sql = "SELECT max_by(value,seq) FILTER (WHERE keep) AS answer FROM (VALUES ('kept',1,true),('ignored',2,false)) t(value,seq,keep)";
+        assert_eq!(
+            transpile_to_duckdb_from(sql, DialectType::Athena),
+            "SELECT ARG_MAX_NULL(value, seq) FILTER(WHERE keep) AS answer FROM (VALUES ('kept', 1, TRUE), ('ignored', 2, FALSE)) AS t(value, seq, keep)"
+        );
+
+        for read in [DialectType::Athena, DialectType::Presto, DialectType::Trino] {
+            for (source, target) in [("MAX_BY", "ARG_MAX"), ("MIN_BY", "ARG_MIN")] {
+                for args in ["value, seq", "value, seq, 2"] {
+                    let target = if args == "value, seq" {
+                        format!("{target}_NULL")
+                    } else {
+                        target.to_string()
+                    };
+                    for suffix in ["", " OVER (PARTITION BY category)"] {
+                        let sql =
+                            format!("SELECT {source}({args}) FILTER (WHERE keep){suffix} FROM t");
+                        assert_eq!(
+                            transpile_to_duckdb_from(&sql, read),
+                            format!("SELECT {target}({args}) FILTER(WHERE keep){suffix} FROM t"),
+                            "{read:?}: {sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_athena_max_by_preserves_null_winner() {
+        for read in [DialectType::Athena, DialectType::Presto, DialectType::Trino] {
+            for (source, target) in [("MAX_BY", "ARG_MAX_NULL"), ("MIN_BY", "ARG_MIN_NULL")] {
+                let sql = format!(
+                    "SELECT {source}(value, seq) AS answer FROM (VALUES ('older', 1), (CAST(NULL AS VARCHAR), 2)) t(value, seq)"
+                );
+                assert_eq!(
+                    transpile_to_duckdb_from(&sql, read),
+                    format!("SELECT {target}(value, seq) AS answer FROM (VALUES ('older', 1), (CAST(NULL AS TEXT), 2)) AS t(value, seq)"),
+                    "{read:?}: {sql}"
+                );
+                assert_eq!(
+                    transpile_to_duckdb_from(
+                        &format!("SELECT {source}(DISTINCT value, seq) FILTER (WHERE keep) FROM t"),
+                        read,
+                    ),
+                    format!("SELECT {target}(DISTINCT value, seq) FILTER(WHERE keep) FROM t")
+                );
+            }
+        }
+
+        // DuckDB's native aliases intentionally skip NULL values.
+        for (source, target) in [("MAX_BY", "ARG_MAX"), ("MIN_BY", "ARG_MIN")] {
+            assert_eq!(
+                transpile_to_duckdb_from(
+                    &format!("SELECT {source}(value, seq) FROM t"),
+                    DialectType::DuckDB,
+                ),
+                format!("SELECT {target}(value, seq) FROM t")
+            );
+        }
+    }
+
+    #[test]
+    fn test_athena_regexp_extract_preserves_null_and_empty_matches() {
+        for read in [DialectType::Athena, DialectType::Presto, DialectType::Trino] {
+            for args in [
+                "'no-match', '([0-9]+)', 1",
+                "'abc', '(z*)a', 1",
+                "'abc', '(z)?a', 1",
+                "'abc', '(a)(b)(c)'",
+                "'abc', '(a)(b)(c)', 2",
+                "'12 34', '[0-9]+'",
+                "'', '()'",
+                "NULL, '([0-9]+)', 1",
+                "'abc', NULL, 1",
+                "value, pattern, group_index",
+            ] {
+                assert_eq!(
+                    transpile_to_duckdb_from(
+                        &format!("SELECT REGEXP_EXTRACT({args}) AS answer"),
+                        read,
+                    ),
+                    format!("SELECT ARRAY_EXTRACT(REGEXP_EXTRACT_ALL({args}), 1) AS answer"),
+                    "{read:?}: {args}"
+                );
+            }
+        }
+
+        assert_eq!(
+            transpile_to_duckdb_from(
+                "SELECT REGEXP_EXTRACT('no-match', '([0-9]+)', 1)",
+                DialectType::DuckDB,
+            ),
+            "SELECT REGEXP_EXTRACT('no-match', '([0-9]+)', 1)"
+        );
+    }
+
+    #[test]
+    fn test_athena_regexp_replace_capture_references() {
+        for read in [DialectType::Athena, DialectType::Presto, DialectType::Trino] {
+            for (sql, expected) in [
+                (
+                    "SELECT regexp_replace('2026.09 2027.10', '([0-9]+)[.]([0-9]+)', '$1-$2') AS answer",
+                    r"SELECT REGEXP_REPLACE('2026.09 2027.10', '([0-9]+)[.]([0-9]+)', '\1-\2', 'g') AS answer",
+                ),
+                (
+                    "SELECT regexp_replace(value, pattern, '$0/$1/$2') FROM t",
+                    r"SELECT REGEXP_REPLACE(value, pattern, '\0/\1/\2', 'g') FROM t",
+                ),
+                (
+                    r"SELECT regexp_replace('aa', '(a)', '\$1')",
+                    "SELECT REGEXP_REPLACE('aa', '(a)', '$1', 'g')",
+                ),
+                (
+                    "SELECT regexp_replace('a1b2', '[0-9]')",
+                    "SELECT REGEXP_REPLACE('a1b2', '[0-9]', '', 'g')",
+                ),
+                (
+                    "SELECT regexp_replace('aa', 'a', 'x')",
+                    "SELECT REGEXP_REPLACE('aa', 'a', 'x', 'g')",
+                ),
+            ] {
+                assert_eq!(transpile_to_duckdb_from(sql, read), expected, "{read:?}: {sql}");
+            }
+        }
+
+        assert_eq!(
+            transpile_to_duckdb_from(
+                "SELECT REGEXP_REPLACE('aa', '(a)', '$1')",
+                DialectType::DuckDB,
+            ),
+            "SELECT REGEXP_REPLACE('aa', '(a)', '$1')"
+        );
+    }
+
+    #[test]
+    fn test_athena_to_iso8601_reports_unsupported_translation() {
+        for read in [DialectType::Athena, DialectType::Presto, DialectType::Trino] {
+            let dialect = Dialect::get(read);
+            for argument in [
+                "TIMESTAMP '2026-05-26 02:08:02.930'",
+                "TIMESTAMP '2026-05-26 02:08:02.123456789'",
+                "TIMESTAMP '2026-05-26 02:08:02.930 +02:00'",
+                "DATE '2026-05-26'",
+                "CAST(value AS TIMESTAMP(3))",
+                "CAST(value AS TIMESTAMP WITH TIME ZONE)",
+                "value",
+            ] {
+                let sql = format!("SELECT TO_ISO8601({argument}) AS answer FROM t");
+                for options in [
+                    crate::dialects::TranspileOptions::default(),
+                    crate::dialects::TranspileOptions::strict(),
+                ] {
+                    let error = dialect
+                        .transpile_with(&sql, DialectType::DuckDB, options)
+                        .expect_err("unsupported TO_ISO8601 must not emit invalid DuckDB SQL");
+                    assert!(matches!(error, crate::error::Error::Unsupported { .. }));
+                    assert!(error.to_string().contains("TO_ISO8601"));
+                    assert!(error.to_string().contains("precision and time zone"));
+                }
+            }
+
+            assert_eq!(
+                dialect
+                    .transpile("SELECT TO_ISO8601(value) FROM t", read)
+                    .unwrap()[0],
+                "SELECT TO_ISO8601(value) FROM t"
+            );
+        }
+    }
+
+    #[test]
     fn test_ifnull_to_coalesce() {
         let result = transpile_to_duckdb("SELECT IFNULL(a, b)");
         assert!(

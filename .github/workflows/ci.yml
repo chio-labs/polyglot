@@ -27,9 +27,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
 
       - uses: actions/setup-node@v6
         with:
@@ -136,9 +137,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Python bindings tests
         run: make test-python
@@ -195,14 +205,18 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
 
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Clean WASM crate artifacts
         run: cargo clean -p polyglot-sql-wasm
@@ -212,9 +226,6 @@ jobs:
 
       - name: Generate TypeScript bindings
         run: make generate-bindings
-
-      - name: Install dependencies
-        run: pnpm install
 
       - name: Build SDK
         run: cd packages/sdk && pnpm run build
@@ -547,9 +558,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
 
       - uses: actions/setup-node@v6
         with:
@@ -570,7 +582,7 @@ jobs:
           path: packages/sdk/dist/
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Publish to npm
         run: cd packages/sdk && pnpm publish --access public --no-git-checks --ignore-scripts
@@ -767,9 +779,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
 
       - uses: actions/setup-node@v6
         with:
@@ -789,7 +802,7 @@ jobs:
           path: packages/sdk/src/generated/
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build documentation
         run: cd packages/documentation && pnpm run build
@@ -865,9 +878,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v3
         with:
-          version: 10
+          version: 12.4.2
+          install: false
 
       - uses: actions/setup-node@v6
         with:
@@ -887,7 +901,7 @@ jobs:
           path: packages/sdk/dist/
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build Playground
         run: cd packages/playground && pnpm run build

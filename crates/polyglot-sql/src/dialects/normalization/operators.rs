@@ -8,6 +8,8 @@ pub(super) enum Action {
     Div0TypedDivision,
     SourceDivisionToClickHouse,
     RegexpReplaceSnowflakeToDuckDB,
+    RegexpExtractPrestoToDuckDB,
+    RegexpReplacePrestoToDuckDB,
     BigQuerySafeDivide,
     RegexpLikeToDuckDB,
     RegexpLikeToTsqlPatindex,
@@ -47,6 +49,36 @@ pub(super) fn rewrite(
     let e = expression;
     let expression = (|| -> Result<Expression> {
         match action {
+            Action::RegexpReplacePrestoToDuckDB => {
+                if let Expression::Function(mut f) = e {
+                    if f.args.len() == 2 {
+                        f.args.push(Expression::string(""));
+                    } else if let Expression::Literal(lit) = &f.args[2] {
+                        if let Literal::String(replacement) = lit.as_ref() {
+                            f.args[2] = Expression::string(presto_regexp_replacement_to_duckdb(
+                                replacement,
+                            )?);
+                        }
+                    }
+                    f.args.push(Expression::string("g"));
+                    Ok(Expression::Function(f))
+                } else {
+                    unreachable!("action only triggered for REGEXP_REPLACE functions")
+                }
+            }
+            Action::RegexpExtractPrestoToDuckDB => {
+                if let Expression::Function(mut f) = e {
+                    // A missing first match (or capture group) is NULL, while
+                    // a successful empty capture must remain an empty string.
+                    f.name = "REGEXP_EXTRACT_ALL".to_string();
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "ARRAY_EXTRACT",
+                        vec![Expression::Function(f), Expression::number(1)],
+                    ))))
+                } else {
+                    unreachable!("action only triggered for REGEXP_EXTRACT functions")
+                }
+            }
             Action::SourceDivisionToClickHouse => {
                 if let Expression::Div(div) = e {
                     normalize_source_division_to_clickhouse(*div, context)
@@ -2222,4 +2254,48 @@ pub(super) fn build_tsql_cbrt_power(this: Expression) -> Expression {
         original_name: None,
         inferred_type: None,
     }))
+}
+
+fn presto_regexp_replacement_to_duckdb(replacement: &str) -> Result<String> {
+    let mut chars = replacement.chars().peekable();
+    let mut converted = String::with_capacity(replacement.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(literal) = chars.next() {
+                    // Trino quotes the following character; RE2 only needs
+                    // quoting for a literal backslash in replacement text.
+                    if literal == '\\' {
+                        converted.push('\\');
+                    }
+                    converted.push(literal);
+                } else {
+                    return Err(crate::error::Error::unsupported(
+                        "REGEXP_REPLACE replacement ends in an escape",
+                        "duckdb",
+                    ));
+                }
+            }
+            '$' => match chars.next() {
+                Some(group) if group.is_ascii_digit() => {
+                    if chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                        return Err(crate::error::Error::unsupported(
+                            "DuckDB REGEXP_REPLACE does not support multi-digit capture references",
+                            "duckdb",
+                        ));
+                    }
+                    converted.push('\\');
+                    converted.push(group);
+                }
+                _ => {
+                    return Err(crate::error::Error::unsupported(
+                        "DuckDB REGEXP_REPLACE requires numbered capture references",
+                        "duckdb",
+                    ))
+                }
+            },
+            _ => converted.push(ch),
+        }
+    }
+    Ok(converted)
 }
