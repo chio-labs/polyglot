@@ -3398,7 +3398,7 @@ fn validate_scope_columns(
 
     // Normalize struct access with the actual lexical context. A real outer
     // qualifier must not be reinterpreted as a column of an open local table.
-    let mut visible = crate::scope::Scope::new(scope.expression.clone());
+    let mut visible = crate::scope::Scope::new(Expression::Null(crate::expressions::Null));
     for source_scope in std::iter::once(scope).chain(ancestors.iter().copied()) {
         for (name, source) in &source_scope.sources {
             if resolve_scope_source_name(&visible, name).is_none() {
@@ -3606,6 +3606,32 @@ fn validate_scope_tree(
     errors: &mut Vec<ValidationError>,
     bindings: &mut ProjectionAliasBindings,
 ) {
+    if matches!(
+        scope_query(&scope.expression),
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+    ) && scope.subquery_scopes.is_empty()
+        && scope.udtf_scopes.is_empty()
+        && !walk_in_scope(scope_query(&scope.expression), false)
+            .any(|node| matches!(node, Expression::Table(_)))
+    {
+        for child in scope
+            .cte_scopes
+            .iter()
+            .chain(&scope.derived_table_scopes)
+            .chain(&scope.union_scopes)
+        {
+            validate_scope_tree(
+                child,
+                ancestors,
+                schema_map,
+                resolver_schema,
+                options,
+                errors,
+                bindings,
+            );
+        }
+        return;
+    }
     let mut selected = selected_validation_scope(scope);
     // Bind children before consumers, but retain the existing parent-first
     // diagnostic order. Only physical sources are inherited, never output aliases.

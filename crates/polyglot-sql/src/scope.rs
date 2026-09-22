@@ -83,7 +83,11 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
             _ => None,
         })
         .collect();
-    let mut selected = Scope::new(query.clone());
+    let selected_expression = match query {
+        Expression::Select(select) => Expression::Select(Box::new(select_without_with(select))),
+        _ => query.clone(),
+    };
+    let mut selected = Scope::new(selected_expression);
     selected.cte_sources = scope.cte_sources.clone();
     selected.sources = scope
         .sources
@@ -96,6 +100,52 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
         .map(|(name, source)| (name.clone(), source.clone()))
         .collect();
     selected
+}
+
+/// CTE definitions have their own scopes and remain available through the source
+/// catalogue. A local resolution view needs the SELECT body, not another copy
+/// of every definition. Keep this exhaustive so new clauses cannot be omitted.
+fn select_without_with(select: &crate::expressions::Select) -> crate::expressions::Select {
+    crate::expressions::Select {
+        expressions: select.expressions.clone(),
+        from: select.from.clone(),
+        joins: select.joins.clone(),
+        lateral_views: select.lateral_views.clone(),
+        prewhere: select.prewhere.clone(),
+        where_clause: select.where_clause.clone(),
+        group_by: select.group_by.clone(),
+        having: select.having.clone(),
+        qualify: select.qualify.clone(),
+        order_by: select.order_by.clone(),
+        distribute_by: select.distribute_by.clone(),
+        cluster_by: select.cluster_by.clone(),
+        sort_by: select.sort_by.clone(),
+        limit: select.limit.clone(),
+        offset: select.offset.clone(),
+        limit_by: select.limit_by.clone(),
+        fetch: select.fetch.clone(),
+        distinct: select.distinct,
+        distinct_on: select.distinct_on.clone(),
+        top: select.top.clone(),
+        with: None,
+        sample: select.sample.clone(),
+        settings: select.settings.clone(),
+        format: select.format.clone(),
+        windows: select.windows.clone(),
+        hint: select.hint.clone(),
+        connect: select.connect.clone(),
+        into: select.into.clone(),
+        locks: select.locks.clone(),
+        for_xml: select.for_xml.clone(),
+        for_json: select.for_json.clone(),
+        leading_comments: select.leading_comments.clone(),
+        post_select_comments: select.post_select_comments.clone(),
+        kind: select.kind.clone(),
+        operation_modifiers: select.operation_modifiers.clone(),
+        qualify_after_window: select.qualify_after_window,
+        option: select.option.clone(),
+        exclude: select.exclude.clone(),
+    }
 }
 
 /// Information about a source (table or subquery) in a scope

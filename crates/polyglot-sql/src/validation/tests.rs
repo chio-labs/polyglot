@@ -2,6 +2,56 @@ use super::*;
 use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFunctionCatalog};
 use std::sync::Arc;
 
+#[test]
+fn cte_resolution_views_preserve_alias_types_and_union_error_locations() {
+    let schema = review_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    let valid = "WITH base AS (SELECT quantity FROM items) SELECT quantity AS total, total + 1 AS next_total FROM base";
+    assert!(validate_with_schema(valid, DialectType::Snowflake, &schema, &options).valid);
+    let invalid = "WITH base AS (SELECT active FROM items) SELECT active AS flag, flag + 1 AS invalid_total FROM base";
+    let result = validate_with_schema(invalid, DialectType::Snowflake, &schema, &options);
+    assert!(!result.valid);
+    assert!(result.errors.iter().any(|error| error.code == "E212"));
+
+    let mut branches = vec!["SELECT quantity FROM base"; 128];
+    branches[17] = "SELECT missing_first FROM base";
+    branches[119] = "SELECT missing_last FROM base";
+    let sql = format!(
+        "WITH base AS (SELECT quantity FROM items) {}",
+        branches.join(" UNION ALL ")
+    );
+    let result = validate_with_schema(
+        &sql,
+        DialectType::Snowflake,
+        &schema,
+        &SchemaValidationOptions {
+            check_types: false,
+            check_references: true,
+            ..Default::default()
+        },
+    );
+    let errors: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|error| error.code == "E201")
+        .collect();
+    assert_eq!(errors.len(), 2, "{:?}", result.errors);
+    assert!(errors[0].message.contains("missing_first"));
+    assert!(errors[1].message.contains("missing_last"));
+    assert_eq!(
+        errors[0].column,
+        Some(sql.find("missing_first").unwrap() + "missing_first".len() + 1)
+    );
+    assert_eq!(
+        errors[1].column,
+        Some(sql.find("missing_last").unwrap() + "missing_last".len() + 1)
+    );
+}
+
 fn review_schema() -> ValidationSchema {
     serde_json::from_value(serde_json::json!({"tables": [
         {"name": "items", "columns": [{"name":"quantity","type":"INTEGER"},{"name":"active","type":"BOOLEAN"}]},
