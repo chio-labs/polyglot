@@ -159,6 +159,8 @@ jobs:
         run: make python-docs-build
 
   go-sdk:
+    # The fork consumes only the Rust crate and Python package.
+    if: github.repository == 'tobilg/polyglot'
     needs: rust-test
     runs-on: ubuntu-latest
     env:
@@ -188,6 +190,8 @@ jobs:
         run: cd packages/go && POLYGLOT_SQL_FFI_PATH="../../target/ffi_release/libpolyglot_sql_ffi.so" go test ./...
 
   sdk-build:
+    # The fork consumes only the Rust crate and Python package.
+    if: github.repository == 'tobilg/polyglot'
     needs: rust-test
     runs-on: ubuntu-latest
     env:

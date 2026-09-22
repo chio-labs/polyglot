@@ -18,6 +18,7 @@ default = []
 function-catalog-clickhouse = ["polyglot-sql/function-catalog-clickhouse"]
 function-catalog-duckdb = ["polyglot-sql/function-catalog-duckdb"]
 function-catalog-all-dialects = ["polyglot-sql/function-catalog-all-dialects"]
+abi3 = ["pyo3/abi3-py312"]
 
 [dependencies]
 polyglot-sql = { path = "../polyglot-sql" }

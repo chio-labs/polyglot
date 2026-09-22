@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Rust-powered SQL transpiler for more than 30 SQL dialects. Parse, generate, transpile, format, and validate SQL."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 keywords = ["sql", "transpiler", "parser", "dialect", "database"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -17,9 +17,6 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Database",
