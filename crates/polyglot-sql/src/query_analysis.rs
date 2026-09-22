@@ -842,6 +842,7 @@ struct NullabilityContext<'a> {
     lineage: RefCell<HashMap<*const Scope, ScopedLineage<'a>>>,
     terminal_lineage: RefCell<HashMap<(*const Scope, String, String), Vec<ColumnReferenceFact>>>,
     schema_columns: RefCell<HashMap<String, HashSet<String>>>,
+    output_types: RefCell<crate::optimizer::set_operation_types::OutputResolver>,
     schema: Option<&'a AnalysisSchemaInfo>,
     mapping_schema: Option<&'a MappingSchema>,
     empty_schema: MappingSchema,
@@ -879,6 +880,9 @@ impl<'a> NullabilityContext<'a> {
             lineage: RefCell::new(HashMap::new()),
             terminal_lineage: RefCell::new(HashMap::new()),
             schema_columns: RefCell::new(HashMap::new()),
+            output_types: RefCell::new(crate::optimizer::set_operation_types::OutputResolver::new(
+                dialect,
+            )),
             schema,
             mapping_schema,
             empty_schema: MappingSchema::with_dialect(dialect),
@@ -1710,6 +1714,21 @@ fn selected_projection_facts_for_query<'a>(
         nullability_context,
     );
     profile_query_analysis_stage("cached_lineage");
+    let mut type_query = expression;
+    loop {
+        type_query = match type_query {
+            Expression::Subquery(subquery) => &subquery.this,
+            Expression::Paren(paren) => &paren.this,
+            Expression::Annotated(annotated) => &annotated.this,
+            _ => break,
+        };
+    }
+    let resolved_outputs = is_set_operation(type_query).then(|| {
+        nullability_context
+            .output_types
+            .borrow_mut()
+            .resolve(expression)
+    });
 
     expressions
         .iter()
@@ -1742,6 +1761,15 @@ fn selected_projection_facts_for_query<'a>(
             if *null_padded {
                 fact.nullability = ProjectionNullability::Nullable;
             }
+            if let Some(outputs) = &resolved_outputs {
+                let output = outputs.get(index);
+                fact.type_hint = output
+                    .and_then(|output| output.data_type())
+                    .and_then(|data_type| render_data_type(data_type, dialect));
+                fact.cast_type = output
+                    .and_then(|output| output.cast_type.as_ref())
+                    .and_then(|data_type| render_data_type(data_type, dialect));
+            }
             fact
         })
         .collect()
@@ -1753,6 +1781,16 @@ fn projection_sources_for_query(
     expression: &Expression,
     dialect: DialectType,
 ) -> Vec<(&Expression, bool)> {
+    match expression {
+        Expression::Subquery(subquery) => {
+            return projection_sources_for_query(&subquery.this, dialect)
+        }
+        Expression::Paren(paren) => return projection_sources_for_query(&paren.this, dialect),
+        Expression::Annotated(annotated) => {
+            return projection_sources_for_query(&annotated.this, dialect)
+        }
+        _ => {}
+    }
     match crate::set_operation::set_operation_layout(expression, Some(dialect)) {
         Ok(Some(layout)) => layout
             .outputs
@@ -1985,6 +2023,7 @@ fn projection_fact<'a>(
     let annotated_type = projection
         .inferred_type()
         .or_else(|| inner.inferred_type())
+        .filter(|data_type| **data_type != DataType::Unknown)
         .and_then(|data_type| render_data_type(data_type, dialect));
     ProjectionFact {
         index,
@@ -2611,6 +2650,13 @@ fn cast_type(expression: &Expression, dialect: DialectType) -> Option<String> {
 }
 
 fn render_data_type(data_type: &DataType, dialect: DialectType) -> Option<String> {
+    if dialect == DialectType::ClickHouse {
+        return crate::generator::Generator::with_config(
+            Dialect::get(dialect).generator_config().clone(),
+        )
+        .generate_type_hint(data_type)
+        .ok();
+    }
     Dialect::get(dialect)
         .generate(&Expression::DataType(data_type.clone()))
         .ok()

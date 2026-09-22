@@ -674,7 +674,8 @@ ifndef V
 endif
 	@echo "Bumping version to $(V)..."
 	cargo set-version $(V)
-	pnpm -r exec pnpm version $(V) --no-git-tag-version
+	# Cargo has already modified the working tree; pnpm must not commit or tag it.
+	pnpm -r version $(V) --no-git-tag-version --no-git-checks --allow-same-version
 	python3 scripts/check_project_consistency.py --sync-version-references
 	cargo update --manifest-path examples/rust/Cargo.toml -p polyglot-sql
 	$(MAKE) check-consistency

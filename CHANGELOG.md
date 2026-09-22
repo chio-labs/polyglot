@@ -4,6 +4,70 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.12.2] - 2026-09-22 (Python fork)
+
+### Fixed
+
+- Integrate upstream 0.12.1 set-operation type inference and DuckDB translation
+  fixes while retaining the fork's project-analysis APIs and scope-reuse optimizations.
+- Preserve physical-table types inside nonrecursive CTEs that share the table's
+  name; early recursive-anchor binding now follows the existing explicit recursion flag.
+
+## [0.12.1] - 2026-09-21
+
+### Added
+
+- Documentation of set-operation output typing, including dialect-specific
+  coercion rules and conservative inference limits.
+
+### Changed
+
+- JavaScript workspace tooling now requires pnpm 12. All six pnpm CI jobs use
+  `pnpm/setup@v3` with pnpm 12.4.2, Node.js 24, and frozen-lockfile installs.
+  Dependency installation runs explicitly before SDK build commands.
+- Two incorrect SQLGlot Presto-to-DuckDB fixture expectations are narrowly
+  excluded because they discard NULL winning values or replace missing regex
+  matches with empty strings. Native regressions cover the corrected behavior.
+  ([#463](https://github.com/tobilg/polyglot/issues/463), [#464](https://github.com/tobilg/polyglot/issues/464))
+
+### Fixed
+
+- Query analysis and scoped type annotation resolve `UNION`, `INTERSECT`, and
+  `EXCEPT` output types from both aligned branches, including `BY NAME`,
+  `CORRESPONDING`, nested operations, CTEs, derived tables, scalar subqueries,
+  and query-backed arrays. Mixed Snowflake INTEGER/FLOAT outputs report FLOAT;
+  combined `castType` is retained only when both branches agree on an explicit
+  cast matching the result type. Dialect-specific rules preserve decimal and
+  nested-type information where supported and leave uncertain or mode-dependent
+  types unresolved. ([#454](https://github.com/tobilg/polyglot/issues/454))
+- Query analysis leaves unknown type hints unset instead of reporting `UNKNOWN`,
+  rejects multi-column scalar-subquery type inference, and renders ClickHouse
+  type hints without adding implicit `Nullable` wrappers. ([#454](https://github.com/tobilg/polyglot/issues/454))
+- `MAX_BY` and `MIN_BY` transpilation to DuckDB preserves `FILTER` and other
+  aggregate modifiers, including in windowed expressions. ([#462](https://github.com/tobilg/polyglot/issues/462))
+- Two-argument Athena, Presto, and Trino `MAX_BY`/`MIN_BY` calls translate to
+  DuckDB `ARG_MAX_NULL`/`ARG_MIN_NULL`, preserving a NULL value when its ordering
+  key wins instead of skipping that row. ([#463](https://github.com/tobilg/polyglot/issues/463))
+- Athena, Presto, and Trino `REGEXP_EXTRACT` transpilation to DuckDB distinguishes
+  missing matches or capture groups (`NULL`) from successful empty matches by
+  selecting the first `REGEXP_EXTRACT_ALL` result. ([#464](https://github.com/tobilg/polyglot/issues/464))
+- Athena, Presto, and Trino `REGEXP_REPLACE` transpilation to DuckDB converts
+  numbered capture references in literal replacements, preserves escaped literal
+  characters and global replacement, and supports the two-argument removal
+  form. Unsupported named or multi-digit references in literal replacements
+  report an error. ([#465](https://github.com/tobilg/polyglot/issues/465))
+- Athena, Presto, and Trino `TO_ISO8601` transpilation to DuckDB reports an
+  unsupported-translation error instead of emitting a nonexistent DuckDB
+  function. Source precision and time-zone semantics cannot be preserved by a
+  generic formatting rewrite. ([#466](https://github.com/tobilg/polyglot/issues/466))
+- pnpm 12 installs explicitly approve the required `esbuild`, `sharp`, and
+  `workerd` build scripts. The standalone TypeScript example has its own
+  `esbuild` approval and updated installation instructions.
+- `make bump-version` uses native recursive pnpm versioning without triggering
+  a dependency install through `exec`. It accepts the working-tree changes
+  already made by Cargo and supports retrying the same version after a partial
+  bump, while creating no Git commit or tag.
+
 ## [0.12.0] - 2026-09-18
 
 ### Added
@@ -60,37 +124,37 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Caller-supplied EOF tokens are normalized before parsing, so terminated and
   unterminated token streams produce equivalent results. Tokens after EOF return
   an error at the offending token. Empty and EOF-only streams no longer panic
-  in statement, standalone-type, or expression-fragment parsing. (#450)
+  in statement, standalone-type, or expression-fragment parsing. ([#450](https://github.com/tobilg/polyglot/issues/450))
 - Unicode function names no longer panic during `WITH ORDINALITY` suffix checks;
   mixed-case suffixes remain supported, including directly constructed ASTs.
   Date/time format conversion uses UTF-8-safe traversal across shared generation
   and DuckDB, Snowflake, and Presto conversion paths, preserving Unicode literals
   without treating Unicode case-folding expansions as format directives.
-  (#451, #452, #453)
+  ([#451](https://github.com/tobilg/polyglot/issues/451), [#452](https://github.com/tobilg/polyglot/issues/452), [#453](https://github.com/tobilg/polyglot/issues/453))
 - Query analysis propagates nullability through chained CTEs and derived tables,
   renamed and positional outputs, known stars, and set operations. It respects
   quoted names, CTE shadowing, expression results, and outer-join null extension,
   while keeping ambiguous, recursive, and otherwise indeterminate dependencies
-  conservative. (#455)
+  conservative. ([#455](https://github.com/tobilg/polyglot/issues/455))
 - Python, FFI, and Go can override or disable individual parsing/analysis/
   validation limits without changing global defaults. Invalid guard payloads are
   rejected consistently, and validation reports guard exhaustion as diagnostics
-  rather than silently ignoring overrides. (#456)
+  rather than silently ignoring overrides. ([#456](https://github.com/tobilg/polyglot/issues/456))
 - Formatting preserves explicit `NULLS FIRST`/`NULLS LAST`, including nested,
   window, and aggregate ordering. Snowflake and DuckDB generation retain explicit
   clauses because their defaults are configurable; same-dialect operations no
   longer inject assumed Snowflake defaults into omitted clauses. Cross-dialect
   normalization remains separate. Incorrect reference-fixture expectations are
-  narrowly excluded for the approved source/target cases. (#457)
+  narrowly excluded for the approved source/target cases. ([#457](https://github.com/tobilg/polyglot/issues/457))
 - Schema validation resolves `ORDER BY` output aliases without falsely reporting
   ambiguous joined inputs, while preserving errors in the original projection.
   Lateral projection aliases, chained aliases, quoted outputs, and clause aliases
-  follow dialect-specific visibility and input-column precedence. (#458, #460)
+  follow dialect-specific visibility and input-column precedence. ([#458](https://github.com/tobilg/polyglot/issues/458), [#460](https://github.com/tobilg/polyglot/issues/460))
 - Lambda parameters are bound lexically instead of treated as table columns,
   including typed/quoted parameters, nested shadowing, and struct-field access.
   Free captures still receive reference/type checks and source diagnostics.
   Analysis excludes lambda locals from physical dependencies and preserves
-  array result types for higher-order array functions. (#459)
+  array result types for higher-order array functions. ([#459](https://github.com/tobilg/polyglot/issues/459))
 - Type validation uses scoped annotations through CTEs, derived tables,
   predicates, and DML instead of re-resolving columns against a flat schema.
   DML targets and references are checked independently of `check_types`, with
@@ -202,7 +266,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   StarRocks `LARGEINT`.
 - Regression coverage in existing Rust and SDK test files now exercises the
   new APIs and fixes, including the exact nested-scope, correlated-subquery,
-  chained-CTE, and window-ordering validation examples from #441 and #442.
+  chained-CTE, and window-ordering validation examples from [#441](https://github.com/tobilg/polyglot/issues/441) and [#442](https://github.com/tobilg/polyglot/issues/442).
 
 ### Changed
 
@@ -1531,7 +1595,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [0.3.11] - 2026-05-15
 
 ### Added
-- Regression coverage for issue #201 across Rust, Python, C FFI, WASM, and the
+- Regression coverage for issue [#201](https://github.com/tobilg/polyglot/issues/201) across Rust, Python, C FFI, WASM, and the
   TypeScript SDK.
 - TypeScript/WASM builder `toSql(dialect?)` support for `Expr` and
   `CaseBuilder`, allowing builder-generated SQL to use dialect-specific
@@ -1808,7 +1872,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Build/test flow updates across Makefile and CI to keep Rust, WASM, SDK, docs, playground, and FFI outputs aligned.
 
 ### Fixed
-- Large-SQL formatting robustness (issue #27 reproduction case) for high condition counts in WASM/SDK usage.
+- Large-SQL formatting robustness (issue [#27](https://github.com/tobilg/polyglot/issues/27) reproduction case) for high condition counts in WASM/SDK usage.
 - WASM->TypeScript AST shape compatibility regressions by using JSON-compatible structured serialization.
 - Additional parser, optimizer, and validation edge cases discovered during large-query and release-hardening work.
 

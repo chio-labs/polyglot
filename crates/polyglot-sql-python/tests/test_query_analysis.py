@@ -3,6 +3,27 @@ import pytest
 import polyglot_sql
 
 
+@pytest.mark.parametrize("operator", ["UNION ALL", "UNION ALL BY NAME", "INTERSECT", "EXCEPT"])
+@pytest.mark.parametrize("left, right", [("INTEGER", "FLOAT"), ("FLOAT", "INTEGER")])
+def test_analyze_query_set_operation_output_types_454(operator, left, right):
+    schema = {"tables": [{"name": "orders", "columns": [{"name": "amount", "type": "VARCHAR"}]}]}
+    sql = (
+        f"SELECT CAST(amount AS {left}) AS amount FROM orders {operator} "
+        f"SELECT CAST(amount AS {right}) AS amount FROM orders"
+    )
+    for options in ({"dialect": "snowflake"}, {"dialect": "snowflake", "schema": schema}):
+        result = polyglot_sql.analyze_query(sql, options)
+        assert result["projections"][0]["typeHint"] == "FLOAT"
+        assert result["projections"][0].get("castType") is None
+        branches = result["setOperations"][0]["branches"]
+        assert [b["projections"][0]["castType"] for b in branches] == [
+            "INT" if t == "INTEGER" else t for t in (left, right)
+        ]
+        result = polyglot_sql.analyze_query(f"WITH t AS ({sql}) SELECT amount FROM t", options)
+        assert result["projections"][0]["typeHint"] == "FLOAT"
+        assert result["projections"][0].get("castType") is None
+
+
 def test_review_lambda_analysis_and_confidence():
     schema = {"tables": [{"name": "items", "columns": [{"name": "quantity", "type": "INT"}]}]}
     result = polyglot_sql.analyze_query(

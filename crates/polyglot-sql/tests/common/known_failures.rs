@@ -212,6 +212,18 @@ pub fn dialect_identity_known_failures(_dialect: &str) -> HashSet<String> {
 pub fn transpilation_known_failures(source: &str, target: &str) -> HashSet<String> {
     let mut failures = HashSet::new();
 
+    if source == "presto" && target == "duckdb" {
+        // Issue #463: SQLGlot 30.14.0 maps two-argument MAX_BY to ARG_MAX,
+        // which drops NULL winning values. Verified by executing its output
+        // in DuckDB; Presto/Trino semantics require ARG_MAX_NULL instead.
+        failures.insert("presto->duckdb:75".to_string());
+        // Issue #464: SQLGlot 30.14.0 passes REGEXP_EXTRACT through, but
+        // DuckDB returns an empty string for no match where Presto returns
+        // NULL. Extracting the first REGEXP_EXTRACT_ALL result preserves both
+        // absent and empty matches; verified against Trino and DuckDB.
+        failures.insert("presto->duckdb:114".to_string());
+    }
+
     // Issue #457 (approved exclusions): SQLGlot removes explicit NULL ordering
     // that matches Snowflake/DuckDB's factory defaults, but both are configurable.
     // Verified against SQLGlot 30.14.0. Exclude only these source/target/index

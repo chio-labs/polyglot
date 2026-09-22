@@ -8,6 +8,208 @@ use polyglot_sql::{
 use serde_json::json;
 
 #[test]
+fn project_projection_types_do_not_shadow_physical_table_in_nonrecursive_cte() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{"name": "orders", "columns": [{"name": "order_id", "type": "BIGINT"}]}]
+    }))
+    .unwrap();
+    let sql = "WITH orders AS (SELECT CAST(order_id AS INT) AS order_id FROM orders \
+               UNION ALL SELECT order_id FROM orders) SELECT order_id FROM orders";
+    let analysis = analyze_query_for_project_projections(
+        sql,
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(schema),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        analysis.cte_facts[0].projections[0].type_hint.as_deref(),
+        Some("BIGINT")
+    );
+}
+
+#[test]
+fn project_projection_facts_preserve_set_operation_common_types() {
+    for operator in ["UNION ALL", "UNION ALL BY NAME"] {
+        let union = format!(
+            "SELECT CAST(amount AS INTEGER) AS amount FROM orders {operator} \
+             SELECT CAST(amount AS FLOAT) AS amount FROM orders"
+        );
+        let options = AnalyzeQueryOptions {
+            dialect: DialectType::Snowflake,
+            schema: Some(schema()),
+            ..Default::default()
+        };
+        let direct = analyze_query_for_project_projections(&union, options.clone()).unwrap();
+        assert_eq!(direct.projections[0].type_hint.as_deref(), Some("FLOAT"));
+        assert_eq!(direct.projections[0].cast_type, None);
+
+        let wrapped = analyze_query_for_project_projections(
+            &format!("WITH combined AS ({union}) SELECT amount FROM combined"),
+            options,
+        )
+        .unwrap();
+        let combined = &wrapped.cte_facts[0].projections[0];
+        assert_eq!(combined.type_hint.as_deref(), Some("FLOAT"));
+        assert_eq!(combined.cast_type, None);
+    }
+}
+
+#[test]
+fn analyze_query_set_operation_types_454() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{"name": "orders", "columns": [{"name": "amount", "type": "VARCHAR", "nullable": true}]}]
+    })).unwrap();
+    for operator in [
+        "UNION ALL",
+        "UNION",
+        "UNION ALL BY NAME",
+        "INTERSECT",
+        "EXCEPT",
+    ] {
+        for (left, right) in [("INTEGER", "FLOAT"), ("FLOAT", "INTEGER")] {
+            let union = format!("SELECT CAST(amount AS {left}) AS amount FROM orders {operator} SELECT CAST(amount AS {right}) AS amount FROM orders");
+            for with_schema in [false, true] {
+                for sql in [
+                    union.clone(),
+                    format!("SELECT t.amount FROM ({union}) AS t"),
+                    format!(
+                        "WITH t AS ({union}), u AS (SELECT amount FROM t) SELECT amount FROM u"
+                    ),
+                    format!("WITH t(n) AS ({union}) SELECT n FROM t"),
+                ] {
+                    let analysis = analyze_query(
+                        &sql,
+                        AnalyzeQueryOptions {
+                            dialect: DialectType::Snowflake,
+                            schema: with_schema.then(|| schema.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    let projection = &analysis.projections[0];
+                    assert_eq!(projection.type_hint.as_deref(), Some("FLOAT"), "{sql}");
+                    assert_eq!(projection.cast_type, None, "{sql}");
+                }
+            }
+            let analysis = analyze_query(
+                &union,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::Snowflake,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let branches = &analysis.set_operations[0].branches;
+            assert_eq!(
+                branches[0].projections[0].cast_type.as_deref(),
+                Some(if left == "INTEGER" { "INT" } else { "FLOAT" })
+            );
+            assert_eq!(
+                branches[1].projections[0].cast_type.as_deref(),
+                Some(if right == "INTEGER" { "INT" } else { "FLOAT" })
+            );
+        }
+    }
+}
+
+#[test]
+fn analyze_query_set_operation_consumers_and_parameters_454() {
+    let mut failures = Vec::new();
+    for (dialect, sql, expected) in [
+        (DialectType::Snowflake, "SELECT (SELECT CAST(1 AS INT) UNION ALL SELECT CAST(2 AS FLOAT) LIMIT 1) AS a", Some("FLOAT")),
+        (DialectType::Snowflake, "SELECT CAST(1 AS INT) AS a UNION ALL (SELECT CAST(2 AS INT) AS b UNION ALL SELECT CAST(3 AS FLOAT) AS b)", Some("FLOAT")),
+        (DialectType::DuckDB, "SELECT CAST(1 AS DECIMAL(10,2)) AS a UNION ALL SELECT CAST(2 AS DECIMAL(8,4)) AS a", Some("DECIMAL(12, 4)")),
+        (DialectType::TSQL, "SELECT CAST(1 AS DECIMAL(10,2)) AS a UNION ALL SELECT CAST(2 AS DECIMAL(8,4)) AS a", Some("DECIMAL(12, 4)")),
+        (DialectType::TSQL, "SELECT CAST('a' AS VARCHAR(10)) AS a UNION ALL SELECT CAST('b' AS VARCHAR(30)) AS a", Some("VARCHAR(30)")),
+        (DialectType::TSQL, "SELECT CAST(0x01 AS BINARY(2)) AS a UNION ALL SELECT CAST(0x02 AS BINARY(5)) AS a", Some("BINARY(5)")),
+        (DialectType::DuckDB, "SELECT t.a FROM (SELECT CAST([1] AS INT[]) AS a UNION ALL SELECT CAST([2.5] AS DOUBLE[]) AS a) t", Some("DOUBLE[]")),
+        (DialectType::BigQuery, "SELECT ARRAY(SELECT 1 UNION ALL SELECT 2.5) AS a", Some("ARRAY<FLOAT64>")),
+        (DialectType::BigQuery, "SELECT ARRAY(SELECT 1 AS a UNION ALL (SELECT 2 AS b UNION ALL SELECT 2.5 AS b)) AS a", Some("ARRAY<FLOAT64>")),
+        (DialectType::Snowflake, "SELECT CAST(1 AS DECIMAL(10,2)) AS a UNION ALL SELECT unknown_fn() AS a", None),
+        (DialectType::Snowflake, "SELECT unknown_fn() AS a UNION ALL SELECT CAST(1 AS DECIMAL(10,2)) AS a", None),
+        (DialectType::Snowflake, "SELECT unknown_fn(1) AS a UNION ALL SELECT CAST(1 AS DECIMAL(10,2)) AS a", None),
+        (DialectType::Snowflake, "WITH t AS (SELECT unknown_fn(1) AS a) SELECT a FROM t UNION ALL SELECT CAST(1 AS DECIMAL(10,2)) AS a", None),
+        (DialectType::Snowflake, "SELECT t.a FROM (SELECT CAST(1 AS INT) AS a UNION ALL SELECT unknown_fn() AS a) t", None),
+        (DialectType::PostgreSQL, "SELECT NULL AS a UNION ALL SELECT NULL AS a UNION ALL SELECT 1 AS a", None),
+        (DialectType::BigQuery, "SELECT NULL AS a UNION ALL SELECT NULL AS a", Some("INT64")),
+        (DialectType::BigQuery, "SELECT CAST(1 AS INT64) AS a UNION ALL SELECT CAST(2 AS FLOAT64) AS a", Some("FLOAT64")),
+        (DialectType::SQLite, "SELECT CAST(1 AS INTEGER) AS a UNION ALL SELECT CAST(2 AS REAL) AS a", None),
+        (DialectType::Teradata, "SELECT CAST(1 AS INTEGER) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", Some("INT")),
+        (DialectType::PostgreSQL, "SELECT CAST(1 AS REAL) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", Some("DOUBLE PRECISION")),
+        (DialectType::TSQL, "SELECT CAST(1 AS REAL) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", Some("FLOAT")),
+        (DialectType::ClickHouse, "SELECT CAST(1 AS Int32) AS a UNION ALL SELECT CAST(2 AS Float32) AS a", Some("Float64")),
+        (DialectType::ClickHouse, "SELECT CAST(1 AS Int64) AS a UNION ALL SELECT CAST(2 AS Float64) AS a", None),
+        (DialectType::ClickHouse, "SELECT CAST(1 AS Int32) AS a UNION ALL SELECT NULL AS a", Some("Nullable(Int32)")),
+        (DialectType::DataFusion, "SELECT CAST(1 AS INT) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", Some("FLOAT")),
+        (DialectType::Databricks, "SELECT CAST(1 AS INT) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", Some("DOUBLE")),
+        (DialectType::Spark, "SELECT CAST(1 AS INT) AS a UNION ALL SELECT CAST(2 AS FLOAT) AS a", None),
+        (DialectType::Trino, "SELECT CAST('1' AS VARCHAR) AS a UNION ALL SELECT CAST(2 AS INT) AS a", None),
+        (DialectType::Hive, "SELECT CAST('1' AS STRING) AS a UNION ALL SELECT CAST(2 AS INT) AS a", None),
+        (DialectType::BigQuery, "SELECT '2024-02-29' AS a UNION ALL SELECT CAST('2024-01-01' AS DATE) AS a", Some("DATE")),
+        (DialectType::BigQuery, "SELECT '2024-02-30' AS a UNION ALL SELECT CAST('2024-01-01' AS DATE) AS a", None),
+        (DialectType::BigQuery, "SELECT CAST('2024-02-29' AS STRING) AS a UNION ALL SELECT CAST('2024-01-01' AS DATE) AS a", None),
+        (DialectType::Snowflake, "SELECT (SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b) AS x", None),
+        (DialectType::DuckDB, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t", Some("INT")),
+        (DialectType::PostgreSQL, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t", Some("INT")),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions { dialect, ..Default::default() }).unwrap();
+        let actual = analysis.projections[0].type_hint.as_deref();
+        if actual != expected {
+            failures.push(format!("{dialect:?}: {sql}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn analyze_query_set_operation_name_alignment_and_cast_consensus_454() {
+    let named = analyze_query(
+        "SELECT CAST(1 AS INT) AS a UNION ALL BY NAME (SELECT CAST(2 AS INT) AS a UNION ALL BY NAME SELECT CAST(3 AS FLOAT) AS a, CAST('x' AS VARCHAR) AS b)",
+        AnalyzeQueryOptions { dialect: DialectType::Snowflake, ..Default::default() },
+    ).unwrap();
+    let nested_branch = &named.set_operations[0].branches[1].projections;
+    assert_eq!(nested_branch.len(), 2);
+    assert_eq!(nested_branch[0].type_hint.as_deref(), Some("FLOAT"));
+    assert_eq!(nested_branch[1].type_hint.as_deref(), Some("VARCHAR"));
+    assert!(nested_branch.iter().all(|p| p.cast_type.is_none()));
+    let nested = analyze_query(
+        "SELECT CAST(1 AS INT) AS a UNION ALL (SELECT CAST(2 AS INT) AS b UNION ALL SELECT CAST(3 AS FLOAT) AS b)",
+        AnalyzeQueryOptions { dialect: DialectType::Snowflake, ..Default::default() },
+    ).unwrap();
+    assert_eq!(
+        nested.set_operations[0].branches[1].projections[0]
+            .type_hint
+            .as_deref(),
+        Some("FLOAT")
+    );
+    assert_eq!(
+        nested.set_operations[0].branches[1].projections[0].cast_type,
+        None
+    );
+    for (sql, expected_types, expected_casts) in [
+        ("SELECT CAST(1 AS INT) AS a, CAST(2 AS FLOAT) AS b UNION ALL BY NAME SELECT CAST(3 AS INT) AS b, CAST(4 AS FLOAT) AS a",
+            vec![Some("FLOAT"), Some("FLOAT")], vec![None, None]),
+        ("SELECT CAST(1 AS INT) AS a UNION ALL BY NAME SELECT CAST(2 AS FLOAT) AS a, CAST('x' AS VARCHAR) AS b",
+            vec![Some("FLOAT"), Some("VARCHAR")], vec![None, None]),
+        ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT CAST(2 AS INTEGER) AS a",
+            vec![Some("INT")], vec![Some("INT")]),
+        ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT 2 AS a",
+            vec![Some("INT")], vec![None]),
+        ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT NULL AS a",
+            vec![Some("INT")], vec![None]),
+        ("SELECT CAST(1 AS INT) AS \"a\" UNION ALL BY NAME SELECT CAST(2 AS FLOAT) AS a",
+            vec![Some("INT"), Some("FLOAT")], vec![None, None]),
+    ] {
+        let analysis = analyze_query(sql, AnalyzeQueryOptions { dialect: DialectType::Snowflake, ..Default::default() }).unwrap();
+        assert_eq!(analysis.projections.iter().map(|p| p.type_hint.as_deref()).collect::<Vec<_>>(), expected_types, "{sql}");
+        assert_eq!(analysis.projections.iter().map(|p| p.cast_type.as_deref()).collect::<Vec<_>>(), expected_casts, "{sql}");
+    }
+}
+
+#[test]
 fn analysis_review_lambda_dependencies_and_result_type() {
     let options: AnalyzeQueryOptions = serde_json::from_value(json!({"dialect":"snowflake", "schema":{"tables":[{"name":"items","columns":[{"name":"quantity","type":"INT"}]}]}})).unwrap();
     for sql in [
@@ -149,7 +351,8 @@ fn analyze_query_keeps_scalar_subquery_types_in_their_own_scope() {
 complexity_guard: None,
             dialect: DialectType::DuckDB, schema: Some(schema.clone()),
         }).unwrap();
-        assert_eq!(analysis.projections[0].type_hint.as_deref(), Some(expected), "{sql}");
+        // Unresolved types are omitted instead of exposing the internal UNKNOWN sentinel.
+        assert_eq!(analysis.projections[0].type_hint.as_deref(), (expected != "UNKNOWN").then_some(expected), "{sql}");
     }
 }
 
@@ -1966,6 +2169,13 @@ fn analyze_query_reports_bigquery_name_alignment_modes() {
         .unwrap_or_else(|error| panic!("analysis failed for {sql:?}: {error}"));
 
         assert_eq!(analysis.set_operations[0].output_columns, expected_names);
+        assert!(
+            analysis
+                .projections
+                .iter()
+                .all(|p| p.type_hint.as_deref() == Some("INT64")),
+            "{sql}"
+        );
         assert_eq!(
             analysis
                 .projections
