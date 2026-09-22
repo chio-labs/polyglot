@@ -1866,11 +1866,6 @@ fn check_query_reference_quality(
             continue;
         };
 
-        let select_expr = Expression::Select(select.clone());
-        let context = collect_type_check_context(&select_expr, schema_map);
-        let scope = build_scope(&select_expr);
-        let mut resolver = Resolver::new(&scope, resolver_schema, true);
-
         let mut cumulative_left_tables = select_from_table_keys(select, schema_map);
 
         for join in &select.joins {
@@ -1897,15 +1892,6 @@ fn check_query_reference_quality(
 
             if let (Some(on_expr), Some(right_key)) = (&join.on, right_table_key.clone()) {
                 if join.using.is_empty() {
-                    let mut eq_pairs = Vec::new();
-                    extract_join_equality_pairs(
-                        on_expr,
-                        schema_map,
-                        &context,
-                        &mut resolver,
-                        &mut eq_pairs,
-                    );
-
                     let relevant_relationships: Vec<&DeclaredRelationship> = relationships
                         .iter()
                         .filter(|rel| {
@@ -1917,6 +1903,18 @@ fn check_query_reference_quality(
                         .collect();
 
                     if !relevant_relationships.is_empty() {
+                        let select_expr = Expression::Select(select.clone());
+                        let context = collect_type_check_context(&select_expr, schema_map);
+                        let scope = build_scope(&select_expr);
+                        let mut resolver = Resolver::new(&scope, resolver_schema, true);
+                        let mut eq_pairs = Vec::new();
+                        extract_join_equality_pairs(
+                            on_expr,
+                            schema_map,
+                            &context,
+                            &mut resolver,
+                            &mut eq_pairs,
+                        );
                         let uses_declared_fk = eq_pairs.iter().any(|((lt, lc), (rt, rc))| {
                             relevant_relationships
                                 .iter()
@@ -2937,34 +2935,50 @@ fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<
         })
 }
 
-fn source_has_column(
+struct ValidationSourceColumns {
+    names: HashSet<String>,
+    empty: bool,
+    wildcard: bool,
+}
+
+fn index_source_columns(
     scope: &crate::scope::Scope,
     source: &str,
     columns: &[String],
-    column: &crate::expressions::Identifier,
     dialect: DialectType,
-) -> bool {
+) -> ValidationSourceColumns {
     let strategy = get_normalization_strategy(Some(dialect));
-    let expected = normalize_identifier(column.clone(), strategy).name;
-    columns.iter().any(|name| {
-        if name == "*" {
-            return true;
+    let mut output_identifiers = HashMap::new();
+    if let Some(source) = scope.sources.get(source) {
+        for identifier in source_output_identifiers(&source.expression) {
+            output_identifiers
+                .entry(identifier.name.as_str())
+                .or_insert(identifier);
         }
-        let identifier = scope
-            .sources
-            .get(source)
-            .and_then(|source| source_output_identifier(&source.expression, name))
-            .cloned()
-            .unwrap_or_else(|| crate::binding::schema_identifier(name));
-        normalize_identifier(identifier, strategy).name == expected
-    })
+    }
+    let names = columns
+        .iter()
+        .map(|name| {
+            let identifier = output_identifiers
+                .get(name.as_str())
+                .copied()
+                .cloned()
+                .unwrap_or_else(|| crate::binding::schema_identifier(name));
+            normalize_identifier(identifier, strategy).name
+        })
+        .collect();
+    ValidationSourceColumns {
+        names,
+        empty: columns.is_empty(),
+        wildcard: columns.iter().any(|name| name == "*"),
+    }
 }
 
 fn source_display_name(scope: &crate::scope::Scope, source_name: &str) -> String {
     scope
         .sources
         .get(source_name)
-        .map(|source| match &source.expression {
+        .map(|source| match source.expression.as_ref() {
             Expression::Table(table) => lower(&table_ref_display_name(table)),
             _ => lower(source_name),
         })
@@ -3090,8 +3104,16 @@ fn bind_scope_projection_aliases(
             let columns = resolver.get_source_columns(source).unwrap_or_default();
             open |= columns.is_empty() || columns.iter().any(|name| name == "*");
             let expression = &source_scope.sources[source].expression;
+            let mut identifiers = HashMap::new();
+            for identifier in source_output_identifiers(expression) {
+                identifiers
+                    .entry(identifier.name.as_str())
+                    .or_insert(identifier);
+            }
             for name in columns {
-                let identifier = source_output_identifier(expression, &name)
+                let identifier = identifiers
+                    .get(name.as_str())
+                    .copied()
                     .cloned()
                     .unwrap_or_else(|| crate::expressions::Identifier::new(name));
                 inputs.insert(normalize_identifier(identifier, strategy).name);
@@ -3108,7 +3130,7 @@ fn bind_scope_projection_aliases(
         scope
             .cte_sources
             .values()
-            .filter_map(|source| match &source.expression {
+            .filter_map(|source| match source.expression.as_ref() {
                 Expression::Cte(cte) => Some(cte.as_ref().clone()),
                 _ => None,
             })
@@ -3124,8 +3146,8 @@ fn bind_scope_projection_aliases(
     // Keep the original sources/CTEs for scoped type inference, without copying
     // the entire projection list for each alias. Bound uses are constant-size.
     let mut projections = std::mem::take(&mut select.expressions);
-    let mut type_select = select.clone();
-    if !ctes.is_empty() {
+    let mut type_select = check_types.then(|| select.clone());
+    if let Some(type_select) = type_select.as_mut().filter(|_| !ctes.is_empty()) {
         type_select.with = Some(crate::expressions::With {
             ctes,
             recursive: false,
@@ -3167,7 +3189,8 @@ fn bind_scope_projection_aliases(
                 aliases.insert(name, Some(DataType::Unknown));
                 continue;
             }
-            let mut typed = Expression::Select(type_select.clone());
+            let mut typed =
+                Expression::Select(type_select.as_ref().expect("type-check scope").clone());
             if let Expression::Select(query) = &mut typed {
                 query.expressions.push(alias.this.clone());
             }
@@ -3234,35 +3257,36 @@ fn bind_scope_projection_aliases(
 
 /// Resolver output names are strings. Retain quoting when those names were
 /// declared by a CTE/derived table, rather than folding a quoted output name.
-fn source_output_identifier<'a>(
-    expression: &'a Expression,
-    name: &str,
-) -> Option<&'a crate::expressions::Identifier> {
+fn source_output_identifiers(expression: &Expression) -> Vec<&crate::expressions::Identifier> {
     let columns: &[crate::expressions::Identifier] = match expression {
         Expression::Cte(cte) => &cte.columns,
         Expression::Subquery(query) => &query.column_aliases,
         Expression::Alias(alias) => &alias.column_aliases,
         Expression::Table(table) => &table.column_aliases,
-        Expression::Paren(paren) => return source_output_identifier(&paren.this, name),
+        Expression::Paren(paren) => return source_output_identifiers(&paren.this),
         _ => &[],
     };
     if !columns.is_empty() {
-        return columns.iter().find(|column| column.name == name);
+        return columns.iter().collect();
     }
     match scope_query(expression) {
-        Expression::Select(select) => select.expressions.iter().find_map(|projection| {
-            let identifier = match projection {
-                Expression::Alias(alias) => &alias.alias,
-                Expression::Column(column) => &column.name,
-                Expression::Identifier(identifier) => identifier,
-                _ => return None,
-            };
-            (identifier.name == name).then_some(identifier)
-        }),
-        Expression::Union(query) => source_output_identifier(&query.left, name),
-        Expression::Intersect(query) => source_output_identifier(&query.left, name),
-        Expression::Except(query) => source_output_identifier(&query.left, name),
-        _ => None,
+        Expression::Select(select) => select
+            .expressions
+            .iter()
+            .filter_map(|projection| {
+                let identifier = match projection {
+                    Expression::Alias(alias) => &alias.alias,
+                    Expression::Column(column) => &column.name,
+                    Expression::Identifier(identifier) => identifier,
+                    _ => return None,
+                };
+                Some(identifier)
+            })
+            .collect(),
+        Expression::Union(query) => source_output_identifiers(&query.left),
+        Expression::Intersect(query) => source_output_identifiers(&query.left),
+        Expression::Except(query) => source_output_identifiers(&query.left),
+        _ => Vec::new(),
     }
 }
 
@@ -3412,9 +3436,23 @@ fn validate_scope_columns(
     // or nested query, and leaves the caller's AST untouched.
     let order_by = normalized.order_by.take();
     let expression = Expression::Select(normalized);
-    let mut resolvers: Vec<_> = std::iter::once(scope)
+    let sources_by_scope: Vec<_> = std::iter::once(scope)
         .chain(ancestors.iter().copied())
-        .map(|scope| (scope, Resolver::new(scope, resolver_schema, true)))
+        .map(|scope| {
+            let mut resolver = Resolver::new(scope, resolver_schema, true);
+            let columns: HashMap<_, _> = scope
+                .sources
+                .keys()
+                .map(|source| {
+                    let columns = resolver.get_source_columns(source).unwrap_or_default();
+                    (
+                        source.as_str(),
+                        index_source_columns(scope, source, &columns, dialect),
+                    )
+                })
+                .collect();
+            (scope, columns)
+        })
         .collect();
     let using_columns: HashSet<String> = select
         .joins
@@ -3448,19 +3486,21 @@ fn validate_scope_columns(
             continue;
         }
         let span = column.name.span.or(column.span);
+        let normalized_name = normalize_identifier(column.name.clone(), strategy).name;
         if let Some(qualifier) = &column.table {
-            let resolved = resolvers.iter_mut().find_map(|(scope, resolver)| {
+            let resolved = sources_by_scope.iter().find_map(|(scope, columns)| {
                 resolve_scope_source_name(scope, &qualifier.name).map(|source| {
                     (
                         *scope,
-                        resolver.get_source_columns(&source).unwrap_or_default(),
+                        columns
+                            .get(source.as_str())
+                            .expect("indexed lexical source"),
                         source,
                     )
                 })
             });
             if let Some((source_scope, columns, source)) = resolved {
-                if !columns.is_empty()
-                    && !source_has_column(source_scope, &source, &columns, &column.name, dialect)
+                if !columns.empty && !columns.wildcard && !columns.names.contains(&normalized_name)
                 {
                     errors.push(reference_diagnostic(
                         format!(
@@ -3488,17 +3528,14 @@ fn validate_scope_columns(
         }
 
         let mut found = false;
-        for (source_scope, resolver) in &mut resolvers {
+        for (_, source_columns) in &sources_by_scope {
             let mut matches = 0;
             let mut open = false;
-            for source in source_scope.sources.keys() {
-                let columns = resolver.get_source_columns(source).unwrap_or_default();
-                open |= columns.is_empty() || columns.iter().any(|name| name == "*");
+            for columns in source_columns.values() {
+                open |= columns.empty || columns.wildcard;
                 // Wildcards are not evidence of a definite ambiguity.
-                matches += usize::from(
-                    !columns.iter().any(|name| name == "*")
-                        && source_has_column(source_scope, source, &columns, &column.name, dialect),
-                );
+                matches +=
+                    usize::from(!columns.wildcard && columns.names.contains(&normalized_name));
             }
             if matches > 0 || open {
                 if matches > 1 && check_references && !using_columns.contains(&name) {
@@ -3869,8 +3906,6 @@ pub fn validate_with_schema(
     schema: &ValidationSchema,
     options: &SchemaValidationOptions,
 ) -> ValidationResult {
-    let strict = options.strict.unwrap_or(schema.strict.unwrap_or(true));
-
     // Parse once, preserving syntax-error precedence and the caller's guards.
     let d = Dialect::get(dialect);
     let statements = match crate::parse_for_validation(
@@ -3885,6 +3920,17 @@ pub fn validate_with_schema(
         Ok(exprs) => exprs,
         Err(result) => return result,
     };
+
+    validate_parsed_with_schema(statements, dialect, schema, options)
+}
+
+pub fn validate_parsed_with_schema(
+    statements: Vec<Expression>,
+    dialect: DialectType,
+    schema: &ValidationSchema,
+    options: &SchemaValidationOptions,
+) -> ValidationResult {
+    let strict = options.strict.unwrap_or(schema.strict.unwrap_or(true));
 
     let schema_map = build_schema_map(schema);
     let resolver_schema = mapping_schema_from_validation_schema_with_dialect(schema, dialect);
@@ -3971,6 +4017,49 @@ pub fn validate_with_schema(
     }
 
     ValidationResult::with_errors(all_errors)
+}
+
+/// Validate an already bound project-query scope without rebuilding its tree.
+/// The caller retains the standalone path for type checks, semantic lint, stars,
+/// and statement kinds that require DML-specific binding.
+pub(crate) fn validate_project_query_scope(
+    scope: &crate::scope::Scope,
+    dialect: DialectType,
+    schema: &ValidationSchema,
+    options: &SchemaValidationOptions,
+) -> ValidationResult {
+    let strict = options.strict.unwrap_or(schema.strict.unwrap_or(true));
+    let schema_map = build_schema_map(schema);
+    let resolver_schema = mapping_schema_from_validation_schema_with_dialect(schema, dialect);
+    let mut errors = Vec::new();
+    if options.check_references {
+        errors.extend(check_reference_integrity(schema, &schema_map, strict));
+    }
+    let mut bindings = ProjectionAliasBindings::new();
+    validate_scope_tree(
+        scope,
+        &[],
+        &schema_map,
+        &resolver_schema,
+        ReferenceValidationOptions {
+            dialect,
+            strict,
+            check_references: options.check_references,
+            check_types: false,
+        },
+        &mut errors,
+        &mut bindings,
+    );
+    if options.check_references {
+        let statement = apply_projection_alias_bindings(scope.expression.clone(), &bindings);
+        errors.extend(check_query_reference_quality(
+            &statement,
+            &schema_map,
+            &resolver_schema,
+            &build_declared_relationships(schema, &schema_map),
+        ));
+    }
+    ValidationResult::with_errors(errors)
 }
 
 #[cfg(test)]

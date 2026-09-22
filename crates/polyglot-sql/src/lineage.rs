@@ -988,6 +988,7 @@ struct IndexedScope<'a> {
 }
 
 struct LineageScopeContext<'a> {
+    schema: Option<&'a dyn Schema>,
     projection_indexes: RefCell<HashMap<*const Expression, Option<ProjectionLookupIndex>>>,
     scopes: Vec<IndexedScope<'a>>,
     scope_ids: HashMap<*const Scope, ScopeId>,
@@ -1024,7 +1025,7 @@ struct LineageResolutionState {
 /// with projection lineage, without manufacturing SELECT projections.
 #[cfg(feature = "generate")]
 pub(crate) struct ScopedLineage<'a> {
-    context: LineageScopeContext<'a>,
+    context: std::rc::Rc<LineageScopeContext<'a>>,
     root: ScopeId,
     ctes: Vec<ScopeId>,
     dialect: Option<DialectType>,
@@ -1037,15 +1038,25 @@ impl<'a> ScopedLineage<'a> {
         inherited_ctes: &[&'a Scope],
         dialect: DialectType,
     ) -> Self {
+        Self::with_schema(scope, inherited_ctes, dialect, None)
+    }
+
+    pub(crate) fn with_schema(
+        scope: &'a Scope,
+        inherited_ctes: &[&'a Scope],
+        dialect: DialectType,
+        schema: Option<&'a dyn Schema>,
+    ) -> Self {
         let visible_ctes = scope.cte_sources.clone();
         let (mut context, root) = LineageScopeContext::from_scope(scope);
+        context.schema = schema;
         context.conservative = true;
         let mut ctes = context.indexed(root).cte_scopes.clone();
         for &cte_scope in inherited_ctes {
             if let Expression::Cte(cte) = &cte_scope.expression {
                 if visible_ctes
                     .get(&cte.alias.name)
-                    .is_some_and(|source| source.expression == cte_scope.expression)
+                    .is_some_and(|source| *source.expression == cte_scope.expression)
                     && !ctes
                         .iter()
                         .any(|id| context.scope(*id).expression == cte_scope.expression)
@@ -1055,11 +1066,36 @@ impl<'a> ScopedLineage<'a> {
             }
         }
         Self {
-            context,
+            context: std::rc::Rc::new(context),
             root,
             ctes,
             dialect: Some(dialect),
         }
+    }
+
+    /// Reuse one indexed query graph while retaining each scope's lexical CTE view.
+    pub(crate) fn for_scope(&self, scope: &'a Scope) -> Option<Self> {
+        let root = *self.context.scope_ids.get(&(scope as *const Scope))?;
+        let mut ctes = self.context.indexed(root).cte_scopes.clone();
+        for &id in &self.ctes {
+            let candidate = self.context.scope(id);
+            if let Expression::Cte(cte) = &candidate.expression {
+                if scope
+                    .cte_sources
+                    .get(&cte.alias.name)
+                    .is_some_and(|source| *source.expression == candidate.expression)
+                    && !ctes.contains(&id)
+                {
+                    ctes.push(id);
+                }
+            }
+        }
+        Some(Self {
+            context: self.context.clone(),
+            root,
+            ctes,
+            dialect: self.dialect,
+        })
     }
 
     pub(crate) fn column(&self, source: &str, column: &str) -> LineageNode {
@@ -1138,6 +1174,7 @@ impl<'a> LineageScopeContext<'a> {
             scope_ids: HashMap::new(),
             resolved_states: RefCell::new(HashSet::new()),
             conservative: false,
+            schema: None,
         };
         let root = context.insert_scope(scope);
         (context, root)
@@ -1434,7 +1471,7 @@ fn to_node_inner(
                         .as_deref()
                         .is_some_and(|alias| alias.eq_ignore_ascii_case(star_table))
                     || matches!(
-                        &source_info.expression,
+                        source_info.expression.as_ref(),
                         Expression::Table(table_ref)
                             if table_name_from_table_ref(table_ref).eq_ignore_ascii_case(star_table)
                     );
@@ -1453,7 +1490,7 @@ fn to_node_inner(
                     trailing_comments: vec![],
                     span: None,
                 }),
-                source_info.expression.clone(),
+                source_info.expression.as_ref().clone(),
             );
             apply_source_info_context(&mut child, name, source_info);
             node.downstream.push(child);
@@ -1505,6 +1542,7 @@ fn to_node_inner(
         } else {
             if let Some(alias_expr) =
                 find_prior_select_alias_expr(effective_expr, &select_expr, col_name, dialect)
+                    .filter(|_| !input_column_precedes_alias(context, scope_id, col_name, dialect))
             {
                 for alias_ref in
                     find_column_refs_in_expr_with_select(&alias_expr, effective_expr, dialect)
@@ -1813,7 +1851,7 @@ fn resolve_qualified_column(
         .get(table)
         .or_else(|| scope.sources.get(effective_table))
     {
-        match &source_info.expression {
+        match source_info.expression.as_ref() {
             Expression::Pivot(pivot) => {
                 if attach_pivot_dependencies(
                     node,
@@ -1850,10 +1888,15 @@ fn resolve_qualified_column(
 
     // Check if table is a CTE reference — check both the current scope's cte_sources
     // and ancestor CTE scopes (for sibling CTEs in parent WITH clauses).
-    let is_cte = scope.cte_sources.contains_key(effective_table)
+    let physical_source = scope
+        .sources
+        .get(table)
+        .or_else(|| scope.sources.get(effective_table))
+        .is_some_and(|source| source.kind == SourceKind::Table && !source.is_scope);
+    let is_cte = !physical_source && (scope.cte_sources.contains_key(effective_table)
         || all_cte_scopes.iter().any(
             |scope_id| matches!(&context.scope(*scope_id).expression, Expression::Cte(cte) if cte.alias.name == effective_table),
-        );
+        ));
     if is_cte {
         if let Some(child_scope_id) =
             find_child_scope_in(context, all_cte_scopes, scope_id, effective_table)
@@ -2492,7 +2535,7 @@ fn resolve_cte_alias(scope: &Scope, name: &str) -> Option<String> {
     // Check if the source's expression is a CTE — if so, extract the CTE name
     if let Some(source_info) = scope.sources.get(name) {
         if source_info.is_scope {
-            if let Expression::Cte(cte) = &source_info.expression {
+            if let Expression::Cte(cte) = source_info.expression.as_ref() {
                 let cte_name = &cte.alias.name;
                 if scope.cte_sources.contains_key(cte_name) {
                     return Some(cte_name.clone());
@@ -2597,7 +2640,7 @@ fn unique_virtual_source_for_column(
 fn virtual_source_output_columns(
     source_info: &ScopeSourceInfo,
 ) -> Box<dyn Iterator<Item = String> + '_> {
-    match &source_info.expression {
+    match source_info.expression.as_ref() {
         Expression::Unnest(unnest) => Box::new(unnest_output_columns(unnest)),
         Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
             Box::new(alias_output_columns(alias))
@@ -2635,7 +2678,7 @@ fn virtual_source_column_type(source_info: &ScopeSourceInfo, column: &str) -> Op
             .and_then(|index| types.get(index).cloned())
     };
 
-    match &source_info.expression {
+    match source_info.expression.as_ref() {
         Expression::Unnest(unnest) => find_type(
             unnest_output_columns(unnest).collect(),
             unnest_output_types(unnest),
@@ -3271,6 +3314,29 @@ fn find_prior_select_alias_expr(
     None
 }
 
+/// A physical/derived input wins over a same-named SELECT alias. Without
+/// schema evidence retain the resolver's existing conservative fallback.
+fn input_column_precedes_alias(
+    context: &LineageScopeContext<'_>,
+    scope_id: ScopeId,
+    column: &str,
+    dialect: Option<DialectType>,
+) -> bool {
+    let Some(schema) = context.schema else {
+        return false;
+    };
+    let scope = context.scope(scope_id);
+    let mut resolver = crate::resolver::Resolver::new(scope, schema, true);
+    let expected = normalize_column_name(column, dialect);
+    scope.sources.keys().any(|source| {
+        resolver.get_source_columns(source).is_ok_and(|columns| {
+            columns
+                .iter()
+                .any(|name| normalize_column_name(name, dialect) == expected)
+        })
+    })
+}
+
 /// Resolve the display name for a column reference.
 fn resolve_column_name(column: &ColumnRef<'_>, select_expr: &Expression) -> String {
     match column {
@@ -3564,7 +3630,7 @@ fn apply_source_info_context(
         source_info
             .lineage_name
             .clone()
-            .unwrap_or_else(|| match &source_info.expression {
+            .unwrap_or_else(|| match source_info.expression.as_ref() {
                 Expression::Table(table_ref) => table_name_from_table_ref(table_ref),
                 _ => source_key.to_string(),
             });
@@ -3592,7 +3658,7 @@ fn make_table_column_node_from_source(
             span: None,
             inferred_type,
         })),
-        source_info.expression.clone(),
+        source_info.expression.as_ref().clone(),
     );
 
     apply_source_info_context(&mut node, source_key, source_info);

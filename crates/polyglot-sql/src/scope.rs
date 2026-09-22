@@ -102,7 +102,7 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     /// The source expression (Table or subquery)
-    pub expression: Expression,
+    pub expression: std::sync::Arc<Expression>,
     /// Whether this source is a scope (vs. a plain table)
     pub is_scope: bool,
     /// Semantic source kind for lineage consumers.
@@ -114,9 +114,13 @@ pub struct SourceInfo {
 }
 
 impl SourceInfo {
-    pub fn new(expression: Expression, is_scope: bool, kind: SourceKind) -> Self {
+    pub fn new(
+        expression: impl Into<std::sync::Arc<Expression>>,
+        is_scope: bool,
+        kind: SourceKind,
+    ) -> Self {
         Self {
-            expression,
+            expression: expression.into(),
             is_scope,
             kind,
             alias: None,

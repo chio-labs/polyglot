@@ -118,8 +118,9 @@ pub use optimizer::{
 pub use parser::Parser;
 #[cfg(all(feature = "semantic", feature = "generate"))]
 pub use query_analysis::{
-    analyze_query, analyze_query_for_project_projections, AnalyzeQueryOptions, ColumnReferenceFact,
-    ColumnUseContext, ColumnUseFact, ColumnUseReferenceFact, CteFact, ProjectionFact,
+    analyze_query, analyze_query_for_project_projections, compile_query_analysis,
+    compile_required_query_analysis, AnalyzeQueryOptions, ColumnReferenceFact, ColumnUseContext,
+    ColumnUseFact, ColumnUseReferenceFact, CompiledQueryAnalysis, CteFact, ProjectionFact,
     ProjectionNullability, QueryAnalysis, QueryShape, QuerySourceSpan, ReferenceConfidence,
     RelationFact, SetOperationBranchFact, SetOperationBranchRole, SetOperationFact,
     StarProjectionFact, TransformFunctionFact, TransformKind,

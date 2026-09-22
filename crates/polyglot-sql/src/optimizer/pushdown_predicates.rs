@@ -325,7 +325,7 @@ fn nodes_for_predicate(
             // - GROUP BY (push to HAVING instead)
             // - Window functions (can't push)
             // - Multiple references (can't push)
-            nodes.insert(table, source_info.expression.clone());
+            nodes.insert(table, source_info.expression.as_ref().clone());
         }
     }
 

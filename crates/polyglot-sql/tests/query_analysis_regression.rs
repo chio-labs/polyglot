@@ -24,6 +24,127 @@ fn first_projection(sql: &str) -> polyglot_sql::ProjectionFact {
 }
 
 #[test]
+fn required_project_facts_follow_only_consumed_cte_outputs() {
+    let columns = (0..128)
+        .map(|index| format!("CAST(order_id AS BIGINT) AS value_{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("WITH expanded AS (SELECT {columns} FROM orders), selected AS (SELECT value_0 AS order_id FROM expanded) SELECT order_id FROM selected");
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({
+        "tables": [{"name": "orders", "columns": [{"name": "order_id", "type": "BIGINT"}]}]
+    }))
+    .unwrap();
+    let options = AnalyzeQueryOptions {
+        dialect: DialectType::DuckDB,
+        schema: Some(schema.clone()),
+        ..Default::default()
+    };
+    let validation = polyglot_sql::SchemaValidationOptions {
+        check_types: false,
+        check_references: true,
+        semantic: false,
+        strict_syntax: false,
+        ..Default::default()
+    };
+    let full =
+        polyglot_sql::compile_query_analysis(&sql, options.clone(), &schema, &validation, true);
+    let required =
+        polyglot_sql::compile_required_query_analysis(&sql, options, &schema, &validation, true);
+    assert_eq!(
+        serde_json::to_value(full.validation).unwrap(),
+        serde_json::to_value(required.validation).unwrap()
+    );
+    let full = full.analysis.unwrap();
+    let required = required.analysis.unwrap();
+    assert_eq!(
+        required.projections[0].type_hint,
+        full.projections[0].type_hint
+    );
+    assert_eq!(
+        required.projections[0].nullability,
+        full.projections[0].nullability
+    );
+    assert_eq!(
+        required.projections[0].passthrough_source.as_deref(),
+        Some("selected")
+    );
+    assert_eq!(
+        required.projections[0].passthrough_column.as_deref(),
+        Some("order_id")
+    );
+    assert!(required.projections[0].upstream.is_empty());
+    assert_eq!(
+        serde_json::to_value(&required.cte_facts[0].projections[0].upstream).unwrap(),
+        serde_json::to_value(&full.cte_facts[0].projections[0].upstream).unwrap()
+    );
+    assert_eq!(
+        full.cte_facts
+            .iter()
+            .map(|fact| fact.projections.len())
+            .sum::<usize>(),
+        129
+    );
+    assert_eq!(
+        required
+            .cte_facts
+            .iter()
+            .map(|fact| fact.projections.len())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        required.cte_facts[0].projections[0].name.as_deref(),
+        Some("value_0")
+    );
+    assert_eq!(
+        required.cte_facts[1].projections[0].name.as_deref(),
+        Some("order_id")
+    );
+}
+
+#[test]
+fn combined_project_compilation_preserves_binding_and_analysis_boundaries() {
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({
+        "strict": true,
+        "tables": [
+            {"name": "orders", "columns": [{"name": "order_id", "type": "BIGINT"}, {"name": "customer_id", "type": "BIGINT"}]},
+            {"name": "customers", "columns": [{"name": "customer_id", "type": "BIGINT"}]}
+        ]
+    })).unwrap();
+    let validation_options = polyglot_sql::SchemaValidationOptions {
+        check_types: false,
+        check_references: true,
+        strict: Some(true),
+        semantic: false,
+        strict_syntax: false,
+        ..Default::default()
+    };
+    for sql in [
+        "SELECT order_id FROM orders",
+        "SELECT missing FROM orders",
+        "SELECT customer_id FROM orders JOIN customers ON orders.customer_id = customers.customer_id",
+        "WITH selected AS (SELECT order_id FROM orders) SELECT order_id FROM selected WHERE order_id > 0",
+        "SELECT order_id AS selected_id FROM orders ORDER BY selected_id",
+        "SELECT order_id AS selected_id, selected_id + 1 AS next_id FROM orders",
+        "SELECT order_id FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE customers.customer_id = orders.customer_id)",
+        "SELECT order_id FROM orders UNION ALL SELECT customer_id FROM customers",
+        "SELECT * FROM orders",
+        "SELECT COUNT(*) AS total FROM orders",
+        "SELECT order_id FROM orders QUALIFY ROW_NUMBER() OVER (ORDER BY order_id) = 1",
+        "SELECT o.order_id FROM orders o JOIN customers c USING (customer_id)",
+    ] {
+        let analysis_options = AnalyzeQueryOptions {
+            dialect: DialectType::Snowflake, schema: Some(schema.clone()), ..Default::default()
+        };
+        let standalone = analyze_query_for_project_projections(sql, analysis_options.clone()).unwrap();
+        let validation = polyglot_sql::validate_with_schema(sql, DialectType::Snowflake, &schema, &validation_options);
+        let combined = polyglot_sql::compile_query_analysis(sql, analysis_options, &schema, &validation_options, true);
+        assert_eq!(serde_json::to_value(combined.analysis.unwrap()).unwrap(), serde_json::to_value(standalone).unwrap(), "analysis: {sql}");
+        assert_eq!(serde_json::to_value(combined.validation).unwrap(), serde_json::to_value(validation).unwrap(), "binding: {sql}");
+    }
+}
+
+#[test]
 fn project_analysis_deduplicates_repeated_cte_lineage_states() {
     let mut ctes = vec!["base AS (SELECT order_id FROM orders)".to_string()];
     for index in 1..=24 {
