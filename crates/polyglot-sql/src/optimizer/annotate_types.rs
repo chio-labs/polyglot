@@ -17,6 +17,7 @@ use crate::expressions::{
     Literal, Map, Nvl2Func, Struct, StructField, Subscript,
 };
 use crate::schema::{normalize_name, Schema, SchemaError, SchemaResult, TABLE_PARTS};
+use crate::traversal::ExpressionWalk;
 
 /// Type coercion class for determining result types in binary operations.
 /// Higher-priority classes win during coercion.
@@ -83,6 +84,7 @@ pub struct TypeAnnotator<'a> {
     annotate_aggregates: bool,
     /// Function return type mappings
     function_return_types: HashMap<String, DataType>,
+    used_unknown_function_fallback: bool,
 }
 
 impl<'a> TypeAnnotator<'a> {
@@ -94,6 +96,7 @@ impl<'a> TypeAnnotator<'a> {
             _dialect: dialect,
             annotate_aggregates: true,
             function_return_types: HashMap::new(),
+            used_unknown_function_fallback: false,
         };
         annotator.init_function_return_types();
         annotator
@@ -402,7 +405,7 @@ impl<'a> TypeAnnotator<'a> {
     pub fn annotate(&mut self, expr: &Expression) -> Option<DataType> {
         match expr {
             // Literals
-            Expression::Literal(lit) => self.annotate_literal(lit),
+            Expression::Literal(lit) => Self::annotate_literal(lit),
             Expression::Boolean(_) => Some(DataType::Boolean),
             Expression::Null(_) => None, // NULL has no type
 
@@ -514,17 +517,19 @@ impl<'a> TypeAnnotator<'a> {
             Expression::SafeCast(cast) => Some(cast.to.clone()),
             Expression::TryCast(cast) => Some(cast.to.clone()),
 
-            // Subqueries - type is the type of the first SELECT expression
+            // Only a single-column relation can supply a scalar subquery type.
             Expression::Subquery(subq) => subq.inferred_type.clone().or_else(|| {
                 let mut query = subq.this.clone();
-                annotate_scoped_expression_with_outer(
+                let columns = annotate_scoped_expression_with_outer(
                     &mut query,
                     self.query_schema,
                     self._dialect,
                     self._schema,
-                )
-                .first()
-                .map(|(_, data_type)| data_type.clone())
+                );
+                match columns.as_slice() {
+                    [(_, data_type)] => Some(data_type.clone()),
+                    _ => None,
+                }
             }),
 
             // CASE expression - common type of all result branches
@@ -1037,7 +1042,10 @@ impl<'a> TypeAnnotator<'a> {
                     self._dialect,
                     self._schema,
                 );
-                s.inferred_type = columns.first().map(|(_, data_type)| data_type.clone());
+                s.inferred_type = match columns.as_slice() {
+                    [(_, data_type)] => Some(data_type.clone()),
+                    _ => None,
+                };
             }
 
             Expression::Trim(f) => {
@@ -1308,7 +1316,7 @@ impl<'a> TypeAnnotator<'a> {
     }
 
     /// Annotate a literal value
-    fn annotate_literal(&self, lit: &Literal) -> Option<DataType> {
+    pub(super) fn annotate_literal(lit: &Literal) -> Option<DataType> {
         match lit {
             Literal::String(_)
             | Literal::NationalString(_)
@@ -1381,6 +1389,12 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate a function call
     fn annotate_function(&mut self, func: &Function) -> Option<DataType> {
+        if self._dialect == Some(DialectType::BigQuery)
+            && !func.quoted
+            && func.name.eq_ignore_ascii_case("ARRAY")
+        {
+            return self.annotate_array(&func.args);
+        }
         if func.name.eq_ignore_ascii_case("TRANSFORM")
             || func.name.eq_ignore_ascii_case("ARRAY_TRANSFORM")
         {
@@ -1455,10 +1469,22 @@ impl<'a> TypeAnnotator<'a> {
                 }
             }
             _ => {
-                // Unknown function - try to infer from first argument
+                self.used_unknown_function_fallback = true;
                 func.args.first().and_then(|arg| self.annotate(arg))
             }
         }
+    }
+
+    /// Relation outputs cannot rely on the scalar annotator's legacy fallback
+    /// that assigns an unknown function the type of its first argument.
+    pub(super) fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
+        let mut annotator = Self::new(None, Some(dialect));
+        // Probe dispatch without traversing or cloning a query argument. The
+        // original annotation already supplied the type for recognized rules.
+        let mut probe = Function::new(func.name.clone(), Vec::new());
+        probe.quoted = func.quoted;
+        annotator.annotate_function(&probe);
+        !annotator.used_unknown_function_fallback
     }
 
     /// Infer DuckDB's string-list or named-capture struct-list regex result.
@@ -1739,6 +1765,32 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Infer the type of an array constructor from all of its elements.
     fn annotate_array(&mut self, expressions: &[Expression]) -> Option<DataType> {
+        if let [query] = expressions {
+            if matches!(
+                query,
+                Expression::Select(_)
+                    | Expression::Union(_)
+                    | Expression::Intersect(_)
+                    | Expression::Except(_)
+                    | Expression::Subquery(_)
+            ) {
+                let mut query = query.clone();
+                let columns = annotate_scoped_expression_with_outer(
+                    &mut query,
+                    self.query_schema,
+                    self._dialect,
+                    self._schema,
+                );
+                let element_type = match columns.as_slice() {
+                    [(_, data_type)] if *data_type != DataType::Unknown => data_type.clone(),
+                    _ => return None,
+                };
+                return Some(DataType::Array {
+                    element_type: Box::new(element_type),
+                    dimension: None,
+                });
+            }
+        }
         let element_type = self
             .coerce_expression_types(expressions.iter())
             .unwrap_or(DataType::Unknown);
@@ -1940,7 +1992,7 @@ fn signed_integer_type(bits: u16) -> DataType {
 
 /// DuckDB uses function-overload binding for arithmetic, but combination casting
 /// for CASE/COALESCE/arrays. In particular, small mixed arithmetic binds BIGINT.
-fn duckdb_unsigned_integer_coercion(
+pub(super) fn duckdb_unsigned_integer_coercion(
     left: &DataType,
     right: &DataType,
     arithmetic: bool,
@@ -2204,6 +2256,12 @@ fn projection_name(expression: &Expression) -> Option<String> {
 }
 
 fn projection_type(expression: &Expression) -> DataType {
+    if let Expression::Literal(literal) = expression {
+        return TypeAnnotator::annotate_literal(literal).unwrap_or(DataType::Unknown);
+    }
+    if matches!(expression, Expression::Boolean(_)) {
+        return DataType::Boolean;
+    }
     expression
         .inferred_type()
         .or_else(|| match expression {
@@ -2214,15 +2272,30 @@ fn projection_type(expression: &Expression) -> DataType {
         .unwrap_or(DataType::Unknown)
 }
 
-fn query_outputs(expressions: &[Expression]) -> OutputColumns {
+fn query_outputs(expressions: &[Expression], dialect: Option<DialectType>) -> OutputColumns {
     expressions
         .iter()
         .map(|expression| {
+            let mut inner = expression;
+            loop {
+                inner = match inner {
+                    Expression::Alias(alias) => &alias.this,
+                    Expression::Paren(paren) => &paren.this,
+                    Expression::Annotated(annotated) => &annotated.this,
+                    _ => break,
+                };
+            }
+            let unknown_function = matches!(inner, Expression::Function(func)
+                if !TypeAnnotator::function_result_is_known(func, dialect.unwrap_or_default()));
             // Keep unnamed slots until CTE/derived-table column aliases have
             // been applied by ordinal. They are not registered as named columns.
             (
                 projection_name(expression).unwrap_or_default(),
-                projection_type(expression),
+                if unknown_function {
+                    DataType::Unknown
+                } else {
+                    projection_type(expression)
+                },
             )
         })
         .collect()
@@ -2408,8 +2481,40 @@ fn annotate_with(
 ) {
     if let Some(with) = with {
         for cte in &mut with.ctes {
-            let columns =
+            let name = crate::binding::identifier_name(&cte.alias);
+            // Bind the anchor before visiting a recursive arm. Only stable
+            // output types are retained; widening through recursion is not a
+            // regular UNION and needs engine-specific recursive-CTE validation.
+            let recursive_anchor = if let Expression::Union(union) = &mut cte.this {
+                let references_self = with.recursive && union.right.contains(|node| matches!(node,
+                    Expression::Table(table) if table.schema.is_none() && table.catalog.is_none()
+                        && normalize_name(&crate::binding::identifier_name(&table.name), dialect, false, true)
+                            == normalize_name(&name, dialect, false, true)));
+                if references_self {
+                    let columns = annotate_scoped_expression_with_outer(
+                        &mut union.left,
+                        Some(schema),
+                        dialect,
+                        outer,
+                    );
+                    let columns = apply_column_aliases(columns, &cte.columns);
+                    let _ = schema.add_table(&name, &columns, dialect);
+                    Some(columns)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut columns =
                 annotate_scoped_expression_with_outer(&mut cte.this, Some(schema), dialect, outer);
+            if let Some(anchor) = recursive_anchor {
+                for ((_, result), (_, initial)) in columns.iter_mut().zip(anchor) {
+                    if *result != initial {
+                        *result = DataType::Unknown;
+                    }
+                }
+            }
             let columns = apply_column_aliases(columns, &cte.columns);
             let _ = schema.add_table(
                 &crate::binding::identifier_name(&cte.alias),
@@ -2477,7 +2582,7 @@ fn annotate_select(
             annotator.annotate_in_place(condition);
         }
     }
-    query_outputs(&select.expressions)
+    query_outputs(&select.expressions, dialect)
 }
 
 fn annotate_scoped_expression(
@@ -2513,19 +2618,14 @@ fn annotate_scoped_expression_with_outer(
         Expression::Union(union) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut union.with, &mut schema, dialect, outer);
-            let columns = annotate_scoped_expression_with_outer(
-                &mut union.left,
-                Some(&schema),
-                dialect,
-                outer,
-            );
+            annotate_scoped_expression_with_outer(&mut union.left, Some(&schema), dialect, outer);
             annotate_scoped_expression_with_outer(&mut union.right, Some(&schema), dialect, outer);
-            columns
+            super::set_operation_types::query_columns(expression, dialect)
         }
         Expression::Intersect(intersect) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut intersect.with, &mut schema, dialect, outer);
-            let columns = annotate_scoped_expression_with_outer(
+            annotate_scoped_expression_with_outer(
                 &mut intersect.left,
                 Some(&schema),
                 dialect,
@@ -2537,19 +2637,14 @@ fn annotate_scoped_expression_with_outer(
                 dialect,
                 outer,
             );
-            columns
+            super::set_operation_types::query_columns(expression, dialect)
         }
         Expression::Except(except) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut except.with, &mut schema, dialect, outer);
-            let columns = annotate_scoped_expression_with_outer(
-                &mut except.left,
-                Some(&schema),
-                dialect,
-                outer,
-            );
+            annotate_scoped_expression_with_outer(&mut except.left, Some(&schema), dialect, outer);
             annotate_scoped_expression_with_outer(&mut except.right, Some(&schema), dialect, outer);
-            columns
+            super::set_operation_types::query_columns(expression, dialect)
         }
         _ => {
             if let Some(mut selected) = crate::binding::dml_scope(expression) {
@@ -2598,6 +2693,283 @@ mod tests {
     use super::*;
     use crate::expressions::{BooleanLiteral, Cast, ExtractFunc, Null};
     use crate::{parse_one, DialectType, MappingSchema, Schema};
+
+    #[test]
+    fn set_operation_types_cover_all_dialects_454() {
+        use DialectType::*;
+        // Exercise real query annotation, including the external-source binding,
+        // rather than just mirroring the policy dispatch.
+        for dialect in [
+            Generic,
+            PostgreSQL,
+            MySQL,
+            BigQuery,
+            Snowflake,
+            DuckDB,
+            SQLite,
+            Hive,
+            Spark,
+            Trino,
+            Presto,
+            Redshift,
+            TSQL,
+            Oracle,
+            ClickHouse,
+            Databricks,
+            Athena,
+            Teradata,
+            Doris,
+            StarRocks,
+            Materialize,
+            RisingWave,
+            SingleStore,
+            CockroachDB,
+            TiDB,
+            Druid,
+            Solr,
+            Tableau,
+            Dune,
+            Fabric,
+            Drill,
+            Dremio,
+            Exasol,
+            DataFusion,
+        ] {
+            for (left, right) in [("INT", "BIGINT"), ("BIGINT", "INT")] {
+                let sql = format!("SELECT t.a FROM (SELECT CAST(1 AS {left}) AS a UNION ALL SELECT CAST(2 AS {right}) AS a) AS t");
+                let mut expression = parse_one(&sql, dialect).unwrap();
+                annotate_types(&mut expression, None, Some(dialect));
+                let Expression::Select(select) = expression else {
+                    panic!("select")
+                };
+                let actual = select.expressions[0].inferred_type();
+                match dialect {
+                    BigQuery => assert!(
+                        matches!(actual, Some(DataType::Custom { name }) if name == "INT64"),
+                        "{dialect:?}: {actual:?}"
+                    ),
+                    SQLite => assert!(
+                        actual.is_none_or(|t| *t == DataType::Unknown),
+                        "{dialect:?}: {actual:?}"
+                    ),
+                    Teradata if left == "INT" => assert!(
+                        matches!(actual, Some(DataType::Int { .. })),
+                        "{dialect:?}: {actual:?}"
+                    ),
+                    Oracle => assert!(
+                        matches!(
+                            actual,
+                            Some(DataType::Oracle {
+                                oracle_type: crate::expressions::OracleDataType::Number { .. }
+                            })
+                        ),
+                        "{dialect:?}: {actual:?}"
+                    ),
+                    _ => assert!(
+                        matches!(actual, Some(DataType::BigInt { .. })),
+                        "{dialect:?}: {actual:?}"
+                    ),
+                }
+            }
+            let mut expression = parse_one(
+                "SELECT t.a FROM (SELECT CAST(1 AS DECIMAL(10,2)) AS a UNION ALL SELECT missing_function() AS a) AS t", dialect
+            ).unwrap();
+            annotate_types(&mut expression, None, Some(dialect));
+            let Expression::Select(select) = expression else {
+                panic!("select")
+            };
+            assert!(
+                select.expressions[0]
+                    .inferred_type()
+                    .is_none_or(|t| *t == DataType::Unknown),
+                "{dialect:?}: {:?}",
+                select.expressions[0].inferred_type()
+            );
+        }
+    }
+
+    #[test]
+    fn set_operation_coercion_parameters_and_isolation_454() {
+        use super::super::set_operation_types::common_type;
+        let mut literal_query = parse_one(
+            "SELECT t.a FROM (SELECT 1.5 AS a UNION ALL SELECT 2.5 AS a) AS t",
+            DialectType::PostgreSQL,
+        )
+        .unwrap();
+        annotate_types(&mut literal_query, None, Some(DialectType::PostgreSQL));
+        let Expression::Select(select) = literal_query else {
+            panic!("select")
+        };
+        assert!(matches!(
+            select.expressions[0].inferred_type(),
+            Some(DataType::Decimal {
+                precision: None,
+                scale: None
+            })
+        ));
+        let dec = |p, s| DataType::Decimal {
+            precision: Some(p),
+            scale: Some(s),
+        };
+        let varchar = |n| DataType::VarChar {
+            length: Some(n),
+            parenthesized_length: false,
+        };
+        let array = |t| DataType::Array {
+            element_type: Box::new(t),
+            dimension: None,
+        };
+        let int = DataType::Int {
+            length: None,
+            integer_spelling: false,
+        };
+        let double = double_type();
+        for dialect in [
+            DialectType::TSQL,
+            DialectType::DuckDB,
+            DialectType::DataFusion,
+            DialectType::Trino,
+        ] {
+            assert_eq!(
+                common_type(&dec(10, 2), &dec(8, 4), dialect, 0),
+                Some(dec(12, 4))
+            );
+            assert_eq!(
+                common_type(&dec(8, 4), &dec(10, 2), dialect, 0),
+                Some(dec(12, 4))
+            );
+            assert_eq!(
+                common_type(&dec(10, 2), &DataType::Unknown, dialect, 0),
+                None
+            );
+            assert_eq!(
+                common_type(&array(int.clone()), &array(DataType::Unknown), dialect, 0),
+                None
+            );
+        }
+        assert_eq!(
+            common_type(&varchar(10), &varchar(30), DialectType::TSQL, 0),
+            Some(varchar(30))
+        );
+        assert_eq!(
+            common_type(
+                &array(int.clone()),
+                &array(double.clone()),
+                DialectType::DuckDB,
+                0
+            ),
+            Some(array(double))
+        );
+        assert_eq!(
+            common_type(
+                &DataType::BigInt { length: None },
+                &DataType::UInt64,
+                DialectType::DuckDB,
+                0
+            ),
+            Some(DataType::Int128)
+        );
+        assert_eq!(
+            common_type(&dec(38, 20), &dec(38, 0), DialectType::TSQL, 0),
+            Some(dec(38, 0))
+        );
+        assert_eq!(
+            common_type(&dec(38, 20), &dec(38, 0), DialectType::Trino, 0),
+            None
+        );
+        assert_eq!(
+            common_type(&dec(10, 2), &double_type(), DialectType::DataFusion, 0),
+            Some(dec(30, 15))
+        );
+        assert_eq!(
+            common_type(
+                &DataType::UInt64,
+                &DataType::BigInt { length: None },
+                DialectType::ClickHouse,
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            common_type(
+                &DataType::UInt64,
+                &DataType::BigInt { length: None },
+                DialectType::DataFusion,
+                0
+            ),
+            Some(dec(20, 0))
+        );
+        let structure = |fields: Vec<(&str, DataType)>| DataType::Struct {
+            fields: fields
+                .into_iter()
+                .map(|(name, t)| StructField::new(name.to_owned(), t))
+                .collect(),
+            nested: false,
+        };
+        let left = structure(vec![("x", int.clone()), ("y", varchar(10))]);
+        let right = structure(vec![("y", varchar(30)), ("x", double_type())]);
+        let combined = structure(vec![("x", double_type()), ("y", varchar(30))]);
+        assert_eq!(
+            common_type(&left, &right, DialectType::DataFusion, 0),
+            Some(combined)
+        );
+        let right = structure(vec![("z", DataType::Boolean), ("x", double_type())]);
+        assert_eq!(
+            common_type(
+                &structure(vec![("x", int.clone())]),
+                &right,
+                DialectType::DuckDB,
+                0
+            ),
+            Some(structure(vec![
+                ("x", double_type()),
+                ("z", DataType::Boolean)
+            ]))
+        );
+        assert_eq!(
+            common_type(
+                &array(int.clone()),
+                &array(double_type()),
+                DialectType::BigQuery,
+                0
+            ),
+            None
+        );
+        let map = |value_type| DataType::Map {
+            key_type: Box::new(DataType::Text),
+            value_type: Box::new(value_type),
+        };
+        assert_eq!(
+            common_type(
+                &map(int.clone()),
+                &map(double_type()),
+                DialectType::DuckDB,
+                0
+            ),
+            Some(map(double_type()))
+        );
+        let timestamp = |p| DataType::Timestamp {
+            precision: Some(p),
+            timezone: false,
+        };
+        assert_eq!(
+            common_type(&timestamp(3), &timestamp(6), DialectType::TSQL, 0),
+            Some(timestamp(6))
+        );
+        assert_eq!(
+            common_type(&DataType::Date, &timestamp(6), DialectType::PostgreSQL, 0),
+            Some(timestamp(6))
+        );
+        for dialect in [
+            DialectType::BigQuery,
+            DialectType::Hive,
+            DialectType::Databricks,
+            DialectType::Generic,
+            DialectType::BigQuery,
+        ] {
+            assert_eq!(common_type(&varchar(10), &DataType::Date, dialect, 0), None);
+        }
+    }
 
     fn make_int_literal(val: i64) -> Expression {
         Expression::Literal(Box::new(Literal::Number(val.to_string())))

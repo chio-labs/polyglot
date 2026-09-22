@@ -1667,6 +1667,17 @@ pub(super) fn normalize(
                 }
                 Expression::Function(f) => {
                     let name = f.name.to_ascii_uppercase();
+                    if name == "TO_ISO8601"
+                        && matches!(source, DialectType::Athena | DialectType::Presto | DialectType::Trino)
+                        && matches!(target, DialectType::DuckDB)
+                    {
+                        // DuckDB has no native equivalent. A generic STRFTIME
+                        // rewrite loses source precision and per-value time zones.
+                        return Err(crate::error::Error::unsupported(
+                            "TO_ISO8601 translation preserving source precision and time zone",
+                            target.to_string(),
+                        ));
+                    }
                     // DuckDB json(x) is a synonym for CAST(x AS JSON) — parses a string.
                     // Map to JSON_PARSE(x) for Trino/Presto/Athena to preserve semantics.
                     if matches!(source, DialectType::PostgreSQL)
@@ -1795,6 +1806,19 @@ pub(super) fn normalize(
                         // The Redshift parser adds 'UTC' as default source_tz, but when
                         // transpiling from other dialects, we should preserve the original form.
                         Action::Temporal(temporal::Action::ConvertTimezoneToExpr)
+                    } else if matches!(source, DialectType::Athena | DialectType::Presto | DialectType::Trino)
+                        && matches!(target, DialectType::DuckDB)
+                        && name == "REGEXP_EXTRACT"
+                        && matches!(f.args.len(), 2 | 3)
+                    {
+                        Action::Operators(operators::Action::RegexpExtractPrestoToDuckDB)
+                    } else if matches!(source, DialectType::Athena | DialectType::Presto | DialectType::Trino)
+                        && matches!(target, DialectType::DuckDB)
+                        && name == "REGEXP_REPLACE"
+                        && matches!(f.args.len(), 2 | 3)
+                        && !matches!(f.args.get(2), Some(Expression::Lambda(_)))
+                    {
+                        Action::Operators(operators::Action::RegexpReplacePrestoToDuckDB)
                     } else if matches!(source, DialectType::Snowflake)
                         && matches!(target, DialectType::DuckDB)
                         && name == "REGEXP_REPLACE"

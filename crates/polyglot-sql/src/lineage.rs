@@ -18,6 +18,7 @@ use crate::scope::{
 };
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// The ordered output description of a query.
@@ -987,9 +988,35 @@ struct IndexedScope<'a> {
 }
 
 struct LineageScopeContext<'a> {
+    schema: Option<&'a dyn Schema>,
+    projection_indexes: RefCell<HashMap<*const Expression, Option<ProjectionLookupIndex>>>,
     scopes: Vec<IndexedScope<'a>>,
+    scope_ids: HashMap<*const Scope, ScopeId>,
+    resolved_states: RefCell<HashSet<LineageResolutionState>>,
     /// Usage analysis must not claim undeclared qualifiers as physical tables.
     conservative: bool,
+}
+
+struct ProjectionLookupIndex {
+    names: HashMap<String, Vec<usize>>,
+    ordinals: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LineageResolutionColumn {
+    Name(String),
+    Index(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LineageResolutionState {
+    column: LineageResolutionColumn,
+    scope_id: ScopeId,
+    scope_name: String,
+    source_name: String,
+    reference_node_name: String,
+    trim_selects: bool,
+    ancestor_cte_scopes: Vec<ScopeId>,
 }
 
 /// Reuse the lineage resolver for analysis of non-output column occurrences.
@@ -998,7 +1025,7 @@ struct LineageScopeContext<'a> {
 /// with projection lineage, without manufacturing SELECT projections.
 #[cfg(feature = "generate")]
 pub(crate) struct ScopedLineage<'a> {
-    context: LineageScopeContext<'a>,
+    context: std::rc::Rc<LineageScopeContext<'a>>,
     root: ScopeId,
     ctes: Vec<ScopeId>,
     dialect: Option<DialectType>,
@@ -1011,15 +1038,25 @@ impl<'a> ScopedLineage<'a> {
         inherited_ctes: &[&'a Scope],
         dialect: DialectType,
     ) -> Self {
+        Self::with_schema(scope, inherited_ctes, dialect, None)
+    }
+
+    pub(crate) fn with_schema(
+        scope: &'a Scope,
+        inherited_ctes: &[&'a Scope],
+        dialect: DialectType,
+        schema: Option<&'a dyn Schema>,
+    ) -> Self {
         let visible_ctes = scope.cte_sources.clone();
         let (mut context, root) = LineageScopeContext::from_scope(scope);
+        context.schema = schema;
         context.conservative = true;
         let mut ctes = context.indexed(root).cte_scopes.clone();
         for &cte_scope in inherited_ctes {
             if let Expression::Cte(cte) = &cte_scope.expression {
                 if visible_ctes
                     .get(&cte.alias.name)
-                    .is_some_and(|source| source.expression == cte_scope.expression)
+                    .is_some_and(|source| *source.expression == cte_scope.expression)
                     && !ctes
                         .iter()
                         .any(|id| context.scope(*id).expression == cte_scope.expression)
@@ -1029,14 +1066,40 @@ impl<'a> ScopedLineage<'a> {
             }
         }
         Self {
-            context,
+            context: std::rc::Rc::new(context),
             root,
             ctes,
             dialect: Some(dialect),
         }
     }
 
+    /// Reuse one indexed query graph while retaining each scope's lexical CTE view.
+    pub(crate) fn for_scope(&self, scope: &'a Scope) -> Option<Self> {
+        let root = *self.context.scope_ids.get(&(scope as *const Scope))?;
+        let mut ctes = self.context.indexed(root).cte_scopes.clone();
+        for &id in &self.ctes {
+            let candidate = self.context.scope(id);
+            if let Expression::Cte(cte) = &candidate.expression {
+                if scope
+                    .cte_sources
+                    .get(&cte.alias.name)
+                    .is_some_and(|source| *source.expression == candidate.expression)
+                    && !ctes.contains(&id)
+                {
+                    ctes.push(id);
+                }
+            }
+        }
+        Some(Self {
+            context: self.context.clone(),
+            root,
+            ctes,
+            dialect: self.dialect,
+        })
+    }
+
     pub(crate) fn column(&self, source: &str, column: &str) -> LineageNode {
+        self.context.reset_resolved_states();
         let mut node = LineageNode::new(
             column,
             Expression::qualified_column(source, column),
@@ -1058,6 +1121,7 @@ impl<'a> ScopedLineage<'a> {
     }
 
     pub(crate) fn output(&self, ordinal: usize) -> Result<LineageNode> {
+        self.context.reset_resolved_states();
         to_node_inner(
             ColumnRef::Index(ordinal),
             &self.context,
@@ -1080,6 +1144,7 @@ impl<'a> ScopedLineage<'a> {
     }
 
     pub(crate) fn subquery_output(&self, index: usize) -> Result<LineageNode> {
+        self.context.reset_resolved_states();
         let scope_id = *self
             .context
             .indexed(self.root)
@@ -1104,14 +1169,31 @@ impl<'a> ScopedLineage<'a> {
 impl<'a> LineageScopeContext<'a> {
     fn from_scope(scope: &'a Scope) -> (Self, ScopeId) {
         let mut context = Self {
+            projection_indexes: RefCell::new(HashMap::new()),
             scopes: Vec::new(),
+            scope_ids: HashMap::new(),
+            resolved_states: RefCell::new(HashSet::new()),
             conservative: false,
+            schema: None,
         };
         let root = context.insert_scope(scope);
         (context, root)
     }
 
     fn insert_scope(&mut self, scope: &'a Scope) -> ScopeId {
+        let scope_key = scope as *const Scope;
+        if let Some(id) = self.scope_ids.get(&scope_key) {
+            return *id;
+        }
+        let id = ScopeId(self.scopes.len());
+        self.scope_ids.insert(scope_key, id);
+        self.scopes.push(IndexedScope {
+            scope,
+            subquery_scopes: Vec::new(),
+            derived_table_scopes: Vec::new(),
+            cte_scopes: Vec::new(),
+            union_scopes: Vec::new(),
+        });
         let subquery_scopes = scope
             .subquery_scopes
             .iter()
@@ -1133,14 +1215,13 @@ impl<'a> LineageScopeContext<'a> {
             .map(|child| self.insert_scope(child))
             .collect();
 
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(IndexedScope {
+        self.scopes[id.0] = IndexedScope {
             scope,
             subquery_scopes,
             derived_table_scopes,
             cte_scopes,
             union_scopes,
-        });
+        };
         id
     }
 
@@ -1150,6 +1231,102 @@ impl<'a> LineageScopeContext<'a> {
 
     fn scope(&self, id: ScopeId) -> &Scope {
         self.indexed(id).scope
+    }
+
+    fn select_expression(
+        &self,
+        expression: &Expression,
+        column: &ColumnRef<'_>,
+        dialect: Option<DialectType>,
+    ) -> Result<Expression> {
+        let Expression::Select(select) = expression else {
+            return find_select_expr(expression, column, dialect);
+        };
+        let mut indexes = self.projection_indexes.borrow_mut();
+        let index = indexes
+            .entry(expression as *const Expression)
+            .or_insert_with(|| {
+                let layout = output_layout(select);
+                if layout
+                    .iter()
+                    .any(|entry| matches!(entry.column, OutputColumn::Wildcard { .. }))
+                {
+                    return None;
+                }
+                let mut names: HashMap<String, Vec<usize>> = HashMap::new();
+                let mut ordinals = Vec::with_capacity(layout.len());
+                for entry in layout {
+                    if let OutputColumn::Named { name, .. } = &entry.column {
+                        names
+                            .entry(normalize_column_name(name, dialect))
+                            .or_default()
+                            .push(entry.projection_index);
+                    }
+                    ordinals.push(entry.projection_index);
+                }
+                Some(ProjectionLookupIndex { names, ordinals })
+            });
+        let Some(index) = index else {
+            return find_select_expr(expression, column, dialect);
+        };
+        let projection_index = match column {
+            ColumnRef::Index(ordinal) => *index.ordinals.get(*ordinal).ok_or_else(|| {
+                ordinal_resolution_error(*ordinal, ColumnResolutionReason::NotFound)
+            })?,
+            ColumnRef::Name(name) => match index
+                .names
+                .get(&normalize_column_name(name, dialect))
+                .map(Vec::as_slice)
+            {
+                Some([ordinal]) => *ordinal,
+                Some(_) => {
+                    return Err(name_resolution_error(
+                        name,
+                        ColumnResolutionReason::Ambiguous,
+                    ))
+                }
+                None => {
+                    return Err(name_resolution_error(
+                        name,
+                        ColumnResolutionReason::NotFound,
+                    ))
+                }
+            },
+        };
+        Ok(select.expressions[projection_index].clone())
+    }
+
+    fn reset_resolved_states(&self) {
+        self.resolved_states.borrow_mut().clear();
+    }
+
+    fn observe_resolution_state(
+        &self,
+        column: &ColumnRef<'_>,
+        scope_id: ScopeId,
+        scope_name: &str,
+        source_name: &str,
+        reference_node_name: &str,
+        trim_selects: bool,
+        ancestor_cte_scopes: &[ScopeId],
+    ) -> bool {
+        if !self.conservative {
+            return true;
+        }
+        self.resolved_states
+            .borrow_mut()
+            .insert(LineageResolutionState {
+                column: match column {
+                    ColumnRef::Name(name) => LineageResolutionColumn::Name((*name).to_string()),
+                    ColumnRef::Index(index) => LineageResolutionColumn::Index(*index),
+                },
+                scope_id,
+                scope_name: scope_name.to_string(),
+                source_name: source_name.to_string(),
+                reference_node_name: reference_node_name.to_string(),
+                trim_selects,
+                ancestor_cte_scopes: ancestor_cte_scopes.to_vec(),
+            })
     }
 }
 
@@ -1190,6 +1367,21 @@ fn to_node_inner(
     ancestor_cte_scopes: &[ScopeId],
     depth: usize,
 ) -> Result<LineageNode> {
+    if !context.observe_resolution_state(
+        &column,
+        scope_id,
+        scope_name,
+        source_name,
+        reference_node_name,
+        trim_selects,
+        ancestor_cte_scopes,
+    ) {
+        return Ok(LineageNode::new(
+            "",
+            Expression::Null(crate::expressions::Null),
+            Expression::Null(crate::expressions::Null),
+        ));
+    }
     if depth > MAX_LINEAGE_DEPTH {
         return Err(Error::internal(format!(
             "lineage recursion depth exceeded (>{MAX_LINEAGE_DEPTH}) — possible circular CTE reference for scope '{scope_name}'"
@@ -1247,7 +1439,7 @@ fn to_node_inner(
     }
 
     // 2. Find the select expression for this column
-    let select_expr = find_select_expr(effective_expr, lookup_column, dialect)?;
+    let select_expr = context.select_expression(effective_expr, lookup_column, dialect)?;
     let column_name = resolve_column_name(&column, &select_expr);
 
     // 3. Trim source if requested
@@ -1279,7 +1471,7 @@ fn to_node_inner(
                         .as_deref()
                         .is_some_and(|alias| alias.eq_ignore_ascii_case(star_table))
                     || matches!(
-                        &source_info.expression,
+                        source_info.expression.as_ref(),
                         Expression::Table(table_ref)
                             if table_name_from_table_ref(table_ref).eq_ignore_ascii_case(star_table)
                     );
@@ -1298,7 +1490,7 @@ fn to_node_inner(
                     trailing_comments: vec![],
                     span: None,
                 }),
-                source_info.expression.clone(),
+                source_info.expression.as_ref().clone(),
             );
             apply_source_info_context(&mut child, name, source_info);
             node.downstream.push(child);
@@ -1350,6 +1542,7 @@ fn to_node_inner(
         } else {
             if let Some(alias_expr) =
                 find_prior_select_alias_expr(effective_expr, &select_expr, col_name, dialect)
+                    .filter(|_| !input_column_precedes_alias(context, scope_id, col_name, dialect))
             {
                 for alias_ref in
                     find_column_refs_in_expr_with_select(&alias_expr, effective_expr, dialect)
@@ -1658,7 +1851,7 @@ fn resolve_qualified_column(
         .get(table)
         .or_else(|| scope.sources.get(effective_table))
     {
-        match &source_info.expression {
+        match source_info.expression.as_ref() {
             Expression::Pivot(pivot) => {
                 if attach_pivot_dependencies(
                     node,
@@ -1695,10 +1888,15 @@ fn resolve_qualified_column(
 
     // Check if table is a CTE reference — check both the current scope's cte_sources
     // and ancestor CTE scopes (for sibling CTEs in parent WITH clauses).
-    let is_cte = scope.cte_sources.contains_key(effective_table)
+    let physical_source = scope
+        .sources
+        .get(table)
+        .or_else(|| scope.sources.get(effective_table))
+        .is_some_and(|source| source.kind == SourceKind::Table && !source.is_scope);
+    let is_cte = !physical_source && (scope.cte_sources.contains_key(effective_table)
         || all_cte_scopes.iter().any(
             |scope_id| matches!(&context.scope(*scope_id).expression, Expression::Cte(cte) if cte.alias.name == effective_table),
-        );
+        ));
     if is_cte {
         if let Some(child_scope_id) =
             find_child_scope_in(context, all_cte_scopes, scope_id, effective_table)
@@ -2337,7 +2535,7 @@ fn resolve_cte_alias(scope: &Scope, name: &str) -> Option<String> {
     // Check if the source's expression is a CTE — if so, extract the CTE name
     if let Some(source_info) = scope.sources.get(name) {
         if source_info.is_scope {
-            if let Expression::Cte(cte) = &source_info.expression {
+            if let Expression::Cte(cte) = source_info.expression.as_ref() {
                 let cte_name = &cte.alias.name;
                 if scope.cte_sources.contains_key(cte_name) {
                     return Some(cte_name.clone());
@@ -2442,7 +2640,7 @@ fn unique_virtual_source_for_column(
 fn virtual_source_output_columns(
     source_info: &ScopeSourceInfo,
 ) -> Box<dyn Iterator<Item = String> + '_> {
-    match &source_info.expression {
+    match source_info.expression.as_ref() {
         Expression::Unnest(unnest) => Box::new(unnest_output_columns(unnest)),
         Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
             Box::new(alias_output_columns(alias))
@@ -2480,7 +2678,7 @@ fn virtual_source_column_type(source_info: &ScopeSourceInfo, column: &str) -> Op
             .and_then(|index| types.get(index).cloned())
     };
 
-    match &source_info.expression {
+    match source_info.expression.as_ref() {
         Expression::Unnest(unnest) => find_type(
             unnest_output_columns(unnest).collect(),
             unnest_output_types(unnest),
@@ -3116,6 +3314,29 @@ fn find_prior_select_alias_expr(
     None
 }
 
+/// A physical/derived input wins over a same-named SELECT alias. Without
+/// schema evidence retain the resolver's existing conservative fallback.
+fn input_column_precedes_alias(
+    context: &LineageScopeContext<'_>,
+    scope_id: ScopeId,
+    column: &str,
+    dialect: Option<DialectType>,
+) -> bool {
+    let Some(schema) = context.schema else {
+        return false;
+    };
+    let scope = context.scope(scope_id);
+    let mut resolver = crate::resolver::Resolver::new(scope, schema, true);
+    let expected = normalize_column_name(column, dialect);
+    scope.sources.keys().any(|source| {
+        resolver.get_source_columns(source).is_ok_and(|columns| {
+            columns
+                .iter()
+                .any(|name| normalize_column_name(name, dialect) == expected)
+        })
+    })
+}
+
 /// Resolve the display name for a column reference.
 fn resolve_column_name(column: &ColumnRef<'_>, select_expr: &Expression) -> String {
     match column {
@@ -3409,7 +3630,7 @@ fn apply_source_info_context(
         source_info
             .lineage_name
             .clone()
-            .unwrap_or_else(|| match &source_info.expression {
+            .unwrap_or_else(|| match source_info.expression.as_ref() {
                 Expression::Table(table_ref) => table_name_from_table_ref(table_ref),
                 _ => source_key.to_string(),
             });
@@ -3437,7 +3658,7 @@ fn make_table_column_node_from_source(
             span: None,
             inferred_type,
         })),
-        source_info.expression.clone(),
+        source_info.expression.as_ref().clone(),
     );
 
     apply_source_info_context(&mut node, source_key, source_info);
@@ -4465,6 +4686,34 @@ mod tests {
             names.iter().any(|name| name == expected),
             "expected {expected} in lineage, got {names:?}"
         );
+    }
+
+    #[test]
+    fn scoped_lineage_indexes_shared_scope_graph_once() {
+        let expression = parse(
+            "WITH base AS (SELECT order_id FROM orders), first_pass AS (SELECT order_id FROM base UNION ALL SELECT order_id FROM base), second_pass AS (SELECT order_id FROM first_pass UNION ALL SELECT order_id FROM first_pass) SELECT order_id FROM second_pass",
+        );
+        let scope = build_scope(&expression);
+        let (context, _) = LineageScopeContext::from_scope(&scope);
+        let mut unique_scopes: HashSet<*const Scope> = HashSet::new();
+        collect_unique_scope_pointers(&scope, &mut unique_scopes);
+
+        assert_eq!(context.scopes.len(), unique_scopes.len());
+    }
+
+    fn collect_unique_scope_pointers(scope: &Scope, pointers: &mut HashSet<*const Scope>) {
+        if !pointers.insert(scope as *const Scope) {
+            return;
+        }
+        for child in scope
+            .subquery_scopes
+            .iter()
+            .chain(&scope.derived_table_scopes)
+            .chain(&scope.cte_scopes)
+            .chain(&scope.union_scopes)
+        {
+            collect_unique_scope_pointers(child, pointers);
+        }
     }
 
     const ISSUE_368_SQL: &str = "with

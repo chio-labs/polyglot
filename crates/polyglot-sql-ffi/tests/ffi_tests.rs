@@ -1585,6 +1585,30 @@ fn test_source_tables_postgres_prepare_body() {
 }
 
 #[test]
+fn test_analyze_query_set_operation_output_types_454() {
+    for operator in ["UNION ALL", "UNION ALL BY NAME", "INTERSECT", "EXCEPT"] {
+        let sql = c(&format!("SELECT CAST(amount AS INTEGER) AS amount FROM orders {operator} SELECT CAST(amount AS FLOAT) AS amount FROM orders"));
+        let options = c(
+            r#"{"dialect":"snowflake","schema":{"tables":[{"name":"orders","columns":[{"name":"amount","type":"VARCHAR"}]}]}}"#,
+        );
+        let (status, data, error) =
+            consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+        assert_eq!(status, 0, "{error:?}");
+        let analysis: Value = serde_json::from_str(&data.unwrap()).unwrap();
+        assert_eq!(analysis["projections"][0]["typeHint"], "FLOAT");
+        assert!(analysis["projections"][0]["castType"].is_null());
+        assert_eq!(
+            analysis["setOperations"][0]["branches"][0]["projections"][0]["castType"],
+            "INT"
+        );
+        assert_eq!(
+            analysis["setOperations"][0]["branches"][1]["projections"][0]["castType"],
+            "FLOAT"
+        );
+    }
+}
+
+#[test]
 fn test_analyze_query_cte_cast_type() {
     let sql = c("WITH transformed AS (SELECT CAST(amount AS INTEGER) AS amount FROM raw_orders), final AS (SELECT amount FROM transformed) SELECT amount FROM final");
     for options in [

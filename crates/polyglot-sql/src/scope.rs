@@ -32,7 +32,7 @@ pub enum ScopeType {
 }
 
 /// Semantic kind of a source registered in a scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// Root query or statement context
@@ -83,7 +83,11 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
             _ => None,
         })
         .collect();
-    let mut selected = Scope::new(query.clone());
+    let selected_expression = match query {
+        Expression::Select(select) => Expression::Select(Box::new(select_without_with(select))),
+        _ => query.clone(),
+    };
+    let mut selected = Scope::new(selected_expression);
     selected.cte_sources = scope.cte_sources.clone();
     selected.sources = scope
         .sources
@@ -98,11 +102,57 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
     selected
 }
 
+/// CTE definitions have their own scopes and remain available through the source
+/// catalogue. A local resolution view needs the SELECT body, not another copy
+/// of every definition. Keep this exhaustive so new clauses cannot be omitted.
+fn select_without_with(select: &crate::expressions::Select) -> crate::expressions::Select {
+    crate::expressions::Select {
+        expressions: select.expressions.clone(),
+        from: select.from.clone(),
+        joins: select.joins.clone(),
+        lateral_views: select.lateral_views.clone(),
+        prewhere: select.prewhere.clone(),
+        where_clause: select.where_clause.clone(),
+        group_by: select.group_by.clone(),
+        having: select.having.clone(),
+        qualify: select.qualify.clone(),
+        order_by: select.order_by.clone(),
+        distribute_by: select.distribute_by.clone(),
+        cluster_by: select.cluster_by.clone(),
+        sort_by: select.sort_by.clone(),
+        limit: select.limit.clone(),
+        offset: select.offset.clone(),
+        limit_by: select.limit_by.clone(),
+        fetch: select.fetch.clone(),
+        distinct: select.distinct,
+        distinct_on: select.distinct_on.clone(),
+        top: select.top.clone(),
+        with: None,
+        sample: select.sample.clone(),
+        settings: select.settings.clone(),
+        format: select.format.clone(),
+        windows: select.windows.clone(),
+        hint: select.hint.clone(),
+        connect: select.connect.clone(),
+        into: select.into.clone(),
+        locks: select.locks.clone(),
+        for_xml: select.for_xml.clone(),
+        for_json: select.for_json.clone(),
+        leading_comments: select.leading_comments.clone(),
+        post_select_comments: select.post_select_comments.clone(),
+        kind: select.kind.clone(),
+        operation_modifiers: select.operation_modifiers.clone(),
+        qualify_after_window: select.qualify_after_window,
+        option: select.option.clone(),
+        exclude: select.exclude.clone(),
+    }
+}
+
 /// Information about a source (table or subquery) in a scope
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     /// The source expression (Table or subquery)
-    pub expression: Expression,
+    pub expression: std::sync::Arc<Expression>,
     /// Whether this source is a scope (vs. a plain table)
     pub is_scope: bool,
     /// Semantic source kind for lineage consumers.
@@ -114,9 +164,13 @@ pub struct SourceInfo {
 }
 
 impl SourceInfo {
-    pub fn new(expression: Expression, is_scope: bool, kind: SourceKind) -> Self {
+    pub fn new(
+        expression: impl Into<std::sync::Arc<Expression>>,
+        is_scope: bool,
+        kind: SourceKind,
+    ) -> Self {
         Self {
-            expression,
+            expression: expression.into(),
             is_scope,
             kind,
             alias: None,
@@ -163,7 +217,7 @@ pub struct Scope {
     pub lateral_sources: HashMap<String, SourceInfo>,
 
     /// CTE sources available to this scope
-    pub cte_sources: HashMap<String, SourceInfo>,
+    pub cte_sources: std::sync::Arc<HashMap<String, SourceInfo>>,
 
     /// If this is a derived table or CTE with alias columns, this is that list
     /// e.g., `SELECT * FROM (SELECT ...) AS y(col1, col2)` => ["col1", "col2"]
@@ -206,7 +260,7 @@ impl Scope {
             scope_type: ScopeType::Root,
             sources: HashMap::new(),
             lateral_sources: HashMap::new(),
-            cte_sources: HashMap::new(),
+            cte_sources: std::sync::Arc::new(HashMap::new()),
             outer_columns: Vec::new(),
             can_be_correlated: false,
             subquery_scopes: Vec::new(),
@@ -313,7 +367,7 @@ impl Scope {
     /// Add a CTE source to this scope
     pub fn add_cte_source(&mut self, name: String, expression: Expression) {
         let info = SourceInfo::new(expression, true, SourceKind::Cte);
-        self.cte_sources.insert(name.clone(), info.clone());
+        std::sync::Arc::make_mut(&mut self.cte_sources).insert(name.clone(), info.clone());
         self.sources.insert(name, info);
         self.clear_cache();
     }
@@ -657,7 +711,7 @@ pub(crate) fn build_scope_with_ctes(
     ctes: &HashMap<String, SourceInfo>,
 ) -> Scope {
     let mut root = Scope::new(expression.clone());
-    root.cte_sources = ctes.clone();
+    root.cte_sources = std::sync::Arc::new(ctes.clone());
     build_scope_impl(expression, &mut root);
     root
 }

@@ -29,6 +29,8 @@ pub mod pushdown_projections;
 pub mod qualify_columns;
 /// Table reference qualification with catalog and schema
 pub mod qualify_tables;
+/// Internal relation-output typing, separate from scalar expression coercion.
+pub(crate) mod set_operation_types;
 /// Boolean and algebraic expression simplification
 pub mod simplify;
 /// Subquery merging and unnesting

@@ -2447,6 +2447,18 @@ impl Generator {
         Ok(std::mem::take(&mut self.output))
     }
 
+    /// Render an analysis type without implicit ClickHouse Nullable wrapping.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn generate_type_hint(&mut self, data_type: &DataType) -> Result<String> {
+        // Analysis already models nullability separately. Native ClickHouse
+        // types must acquire Nullable only from an explicit type wrapper.
+        let saved_depth = self.clickhouse_nullable_depth;
+        self.clickhouse_nullable_depth = -1;
+        let result = self.generate(&Expression::DataType(data_type.clone()));
+        self.clickhouse_nullable_depth = saved_depth;
+        result
+    }
+
     /// Returns the unsupported diagnostics collected during the most recent generate call.
     pub fn unsupported_messages(&self) -> &[String] {
         &self.unsupported_messages
@@ -26850,9 +26862,10 @@ impl Generator {
                         // ClickHouse: Map(key_type, value_type) with parenthesized syntax
                         // Key types must NOT be wrapped in Nullable
                         self.write("Map(");
+                        let saved_depth = self.clickhouse_nullable_depth;
                         self.clickhouse_nullable_depth = -1; // suppress Nullable for key
                         self.generate_data_type(key_type)?;
-                        self.clickhouse_nullable_depth = 0;
+                        self.clickhouse_nullable_depth = saved_depth;
                         self.write(", ");
                         self.generate_data_type(value_type)?;
                         self.write(")");
