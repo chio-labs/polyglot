@@ -3,6 +3,13 @@ name: Python fork release
 on:
   push:
     tags: ['python-v*']
+  # Build and smoke-test every wheel without publishing.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/python-fork-release.yml'
+      - 'crates/polyglot-sql-python/Cargo.toml'
+      - 'crates/polyglot-sql-python/pyproject.toml'
 
 permissions:
   contents: read
@@ -30,19 +37,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: '2014'
-          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          args: --profile python_release --out dist --features abi3 --manifest-path crates/polyglot-sql-python/Cargo.toml
           sccache: true
 
       - name: Smoke test wheel
         if: matrix.target == 'x86_64'
         run: |
-          version="${GITHUB_REF_NAME#python-v}"
-          python -m pip install --no-index --find-links dist "polyglot-sql-chio==${version}"
+          ls dist/*-abi3-*.whl
+          python -m pip install --no-index --find-links dist polyglot-sql-chio
           python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
 
       - name: Upload wheel
@@ -65,17 +76,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          args: --profile python_release --out dist --features abi3 --manifest-path crates/polyglot-sql-python/Cargo.toml
           sccache: true
 
       - name: Smoke test wheel
         run: |
-          version="${GITHUB_REF_NAME#python-v}"
-          python -m pip install --no-index --find-links dist "polyglot-sql-chio==${version}"
+          ls dist/*-abi3-*.whl
+          python -m pip install --no-index --find-links dist polyglot-sql-chio
           python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
 
       - name: Upload wheel
@@ -90,20 +105,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         env:
           SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
         with:
           target: x86_64-pc-windows-msvc
-          args: --profile python_release --out dist --find-interpreter --manifest-path crates/polyglot-sql-python/Cargo.toml
+          args: --profile python_release --out dist --features abi3 --manifest-path crates/polyglot-sql-python/Cargo.toml
           sccache: true
 
       - name: Smoke test wheel
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.Substring('python-v'.Length)
-          python -m pip install --no-index --find-links dist "polyglot-sql-chio==$version"
+          python -m pip install --no-index --find-links dist polyglot-sql-chio
           python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
 
       - name: Upload wheel
@@ -131,6 +149,7 @@ jobs:
           path: dist
 
   publish:
+    if: github.event_name == 'push'
     needs: [wheels-linux, wheels-macos, wheels-windows, sdist]
     runs-on: ubuntu-latest
     permissions:
