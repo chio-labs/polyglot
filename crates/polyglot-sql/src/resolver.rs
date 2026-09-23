@@ -387,29 +387,7 @@ impl<'a> Resolver<'a> {
 
     fn get_unpivot_output_columns(&self, unpivot: &crate::expressions::Unpivot) -> Vec<String> {
         let pre_columns = self.get_source_output_columns(&unpivot.this);
-        if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
-            return Vec::new();
-        }
-
-        let input_columns: HashSet<String> = unpivot
-            .columns
-            .iter()
-            .flat_map(expression_column_names)
-            .map(|column| normalize_column_name(&column, self.dialect))
-            .collect();
-        let mut columns: Vec<String> = pre_columns
-            .into_iter()
-            .filter(|column| !input_columns.contains(&normalize_column_name(column, self.dialect)))
-            .collect();
-        columns.push(unpivot.name_column.name.clone());
-        columns.push(unpivot.value_column.name.clone());
-        columns.extend(
-            unpivot
-                .extra_value_columns
-                .iter()
-                .map(|column| column.name.clone()),
-        );
-        apply_alias_columns(columns, &unpivot.alias_columns)
+        unpivot_output_columns(unpivot, pre_columns, self.dialect)
     }
 
     fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
@@ -655,6 +633,38 @@ fn values_output_columns(values: &crate::expressions::Values) -> Vec<String> {
 
 fn normalize_column_name(name: &str, dialect: Option<DialectType>) -> String {
     normalize_name(name, dialect, false, true)
+}
+
+/// UNPIVOT output: unconsumed input columns, then name and value columns.
+/// Returns no columns when the input columns are unknown.
+pub(crate) fn unpivot_output_columns(
+    unpivot: &crate::expressions::Unpivot,
+    pre_columns: Vec<String>,
+    dialect: Option<DialectType>,
+) -> Vec<String> {
+    if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
+        return Vec::new();
+    }
+
+    let input_columns: HashSet<String> = unpivot
+        .columns
+        .iter()
+        .flat_map(expression_column_names)
+        .map(|column| normalize_column_name(&column, dialect))
+        .collect();
+    let mut columns: Vec<String> = pre_columns
+        .into_iter()
+        .filter(|column| !input_columns.contains(&normalize_column_name(column, dialect)))
+        .collect();
+    columns.push(unpivot.name_column.name.clone());
+    columns.push(unpivot.value_column.name.clone());
+    columns.extend(
+        unpivot
+            .extra_value_columns
+            .iter()
+            .map(|column| column.name.clone()),
+    );
+    apply_alias_columns(columns, &unpivot.alias_columns)
 }
 
 fn apply_alias_columns(mut columns: Vec<String>, alias_columns: &[Identifier]) -> Vec<String> {

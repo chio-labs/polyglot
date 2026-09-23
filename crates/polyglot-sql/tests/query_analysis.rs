@@ -3499,3 +3499,119 @@ fn analyze_query_resolves_snowflake_dynamic_pivot_over_cte_without_recursion() {
 
     assert!(!analysis.projections.is_empty());
 }
+
+struct ReshapedStarCase {
+    name: &'static str,
+    sql: &'static str,
+    with_schema: bool,
+    expected_columns: &'static [&'static str],
+    expected_upstream: Option<&'static [&'static [(&'static str, &'static str)]]>,
+}
+
+const PIVOTED_UPSTREAM: &[&[(&str, &str)]] = &[
+    &[("staged_orders", "customer_id")],
+    &[("staged_orders", "amount")],
+    &[("staged_orders", "amount")],
+];
+
+#[test]
+fn star_over_pivot_and_unpivot_reports_reshaped_columns_in_every_mode() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [
+            {"name": "staged_orders", "columns": [
+                {"name": "customer_id", "type": "INT"},
+                {"name": "category", "type": "VARCHAR"},
+                {"name": "amount", "type": "INT"}
+            ]},
+            {"name": "wide_orders", "columns": [
+                {"name": "customer_id", "type": "INT"},
+                {"name": "books", "type": "INT"},
+                {"name": "games", "type": "INT"}
+            ]}
+        ]
+    }))
+    .unwrap();
+    let ctes = "WITH pivot_input AS (SELECT customer_id, category, amount FROM staged_orders), \
+                wide_input AS (SELECT customer_id, books, games FROM wide_orders) ";
+    let cases = [
+        ReshapedStarCase {
+            name: "pivot over cte",
+            sql: "SELECT * FROM pivot_input PIVOT (MAX(amount) FOR category IN ('books', 'games'))",
+            with_schema: true,
+            expected_columns: &["customer_id", "books", "games"],
+            expected_upstream: Some(PIVOTED_UPSTREAM),
+        },
+        ReshapedStarCase {
+            name: "pivot over cte without schema",
+            sql: "SELECT * FROM pivot_input PIVOT (MAX(amount) FOR category IN ('books', 'games'))",
+            with_schema: false,
+            expected_columns: &["customer_id", "books", "games"],
+            expected_upstream: Some(PIVOTED_UPSTREAM),
+        },
+        ReshapedStarCase {
+            name: "pivot over table",
+            sql:
+                "SELECT * FROM staged_orders PIVOT (MAX(amount) FOR category IN ('books', 'games'))",
+            with_schema: true,
+            expected_columns: &["customer_id", "books", "games"],
+            expected_upstream: Some(PIVOTED_UPSTREAM),
+        },
+        ReshapedStarCase {
+            name: "qualified star over aliased pivot",
+            sql: "SELECT pv.* FROM pivot_input \
+                  PIVOT (MAX(amount) FOR category IN ('books', 'games')) AS pv",
+            with_schema: true,
+            expected_columns: &["customer_id", "books", "games"],
+            expected_upstream: Some(PIVOTED_UPSTREAM),
+        },
+        ReshapedStarCase {
+            name: "unpivot over cte",
+            sql: "SELECT * FROM wide_input UNPIVOT (amount FOR category IN (books, games))",
+            with_schema: true,
+            expected_columns: &["customer_id", "category", "amount"],
+            expected_upstream: None,
+        },
+    ];
+    for case in cases {
+        let sql = format!("{ctes}{}", case.sql);
+        let options = AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: case.with_schema.then(|| schema.clone()),
+            ..Default::default()
+        };
+        for (mode, analysis) in [
+            ("default", analyze_query(&sql, options.clone()).unwrap()),
+            (
+                "project",
+                analyze_query_for_project_projections(&sql, options.clone()).unwrap(),
+            ),
+        ] {
+            let columns: Vec<_> = analysis
+                .projections
+                .iter()
+                .map(|projection| projection.name.as_deref().unwrap_or_default())
+                .collect();
+            assert_eq!(columns, case.expected_columns, "{} ({mode})", case.name);
+            let Some(expected_upstream) = case.expected_upstream else {
+                continue;
+            };
+            let upstream: Vec<Vec<_>> = analysis
+                .projections
+                .iter()
+                .map(|projection| {
+                    projection
+                        .upstream
+                        .iter()
+                        .map(|column| {
+                            (
+                                column.table.as_deref().unwrap_or_default(),
+                                column.column.as_str(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(upstream, expected_upstream, "{} ({mode})", case.name);
+        }
+    }
+}
