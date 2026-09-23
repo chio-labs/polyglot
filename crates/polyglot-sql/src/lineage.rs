@@ -714,13 +714,7 @@ fn expand_star_from_sources(
         let qual_normalized = normalize_cte_name(qual);
         for src in sources {
             if src.normalized == qual_normalized || src.alias.to_lowercase() == qual_normalized {
-                // Try CTE first
-                if let Some(cols) = resolved_ctes.get(&src.normalized) {
-                    expanded.extend(cols.iter().map(|c| (src.alias.clone(), c.clone())));
-                    return Some(expanded);
-                }
-                // Fall back to schema
-                if let Some(cols) = lookup_schema_columns(schema, &src.fq_name) {
+                if let Some(cols) = source_output_columns(src, resolved_ctes, schema) {
                     expanded.extend(cols.into_iter().map(|c| (src.alias.clone(), c)));
                     return Some(expanded);
                 }
@@ -735,21 +729,66 @@ fn expand_star_from_sources(
         // This matches sqlglot's behavior (raises SqlglotError when schema is missing).
         let mut any_expanded = false;
         for src in sources {
-            if let Some(cols) = resolved_ctes.get(&src.normalized) {
-                expanded.extend(cols.iter().map(|c| (src.alias.clone(), c.clone())));
-                any_expanded = true;
-            } else if let Some(cols) = lookup_schema_columns(schema, &src.fq_name) {
-                expanded.extend(cols.into_iter().map(|c| (src.alias.clone(), c)));
-                any_expanded = true;
-            } else {
-                return None;
-            }
+            let cols = source_output_columns(src, resolved_ctes, schema)?;
+            expanded.extend(cols.into_iter().map(|c| (src.alias.clone(), c)));
+            any_expanded = true;
         }
         if any_expanded {
             Some(expanded)
         } else {
             None
         }
+    }
+}
+
+/// Output columns of a FROM/JOIN source, preferring resolved CTEs over the schema.
+fn source_output_columns(
+    src: &SourceInfo,
+    resolved_ctes: &HashMap<String, Vec<String>>,
+    schema: Option<&dyn Schema>,
+) -> Option<Vec<String>> {
+    match &src.relation {
+        SourceRelation::Plain => resolved_ctes
+            .get(&src.normalized)
+            .cloned()
+            .or_else(|| lookup_schema_columns(schema, &src.fq_name)),
+        SourceRelation::Pivot(pivot) if !pivot.unpivot => {
+            let input = pivot_input_columns(&pivot.this, resolved_ctes, schema)?;
+            let output = pivot_output_columns(pivot, &input, None);
+            (!output.is_empty()).then(|| output.into_iter().map(|(post, _)| post).collect())
+        }
+        SourceRelation::Unpivot(unpivot) => {
+            let input = pivot_input_columns(&unpivot.this, resolved_ctes, schema)?;
+            let output = crate::resolver::unpivot_output_columns(unpivot, input, None);
+            (!output.is_empty()).then_some(output)
+        }
+        SourceRelation::Pivot(_) => None,
+    }
+}
+
+fn pivot_input_columns(
+    input: &Expression,
+    resolved_ctes: &HashMap<String, Vec<String>>,
+    schema: Option<&dyn Schema>,
+) -> Option<Vec<String>> {
+    match input {
+        Expression::Table(table) => {
+            let cte_columns = (table.schema.is_none() && table.catalog.is_none())
+                .then(|| resolved_ctes.get(&normalize_cte_name(&table.name)).cloned())
+                .flatten();
+            cte_columns.or_else(|| {
+                let fq_name = [&table.catalog, &table.schema]
+                    .into_iter()
+                    .flatten()
+                    .map(|part| part.name.as_str())
+                    .chain(std::iter::once(table.name.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                lookup_schema_columns(schema, &fq_name)
+            })
+        }
+        Expression::Paren(paren) => pivot_input_columns(&paren.this, resolved_ctes, schema),
+        _ => None,
     }
 }
 
@@ -802,6 +841,16 @@ struct SourceInfo {
     normalized: String,
     /// Fully-qualified table name for schema lookup (e.g., "db.schema.table").
     fq_name: String,
+    /// Relation shape that determines how this source's output columns are derived.
+    relation: SourceRelation,
+}
+
+/// PIVOT and UNPIVOT change their input's columns, so their output cannot be
+/// read from the CTE or table that happens to share the source name.
+enum SourceRelation {
+    Plain,
+    Pivot(Box<crate::expressions::Pivot>),
+    Unpivot(Box<crate::expressions::Unpivot>),
 }
 
 /// Extract source info (alias, normalized CTE name, fully-qualified name) from a
@@ -816,6 +865,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                 quoted: alias.quoted,
                 normalized: normalize_cte_name(alias),
                 fq_name: alias.name.clone(),
+                relation: SourceRelation::Plain,
             }
         }
 
@@ -825,6 +875,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                 quoted: false,
                 normalized: alias.to_lowercase(),
                 fq_name: alias.to_string(),
+                relation: SourceRelation::Plain,
             }
         }
 
@@ -850,6 +901,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                     quoted: t.name.quoted,
                     normalized,
                     fq_name,
+                    relation: SourceRelation::Plain,
                 })
             }
             Expression::Subquery(s) => {
@@ -862,6 +914,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                     quoted: alias_identifier.quoted,
                     normalized,
                     fq_name,
+                    relation: SourceRelation::Plain,
                 })
             }
             Expression::Unnest(u) => u.alias.as_ref().map(virtual_source_info),
@@ -887,6 +940,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                     quoted: false,
                     normalized: alias.to_lowercase(),
                     fq_name: alias,
+                    relation: SourceRelation::Pivot(pivot.clone()),
                 })
             }
             Expression::Unpivot(unpivot) => {
@@ -899,6 +953,7 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                     quoted: false,
                     normalized: alias.to_lowercase(),
                     fq_name: alias,
+                    relation: SourceRelation::Unpivot(unpivot.clone()),
                 })
             }
             Expression::Paren(p) => extract_source(&p.this),
