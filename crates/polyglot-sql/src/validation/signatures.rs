@@ -124,13 +124,25 @@ pub(super) fn check(
         let valid = match expected {
             ArgumentType::Any => true,
             ArgumentType::Numeric => family.is_numeric(),
-            ArgumentType::Integer => family == TypeFamily::Integer,
-            ArgumentType::String => family == TypeFamily::String,
+            ArgumentType::Integer => {
+                family == TypeFamily::Integer
+                    || (family.is_numeric()
+                        && matches!(
+                            dialect,
+                            DialectType::DuckDB | DialectType::Snowflake | DialectType::PostgreSQL
+                        ))
+            }
+            ArgumentType::String => {
+                family == TypeFamily::String
+                    || (family == TypeFamily::Binary
+                        && matches!(name.as_str(), "substring" | "substr")
+                        && matches!(dialect, DialectType::BigQuery | DialectType::PostgreSQL))
+            }
             ArgumentType::Sequence => matches!(
                 family,
                 TypeFamily::String | TypeFamily::Binary | TypeFamily::Array
             ),
-            ArgumentType::Temporal => family.is_temporal(),
+            ArgumentType::Temporal => coercion::temporal_argument(dialect, arg, family),
             ArgumentType::Boolean => predicate_compatible(family, dialect),
         };
         // Snowflake's string signatures permit scalar implicit conversion.
@@ -141,14 +153,50 @@ pub(super) fn check(
                         expected,
                         ArgumentType::Numeric | ArgumentType::Integer | ArgumentType::Temporal
                     )));
+        let literal = match expected {
+            ArgumentType::Integer | ArgumentType::Numeric => {
+                coercion::literal_coerces(dialect, arg, TypeFamily::Numeric)
+            }
+            ArgumentType::Boolean => coercion::literal_coerces(dialect, arg, TypeFamily::Boolean),
+            _ => false,
+        };
+        let interval_aggregate = family == TypeFamily::Interval
+            && matches!(name.as_str(), "sum" | "avg")
+            && dialect != DialectType::DuckDB;
+        let runtime_argument = dialect == DialectType::DuckDB
+            && family == TypeFamily::String
+            && *expected == ArgumentType::Integer
+            && matches!(name.as_str(), "lag" | "lead" | "ntile");
+        let target = match expected {
+            ArgumentType::Numeric | ArgumentType::Integer => Some(TypeFamily::Numeric),
+            ArgumentType::Temporal => Some(TypeFamily::Timestamp),
+            ArgumentType::Boolean => Some(TypeFamily::Boolean),
+            _ => None,
+        };
+        if family == TypeFamily::String
+            && (valid || implicit || literal)
+            && target.is_some_and(|target| {
+                !coercion::string_literal(arg) || expressions::invalid_literal_for(arg, target)
+            })
+        {
+            errors.push(type_issue(
+                false,
+                validation_codes::E_INVALID_FUNCTION_ARGUMENT_TYPE,
+                validation_codes::W_FUNCTION_ARGUMENT_COERCION,
+                format!(
+                    "Function '{name}' argument {} uses a runtime conversion",
+                    index + 1
+                ),
+            ));
+        }
         check_function_argument(
             errors,
-            strict,
+            strict && !runtime_argument,
             &name,
             index,
             family,
             &format!("{expected:?}"),
-            valid || implicit,
+            valid || implicit || literal || interval_aggregate,
         );
     }
     if name == "avg" && dialect == DialectType::DuckDB {
@@ -183,7 +231,16 @@ pub(super) fn check(
         name.as_str(),
         "coalesce" | "ifnull" | "nvl" | "greatest" | "least" | "nullif"
     ) {
-        unify(&args, dialect, schema, context, strict, errors);
+        unify(
+            &args,
+            dialect,
+            schema,
+            context,
+            strict
+                && !(name == "nullif"
+                    && matches!(dialect, DialectType::DuckDB | DialectType::Snowflake)),
+            errors,
+        );
     }
     if matches!(node, Expression::Coalesce(_)) && args.is_empty() {
         errors.push(type_issue(

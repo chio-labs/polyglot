@@ -38,6 +38,7 @@ pub fn type_signature(dialect: &str, name: &str) -> Option<TypeSignature> {
         "sum" => (&[Numeric], ReturnType::Argument(0)),
         // DuckDB also implements temporal AVG overloads. Preserve their return type.
         "avg" if dialect == "duckdb" => (&[Any], ReturnType::Average),
+        "avg" if dialect == "postgres" => (&[Numeric], ReturnType::Average),
         "avg" | "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop" | "var_samp" => {
             (&[Numeric], ReturnType::Numeric)
         }
@@ -66,7 +67,9 @@ pub fn type_signature(dialect: &str, name: &str) -> Option<TypeSignature> {
         "date_trunc" if dialect == "snowflake" => (&[String, Temporal], ReturnType::Argument(1)),
         "date_trunc" => (&[String, Temporal], ReturnType::Timestamp),
         "extract" | "date_part" => (&[String, Temporal], ReturnType::Integer),
-        "date_diff" if dialect == "bigquery" => (&[Temporal, Temporal, Any], ReturnType::Integer),
+        "date_diff" | "datediff" if dialect == "bigquery" => {
+            (&[Temporal, Temporal, Any], ReturnType::Integer)
+        }
         "date_diff" | "datediff" => (&[String, Temporal, Temporal], ReturnType::Integer),
         "dateadd" => (&[String, Integer, Temporal], ReturnType::Argument(2)),
         "strftime" => (&[Temporal, String], ReturnType::String),

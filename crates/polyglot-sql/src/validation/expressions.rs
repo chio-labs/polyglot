@@ -144,9 +144,11 @@ fn check_using(
     for column in &select.joins[0].using {
         let left = relation_column(sources[0], &column.name, schema, dialect);
         let right = relation_column(sources[1], &column.name, schema, dialect);
-        if !coercion::comparable(dialect, sources[0], sources[1], left, right) {
+        if !coercion::comparable(dialect, sources[0], sources[1], left, right)
+            || coercion::runtime_comparison(dialect, left, right)
+        {
             errors.push(type_issue(
-                strict,
+                strict && !coercion::runtime_comparison(dialect, left, right),
                 validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
                 validation_codes::W_IMPLICIT_CAST_COMPARISON,
                 format!("JOIN USING column '{}' has incompatible types", column.name),
@@ -165,21 +167,67 @@ pub(super) fn check(
     errors: &mut Vec<ValidationError>,
 ) {
     let scalar_children: Vec<_> = match node {
-        Expression::Select(select) => select.expressions.iter().collect(),
-        Expression::Exists(_)
-        | Expression::In(_)
-        | Expression::Subquery(_)
-        | Expression::Union(_)
-        | Expression::Intersect(_)
-        | Expression::Except(_)
-        | Expression::Cte(_)
-        | Expression::From(_)
-        | Expression::Lateral(_)
-        | Expression::JoinedTable(_)
-        | Expression::Alias(_)
-        | Expression::Paren(_)
-        | Expression::Join(_) => Vec::new(),
-        _ => node.children(),
+        Expression::Select(select) => select
+            .expressions
+            .iter()
+            .chain(select.where_clause.iter().map(|clause| &clause.this))
+            .chain(select.having.iter().map(|clause| &clause.this))
+            .chain(select.qualify.iter().map(|clause| &clause.this))
+            .chain(select.joins.iter().filter_map(|join| join.on.as_ref()))
+            .collect(),
+        Expression::Eq(op)
+        | Expression::Neq(op)
+        | Expression::Lt(op)
+        | Expression::Lte(op)
+        | Expression::Gt(op)
+        | Expression::Gte(op)
+            if dialect != DialectType::DuckDB
+                && (matches!(&op.left, Expression::Tuple(_))
+                    || matches!(&op.right, Expression::Tuple(_))) =>
+        {
+            Vec::new()
+        }
+        Expression::Eq(_)
+        | Expression::Neq(_)
+        | Expression::Lt(_)
+        | Expression::Lte(_)
+        | Expression::Gt(_)
+        | Expression::Gte(_)
+        | Expression::Add(_)
+        | Expression::Sub(_)
+        | Expression::Mul(_)
+        | Expression::Div(_)
+        | Expression::Mod(_)
+        | Expression::And(_)
+        | Expression::Or(_)
+        | Expression::Not(_)
+        | Expression::Neg(_)
+        | Expression::Like(_)
+        | Expression::ILike(_)
+        | Expression::Cast(_)
+        | Expression::TryCast(_)
+        | Expression::SafeCast(_)
+        | Expression::IfFunc(_) => node.children(),
+        Expression::Function(function)
+            if polyglot_sql_function_catalogs::types::type_signature(
+                signatures::dialect_key(dialect),
+                &function_dispatch_name(&function.name),
+            )
+            .is_some() =>
+        {
+            node.children()
+        }
+        // Only established scalar argument contexts are checked. Relational
+        // children (PIVOT, INSERT query sources, CREATE AS, etc.) are not scalar.
+        _ if polyglot_sql_function_catalogs::types::type_signature(
+            signatures::dialect_key(dialect),
+            node.variant_name(),
+        )
+        .is_some() =>
+        {
+            node.children()
+        }
+        _ => Vec::new(),
     };
     for child in scalar_children {
         if let Some(query) = scalar_query(child) {
@@ -197,7 +245,7 @@ pub(super) fn check(
     let mut predicate = |expr: &Expression| {
         if !predicate_expression_compatible(expr, family(expr), dialect) {
             errors.push(type_issue(
-                strict,
+                strict && dialect != DialectType::DuckDB,
                 validation_codes::E_INVALID_PREDICATE_TYPE,
                 validation_codes::W_PREDICATE_NULLABILITY,
                 format!(
@@ -233,7 +281,7 @@ pub(super) fn check(
                                     || !coercion::setop(dialect, target, source);
                                 if invalid {
                                     errors.push(type_issue(
-                                        strict,
+                                        false,
                                         validation_codes::E_SETOP_TYPE_MISMATCH,
                                         validation_codes::W_SETOP_IMPLICIT_COERCION,
                                         "Recursive branch cannot convert to the anchor column type"
@@ -276,7 +324,7 @@ pub(super) fn check(
         Expression::Cast(expr) | Expression::TryCast(expr) | Expression::SafeCast(expr) if matches!(&expr.to, DataType::Custom { name } if canonical_type_family(name) == TypeFamily::Unknown && !known_types.iter().any(|known| known.eq_ignore_ascii_case(name))) => {
             if coercion::covered(dialect) {
                 errors.push(type_issue(
-                    strict,
+                    false,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
                     format!("Unknown cast target type {:?}", expr.to),
@@ -290,7 +338,7 @@ pub(super) fn check(
             {
                 if invalid_temporal_literal(value) {
                     errors.push(type_issue(
-                        strict,
+                        false,
                         validation_codes::E_INVALID_CAST,
                         validation_codes::W_LOSSY_CAST,
                         "Invalid temporal literal".to_owned(),
@@ -303,7 +351,7 @@ pub(super) fn check(
                 if let crate::expressions::Literal::String(value) = literal.as_ref() {
                     if !value.chars().any(|c| c.is_ascii_digit()) {
                         errors.push(type_issue(
-                            strict,
+                            false,
                             validation_codes::E_INVALID_CAST,
                             validation_codes::W_LOSSY_CAST,
                             "Invalid interval literal".to_owned(),
@@ -321,7 +369,7 @@ pub(super) fn check(
                 1,
                 ty,
                 "a temporal argument",
-                ty.is_temporal(),
+                coercion::temporal_argument(dialect, &expr.this, ty),
             );
         }
         Expression::Extract(expr) => {
@@ -333,7 +381,7 @@ pub(super) fn check(
                 1,
                 ty,
                 "a temporal argument",
-                ty.is_temporal(),
+                coercion::temporal_argument(dialect, &expr.this, ty),
             );
         }
         Expression::DateDiff(expr) => {
@@ -346,7 +394,7 @@ pub(super) fn check(
                     index,
                     ty,
                     "a temporal argument",
-                    ty.is_temporal(),
+                    coercion::temporal_argument(dialect, arg, ty),
                 );
             }
         }
@@ -407,7 +455,7 @@ pub(super) fn check(
                 || (source == TypeFamily::Boolean && target == TypeFamily::Timestamp)
             {
                 errors.push(type_issue(
-                    strict,
+                    false,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
                     format!(
@@ -426,7 +474,7 @@ pub(super) fn check(
                     .any(|value| invalid_literal_for(value, family(&expr.this)))
             {
                 errors.push(type_issue(
-                    strict,
+                    false,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
                     "IN list contains an invalid coercible literal".to_owned(),
@@ -448,16 +496,25 @@ pub(super) fn check(
                                 types.len()
                             ),
                         ));
-                    } else if expected == 1
-                        && !coercion::setop_literal(dialect, query, 0, family(&expr.this))
-                        && !are_comparable(family(&expr.this), types[0])
-                    {
-                        errors.push(type_issue(
-                            strict,
-                            validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
-                            validation_codes::W_IMPLICIT_CAST_COMPARISON,
-                            "IN subquery has incompatible output type".to_owned(),
-                        ));
+                    } else if expected == 1 {
+                        let right = coercion::projection_literal(query, 0).unwrap_or(query);
+                        let runtime = dialect == DialectType::Snowflake
+                            && coercion::runtime_comparison(dialect, family(&expr.this), types[0]);
+                        if !coercion::comparable(
+                            dialect,
+                            &expr.this,
+                            right,
+                            family(&expr.this),
+                            types[0],
+                        ) || runtime
+                        {
+                            errors.push(type_issue(
+                                strict && !runtime,
+                                validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
+                                validation_codes::W_IMPLICIT_CAST_COMPARISON,
+                                "IN subquery has incompatible output type".to_owned(),
+                            ));
+                        }
                     }
                 }
             }
@@ -473,7 +530,7 @@ pub(super) fn check(
                     || invalid_literal_for(&expr.right, family(&expr.left)))
             {
                 errors.push(type_issue(
-                    strict,
+                    false,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
                     "Comparison contains an invalid coercible literal".to_owned(),
@@ -489,6 +546,20 @@ pub(super) fn check(
                     ));
                 }
             }
+            for (row, query) in [(&expr.left, &expr.right), (&expr.right, &expr.left)] {
+                if let (Expression::Tuple(row), Some(query)) = (row, scalar_query(query)) {
+                    if projection_families(query, schema, dialect)
+                        .is_some_and(|types| types.len() != row.expressions.len())
+                    {
+                        errors.push(type_issue(
+                            strict,
+                            validation_codes::E_SETOP_ARITY_MISMATCH,
+                            validation_codes::W_SETOP_IMPLICIT_COERCION,
+                            "Row comparison has different column counts".to_owned(),
+                        ));
+                    }
+                }
+            }
         }
         Expression::Between(expr)
             if dialect == DialectType::DuckDB
@@ -496,7 +567,7 @@ pub(super) fn check(
                     || invalid_literal_for(&expr.high, family(&expr.this))) =>
         {
             errors.push(type_issue(
-                strict,
+                false,
                 validation_codes::E_INVALID_CAST,
                 validation_codes::W_LOSSY_CAST,
                 "BETWEEN contains an invalid coercible literal".to_owned(),

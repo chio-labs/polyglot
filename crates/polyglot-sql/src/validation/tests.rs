@@ -2,6 +2,197 @@ use super::*;
 use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFunctionCatalog};
 use std::sync::Arc;
 
+#[test]
+fn review_bind_time_coercion_controls() {
+    use DialectType::{BigQuery, DuckDB, Generic, PostgreSQL, Snowflake};
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[{"name":"x","type":"NUMBER(38,0)"},{"name":"i","type":"INTEGER"},{"name":"s","type":"VARCHAR"},{"name":"ts","type":"TIMESTAMP"}]}]})).unwrap();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            ..Default::default()
+        };
+        for (dialect, sql) in [
+            (BigQuery, "SELECT DATE_DIFF(DATE '2024-01-02', DATE '2024-01-01', DAY)"),
+            (BigQuery, "SELECT CAST(1 AS BIGNUMERIC)"),
+            (Snowflake, "SELECT SUBSTR('abc', x, 1), ROUND(1.234, x) FROM orders"),
+            (Snowflake, "SELECT DATEDIFF(day, '2024-01-01', '2024-01-02')"),
+            (DuckDB, "SELECT TRUE IN (SELECT 1)"),
+            (Snowflake, "SELECT '1' IN (SELECT 1)"),
+            (PostgreSQL, "SELECT (1, 2) = (SELECT 1, 2)"),
+            (DuckDB, "SELECT * FROM (SELECT 1 a, 2 b) PIVOT (sum(b) FOR a IN (1))"),
+            (DuckDB, "SELECT COLUMNS(*) FROM (SELECT 1 a, 2 b) ORDER BY 2"),
+            (PostgreSQL, "SELECT SUM(INTERVAL '1 day'), AVG(INTERVAL '1 day')"),
+            (DuckDB, "SELECT AVG(INTERVAL '1 day')"),
+            (DuckDB, "SELECT AVG(INTERVAL '1 day') + INTERVAL '1 day'"),
+            (PostgreSQL, "SELECT SUM(INTERVAL '1 day') + INTERVAL '1 day', AVG(INTERVAL '1 day') + INTERVAL '1 day'"),
+            (DuckDB, "SELECT 1 LIMIT -(-1)"),
+            (DuckDB, "SELECT 1 LIMIT -0"),
+            (Generic, "SELECT TIMESTAMP '2024-01-01 00:00:00' + 1"),
+            (DuckDB, "SELECT CAST('1' AS VARCHAR) = 1"),
+            (DuckDB, "SELECT INTERVAL '1 day' * 2, INTERVAL '1 day' / 2"),
+            (PostgreSQL, "SELECT INTERVAL '1 day' * 2"),
+            (BigQuery, "SELECT SUBSTR(b'abc', 1, 2)"),
+            (PostgreSQL, "SELECT substring('abc'::bytea, 1, 2)"),
+            (DuckDB, "SELECT round(1.25, '1')"),
+            (DuckDB, "INSERT INTO orders(i,s) (SELECT i,s FROM orders)"),
+            (DuckDB, "SELECT i * '1', i / '2', i % '2', i - '2' FROM orders"),
+            (PostgreSQL, "SELECT i + '1', i * '2' FROM orders"),
+        ] {
+            let result = validate_with_schema(sql, dialect, &schema, &options);
+            assert!(result.valid, "{dialect:?}, types={check_types}, {sql}: {:?}", result.errors);
+        }
+    }
+    assert_eq!(canonical_type_family("BIGNUMERIC"), TypeFamily::Numeric);
+    assert_eq!(canonical_type_family("NUMBER(38,0)"), TypeFamily::Integer);
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    for (dialect, sql, code) in [
+        (DuckDB, "SELECT ts > 5 FROM orders", "E217"),
+        (DuckDB, "SELECT 1 LIMIT -1", "E234"),
+        (PostgreSQL, "SELECT (1, 2) = (SELECT 1, 2, 3)", "E216"),
+        (DuckDB, "SELECT SUM(INTERVAL '1 day')", "E213"),
+        (
+            DuckDB,
+            "INSERT INTO orders(i) SELECT i,s FROM orders",
+            "E214",
+        ),
+    ] {
+        let result = validate_with_schema(sql, dialect, &schema, &options);
+        assert!(
+            !result.valid && result.errors.iter().any(|e| e.code == code),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+}
+
+#[test]
+fn review_runtime_conversions_only_warn() {
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    for sql in [
+        "SELECT CAST('1' AS VARCHAR) = 1",
+        "SELECT i = s FROM orders",
+        "SELECT i IN ('a','b') FROM orders",
+        "SELECT NULLIF(i,s) FROM orders",
+        "SELECT LAG(i,s) OVER () FROM orders",
+        "SELECT NTILE(s) OVER () FROM orders",
+        "SELECT ts = 'invalid' FROM orders",
+        "SELECT CAST(ts AS INTEGER) FROM orders",
+        "SELECT i FROM orders WHERE s",
+        "SELECT DATE 'invalid'",
+        "SELECT i FROM orders UNION ALL SELECT ts FROM orders",
+        "SELECT i FROM orders WHERE ts",
+        "SELECT NOT ts FROM orders",
+        "SELECT ts = i FROM orders",
+        "INSERT INTO orders(i) SELECT s FROM orders",
+        "UPDATE orders SET i = s",
+        "SELECT round(1.25, 'invalid')",
+        "SELECT i * 'invalid' FROM orders",
+    ] {
+        let result =
+            validate_with_schema(sql, DialectType::DuckDB, &semantic_type_schema(), &options);
+        assert!(
+            result.valid && result.errors.iter().any(|e| e.code.starts_with("W21")),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+    let result = validate_with_schema(
+        "SELECT i = s FROM orders",
+        DialectType::Snowflake,
+        &semantic_type_schema(),
+        &options,
+    );
+    assert!(result.valid && result.errors.iter().any(|e| e.code == "W210"));
+}
+
+#[test]
+fn review_builtin_and_unknown_cast_targets_do_not_error() {
+    for (dialect, types) in [
+        (
+            DialectType::Snowflake,
+            &[
+                "VARIANT",
+                "OBJECT",
+                "ARRAY",
+                "GEOGRAPHY",
+                "NUMBER(38,0)",
+                "TIMESTAMP_NTZ",
+                "TIMESTAMP_LTZ",
+                "TIMESTAMP_TZ",
+            ][..],
+        ),
+        (
+            DialectType::BigQuery,
+            &[
+                "INT64",
+                "FLOAT64",
+                "NUMERIC",
+                "BIGNUMERIC",
+                "STRING",
+                "BYTES",
+                "JSON",
+                "GEOGRAPHY",
+                "STRUCT<id INT64>",
+                "ARRAY<INT64>",
+            ][..],
+        ),
+        (
+            DialectType::PostgreSQL,
+            &[
+                "TEXT",
+                "BYTEA",
+                "JSONB",
+                "UUID",
+                "TIMESTAMPTZ",
+                "INTERVAL",
+                "NUMERIC",
+            ][..],
+        ),
+        (
+            DialectType::DuckDB,
+            &[
+                "HUGEINT",
+                "UHUGEINT",
+                "UTINYINT",
+                "USMALLINT",
+                "UINTEGER",
+                "UBIGINT",
+                "VARINT",
+                "UUID",
+                "JSON",
+                "INTEGER[]",
+                "STRUCT(id INTEGER)",
+                "MAP(INTEGER, VARCHAR)",
+                "UNION(id INTEGER, label VARCHAR)",
+                "BLOB",
+                "NOT_A_TYPE",
+            ][..],
+        ),
+    ] {
+        for ty in types {
+            let result = validate_with_schema(
+                &format!("SELECT CAST(NULL AS {ty})"),
+                dialect,
+                &semantic_type_schema(),
+                &SchemaValidationOptions {
+                    check_types: true,
+                    ..Default::default()
+                },
+            );
+            assert!(result.valid, "{dialect:?}: {ty}: {:?}", result.errors);
+        }
+    }
+}
+
 fn semantic_type_schema() -> ValidationSchema {
     serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[
         {"name":"i","type":"INTEGER"}, {"name":"s","type":"VARCHAR"},
@@ -53,9 +244,9 @@ fn semantic_type_literal_coercion_and_controls() {
         ("SELECT SUM(s) FROM orders", "E213"),
         ("SELECT SUM(s) OVER () FROM orders", "E213"),
         ("SELECT COALESCE(i, ts) FROM orders", "E213"),
-        ("SELECT CASE WHEN s THEN i ELSE 0 END FROM orders", "E211"),
+        ("SELECT CASE WHEN s THEN i ELSE 0 END FROM orders", "W215"),
         ("SELECT -s FROM orders", "E212"),
-        ("SELECT CAST(ts AS BOOLEAN) FROM orders", "E218"),
+        ("SELECT CAST(ts AS BOOLEAN) FROM orders", "W213"),
         ("SELECT i IN (SELECT i, s FROM orders) FROM orders", "E216"),
         ("SELECT not_a_function(i) FROM orders", "E202"),
         ("SELECT COALESCE() FROM orders", "E203"),
@@ -186,27 +377,27 @@ fn semantic_type_structure_and_negative_controls() {
         ("SELECT i FROM orders LIMIT i", "E234"),
         ("SELECT (SELECT i, s FROM orders) FROM orders", "E216"),
         ("SELECT (SELECT i, s FROM orders) AS total FROM orders", "E216"),
-        ("SELECT DATE '2026-02-30'", "E218"),
-        ("SELECT TIMESTAMP 'invalid'", "E218"),
-        ("SELECT TIMESTAMP '2026-01-01 99:99:99'", "E218"),
-        ("SELECT INTERVAL 'invalid'", "E218"),
+        ("SELECT DATE '2026-02-30'", "W213"),
+        ("SELECT TIMESTAMP 'invalid'", "W213"),
+        ("SELECT TIMESTAMP '2026-01-01 99:99:99'", "W213"),
+        ("SELECT INTERVAL 'invalid'", "W213"),
         ("SELECT SUBSTRING(s) FROM orders", "E203"),
         ("SELECT DATE_TRUNC('day') FROM orders", "E203"),
         ("SELECT SUM(i, i) FROM orders", "E203"),
         ("SELECT DATE_TRUNC('day', s) FROM orders", "E213"),
-        ("SELECT LAG(i, s) OVER () FROM orders", "E213"),
-        ("SELECT NTILE(s) OVER () FROM orders", "E213"),
+        ("SELECT LAG(i, s) OVER () FROM orders", "W216"),
+        ("SELECT NTILE(s) OVER () FROM orders", "W216"),
         ("SELECT i FROM orders ORDER BY 9", "E201"),
         ("SELECT i FROM orders UNION ALL SELECT i FROM orders ORDER BY s", "E201"),
         ("SELECT COLUMNS('missing') FROM orders", "E201"),
         ("SELECT a.i FROM orders a JOIN orders b USING (missing)", "E201"),
-        ("SELECT CAST(i AS unknown_type) FROM orders", "E218"),
-        ("SELECT * FROM (SELECT i FROM orders) a JOIN (SELECT s AS i FROM orders) b USING (i)", "E217"),
+        ("SELECT CAST(i AS unknown_type) FROM orders", "W213"),
+        ("SELECT * FROM (SELECT i FROM orders) a JOIN (SELECT s AS i FROM orders) b USING (i)", "W210"),
         ("SELECT STRING_AGG(i, 5) FROM orders", "E213"),
-        ("SELECT i IN ('invalid') FROM orders", "E218"),
-        ("SELECT ts = 'invalid' FROM orders", "E218"),
-        ("SELECT i BETWEEN 'invalid' AND 'other' FROM orders", "E218"),
-        ("WITH RECURSIVE q(n) AS (SELECT 1 UNION ALL SELECT 'invalid' FROM q WHERE n < 3) SELECT n FROM q", "E215"),
+        ("SELECT i IN ('invalid') FROM orders", "W213"),
+        ("SELECT ts = 'invalid' FROM orders", "W213"),
+        ("SELECT i BETWEEN 'invalid' AND 'other' FROM orders", "W213"),
+        ("WITH RECURSIVE q(n) AS (SELECT 1 UNION ALL SELECT 'invalid' FROM q WHERE n < 3) SELECT n FROM q", "W214"),
         ("SELECT SUM(i) OVER (ORDER BY s RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM orders", "E232"),
     ] {
         let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);

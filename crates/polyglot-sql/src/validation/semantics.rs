@@ -477,7 +477,8 @@ fn check_structure(
         .chain(select.offset.iter().map(|offset| &offset.this))
     {
         let invalid = match value {
-            Expression::Neg(_) | Expression::Column(_) => true,
+            Expression::Neg(_) => negative_constant(value, false).unwrap_or(false),
+            Expression::Column(_) => true,
             Expression::Literal(literal) => match literal.as_ref() {
                 crate::expressions::Literal::Number(number) => {
                     number.parse::<f64>().is_ok_and(|n| n < 0.0)
@@ -496,6 +497,29 @@ fn check_structure(
                 "LIMIT/OFFSET must be a non-negative constant numeric expression",
             ));
         }
+    }
+}
+
+fn negative_constant(expr: &Expression, negative: bool) -> Option<bool> {
+    match expr {
+        Expression::Neg(expr) => negative_constant(&expr.this, !negative),
+        Expression::Paren(expr) => negative_constant(&expr.this, negative),
+        Expression::Literal(literal) => match literal.as_ref() {
+            crate::expressions::Literal::Number(value) => {
+                let value = value.trim();
+                let sign = value.starts_with('-') ^ negative;
+                let mantissa = value
+                    .trim_start_matches(['-', '+'])
+                    .split(['e', 'E'])
+                    .next()?;
+                if !mantissa.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    return None;
+                }
+                Some(sign && mantissa.chars().any(|c| matches!(c, '1'..='9')))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -551,7 +575,7 @@ pub(crate) fn check_semantics(
         if !select
             .expressions
             .iter()
-            .any(|expr| matches!(expr, Expression::Star(_) | Expression::BracedWildcard(_)))
+            .any(|expr| expr.dfs().any(|node| matches!(node, Expression::Star(_) | Expression::BracedWildcard(_)) || matches!(node, Expression::Function(f) if f.name.eq_ignore_ascii_case("columns"))))
         {
             for ordered in select.order_by.iter().flat_map(|order| &order.expressions) {
                 if let Expression::Literal(literal) = &ordered.this {

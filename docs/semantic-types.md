@@ -1,5 +1,18 @@
 # Schema-aware semantic types
 
+## Diagnostic contract
+
+An **error** is emitted only when the selected concrete dialect definitely
+rejects the SQL at binding/compilation. An accepted implicit conversion that can
+fail on data at execution time is a **warning**, using the existing W21x codes.
+This includes DuckDB VARCHAR/numeric equality, conversion of invalid string
+literals, predicates converted from VARCHAR, and casts unsupported at execution.
+Unknown or incompletely modelled built-in types must not cause errors. The type
+catalogue is not an authoritative list of installed types: unrecognized cast
+targets receive W213 at most, including application or extension types. Register
+`known_types` to suppress that uncertainty notice. No complete authoritative
+DuckDB type-existence catalogue is claimed.
+
 `check_types` enables expression compatibility checks. `semantic` enables
 scope, grouping, window, and shape checks. DuckDB's embedded function catalogue
 is now included by the `semantic` Cargo feature, rather than requiring a second
@@ -37,8 +50,11 @@ minus a timestamp is not the inverse of a timestamp plus an interval. Unsupporte
 dialects do not get coercion errors from these tables; remaining legacy type
 checks are warnings. Generic SQL retains its historical strict abstract rules.
 The table is conservative and partial, not a claim to model every engine overload.
-A DuckDB column-to-column numeric/VARCHAR comparison is diagnosed even when the
-engine can attempt a data-dependent conversion at execution time. Snowflake's
+DuckDB and Snowflake column/expression VARCHAR-to-numeric equality is accepted
+with implicit-conversion warnings, never blocking errors. DuckDB's ordering and
+IN-subquery binders are stricter: a VARCHAR column ordered against INTEGER, or an
+INTEGER tested against a VARCHAR subquery column, is rejected at binding. These
+are distinct from comparisons involving coercible string literals. Snowflake's
 documented scalar coercions (including numeric/string predicates) are accepted.
 
 DuckDB combination casting accepts boolean/numeric CASE and COALESCE inputs and
@@ -46,6 +62,8 @@ VARCHAR set-operation outputs, but does not allow arbitrary VARCHAR columns in
 COALESCE with numeric inputs. Recursive branches must convert to the anchor's
 type, unlike ordinary UNION output unification. Fractional and numeric-string
 LIMIT values are accepted by DuckDB and are not rejected as non-integers.
+DuckDB scalar set-operation casts also defer unsupported conversions until
+execution: INTEGER UNION TIMESTAMP therefore produces W214, not E215.
 
 Sources:
 
@@ -81,15 +99,18 @@ overloads such as reversed STRFTIME arguments are handled explicitly.
 Existing codes are reused: E201 for missing star-modifier/output columns,
 E202/E203 for function names/arity, E211 for conditions, E212 for arithmetic,
 E213 for argument/unification types, E215 for set-operation types, E216 for
-subquery/row column counts, E217 for comparisons, E218 for casts/literals, and
-E232 for window usage. New codes:
+subquery/row column counts, E217 for comparisons, and E232 for window usage.
+W210/W211/W212/W213/W215/W216 report runtime comparison, arithmetic, assignment,
+cast, predicate, and function-argument conversions respectively. E218 remains
+reserved for proven bind-time cast rejection. New codes:
 
 - **E233:** duplicate CTE name or duplicate relation alias in a scope.
 - **E234:** invalid LIMIT/OFFSET value or column-valued bound.
 
-Temporal literal validation proves invalid ISO calendar dates and clearly invalid
-text; alternate date formats remain unchecked. Cast rejection is conservative:
-the impossible-conversion table currently covers DuckDB timestamp/boolean and
-timestamp/integer conversions. Unknown application types require registration.
+Temporal literal validation recognizes invalid ISO calendar dates and clearly
+invalid text, but reports runtime conversion warnings; alternate formats remain
+unchecked. DuckDB timestamp/boolean and timestamp/integer casts likewise warn
+because PREPARE accepts them. PostgreSQL interval SUM/AVG and DuckDB interval AVG
+are supported; the tested DuckDB version rejects SUM(INTERVAL) at bind time.
 Remaining overload and dialect coverage should be added with accepted-form
 controls rather than importing one engine's rules into another.

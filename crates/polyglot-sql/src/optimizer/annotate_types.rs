@@ -1421,6 +1421,14 @@ impl<'a> TypeAnnotator<'a> {
         }
         let func_name = func.name.to_uppercase();
 
+        if self._dialect == Some(DialectType::PostgreSQL) && !func.quoted {
+            match func_name.as_str() {
+                "SUM" => return func.args.first().and_then(|arg| self.annotate_sum(arg)),
+                "AVG" => return func.args.first().and_then(|arg| self.annotate_avg(arg)),
+                _ => {}
+            }
+        }
+
         if self._dialect == Some(DialectType::DuckDB) && !func.quoted {
             match func_name.as_str() {
                 // Builder-created Function nodes use the same inference as the
@@ -1748,6 +1756,14 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate SUM function - promotes to at least BigInt
     fn annotate_avg(&mut self, arg: &Expression) -> Option<DataType> {
+        if matches!(
+            self._dialect,
+            Some(DialectType::PostgreSQL | DialectType::DuckDB)
+        ) {
+            if let Some(ty @ DataType::Interval { .. }) = self.annotate(arg) {
+                return Some(ty);
+            }
+        }
         if self._dialect == Some(DialectType::DuckDB) {
             match self.annotate(arg) {
                 Some(DataType::Date) => {
@@ -1768,6 +1784,11 @@ impl<'a> TypeAnnotator<'a> {
 
     fn annotate_sum(&mut self, arg: &Expression) -> Option<DataType> {
         let arg_type = self.annotate(arg);
+        if self._dialect == Some(DialectType::PostgreSQL)
+            && matches!(arg_type, Some(DataType::Interval { .. }))
+        {
+            return arg_type;
+        }
         if self._dialect == Some(DialectType::DuckDB) {
             // These are DuckDB's bound aggregate result types, not the generic
             // integer-to-BIGINT promotion. UHUGEINT binds to the DOUBLE overload.

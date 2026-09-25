@@ -445,6 +445,14 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
             "array" | "list" => return TypeFamily::Array,
             "map" => return TypeFamily::Map,
             "struct" | "row" | "record" => return TypeFamily::Struct,
+            "number" | "numeric" | "decimal" | "dec"
+                if inner
+                    .split(',')
+                    .nth(1)
+                    .is_some_and(|scale| scale.trim() == "0") =>
+            {
+                return TypeFamily::Integer
+            }
             _ => {}
         }
     }
@@ -486,17 +494,21 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
         "tinyint" | "smallint" | "int2" | "int" | "integer" | "int4" | "int8" | "bigint"
         | "serial" | "smallserial" | "bigserial" | "utinyint" | "usmallint" | "uinteger"
         | "ubigint" | "uint8" | "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64"
-        | "hugeint" | "int128" | "largeint" | "uhugeint" | "uint128" => TypeFamily::Integer,
-        "numeric" | "decimal" | "dec" | "number" | "float" | "float4" | "float8" | "real"
-        | "double" | "double precision" | "bfloat16" | "float16" | "float32" | "float64" => {
-            TypeFamily::Numeric
+        | "hugeint" | "int128" | "largeint" | "uhugeint" | "uint128" | "varint" => {
+            TypeFamily::Integer
         }
+        "numeric" | "bignumeric" | "decimal" | "dec" | "number" | "float" | "float4" | "float8"
+        | "real" | "double" | "double precision" | "bfloat16" | "float16" | "float32"
+        | "float64" => TypeFamily::Numeric,
         "char" | "character" | "varchar" | "character varying" | "nchar" | "nvarchar" | "text"
         | "string" | "clob" => TypeFamily::String,
         "binary" | "varbinary" | "blob" | "bytea" | "bytes" => TypeFamily::Binary,
         "date" => TypeFamily::Date,
         "time" => TypeFamily::Time,
         "timestamp"
+        | "timestamp_ntz"
+        | "timestamp_ltz"
+        | "timestamp_tz"
         | "timestamptz"
         | "datetime"
         | "datetime2"
@@ -1379,7 +1391,7 @@ fn check_function_argument(
     }
 
     errors.push(type_issue(
-        strict,
+        strict && coercion::fully_modelled(family),
         validation_codes::E_INVALID_FUNCTION_ARGUMENT_TYPE,
         validation_codes::W_FUNCTION_ARGUMENT_COERCION,
         format!(
@@ -2205,7 +2217,7 @@ fn check_set_operation_compatibility(
             && !coercion::setop_literal(dialect, right_expr, source_ordinals[idx].1, left)
         {
             errors.push(type_issue(
-                strict,
+                strict && dialect != DialectType::DuckDB,
                 validation_codes::E_SETOP_TYPE_MISMATCH,
                 validation_codes::W_SETOP_IMPLICIT_COERCION,
                 format!(
@@ -2294,7 +2306,7 @@ fn check_insert_assignments(
                 let source_family = infer_expression_type_family(value, schema_map, &context);
                 if !are_assignment_compatible(target_family, source_family) {
                     errors.push(type_issue(
-                        strict,
+                        strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                         validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                         validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                         format!(
@@ -2342,7 +2354,7 @@ fn check_insert_assignments(
             };
             if !are_assignment_compatible(target_family, source_family) {
                 errors.push(type_issue(
-                    strict,
+                    strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                     validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                     validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                     format!(
@@ -2359,6 +2371,7 @@ fn check_insert_assignments(
 }
 
 fn check_update_assignments(
+    dialect: DialectType,
     stmt: &Expression,
     update: &Update,
     schema_map: &HashMap<String, TableSchemaEntry>,
@@ -2399,7 +2412,7 @@ fn check_update_assignments(
         let source_family = infer_expression_type_family(value, schema_map, &context);
         if !are_assignment_compatible(target_family, source_family) {
             errors.push(type_issue(
-                strict,
+                strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                 validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                 validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                 format!(
@@ -2456,7 +2469,7 @@ fn check_types(
             let family = infer_expression_type_family(predicate, schema_map, &context);
             if !predicate_expression_compatible(predicate, family, dialect) {
                 errors.push(type_issue(
-                    strict,
+                    strict && dialect != DialectType::DuckDB,
                     validation_codes::E_INVALID_PREDICATE_TYPE,
                     validation_codes::W_PREDICATE_NULLABILITY,
                     format!(
@@ -2500,7 +2513,7 @@ fn check_types(
                 check_insert_assignments(dialect, stmt, insert, schema_map, strict, &mut errors);
             }
             Expression::Update(update) => {
-                check_update_assignments(stmt, update, schema_map, strict, &mut errors);
+                check_update_assignments(dialect, stmt, update, schema_map, strict, &mut errors);
             }
             Expression::Union(union) => {
                 check_set_operation_compatibility(
@@ -2543,7 +2556,7 @@ fn check_types(
                     let family = infer_expression_type_family(expr, schema_map, &context);
                     if !predicate_expression_compatible(expr, family, dialect) {
                         errors.push(type_issue(
-                            strict,
+                            strict && dialect != DialectType::DuckDB,
                             validation_codes::E_INVALID_PREDICATE_TYPE,
                             validation_codes::W_PREDICATE_NULLABILITY,
                             format!(
@@ -2559,7 +2572,7 @@ fn check_types(
                 let family = infer_expression_type_family(&unary.this, schema_map, &context);
                 if !predicate_expression_compatible(&unary.this, family, dialect) {
                     errors.push(type_issue(
-                        strict,
+                        strict && dialect != DialectType::DuckDB,
                         validation_codes::E_INVALID_PREDICATE_TYPE,
                         validation_codes::W_PREDICATE_NULLABILITY,
                         format!("NOT expects boolean, found {}", type_family_name(family)),
@@ -2574,9 +2587,17 @@ fn check_types(
             | Expression::Gte(op) => {
                 let left = infer_expression_type_family(&op.left, schema_map, &context);
                 let right = infer_expression_type_family(&op.right, schema_map, &context);
-                if !coercion::comparable(dialect, &op.left, &op.right, left, right) {
+                let runtime = (dialect == DialectType::Snowflake
+                    && coercion::runtime_comparison(dialect, left, right))
+                    || (matches!(node, Expression::Eq(_) | Expression::Neq(_))
+                        && coercion::runtime_equality(dialect, left, right));
+                if !coercion::comparable(dialect, &op.left, &op.right, left, right)
+                    || (runtime
+                        && !coercion::string_literal(&op.left)
+                        && !coercion::string_literal(&op.right))
+                {
                     errors.push(type_issue(
-                        strict,
+                        strict && !runtime,
                         validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
                         validation_codes::W_IMPLICIT_CAST_COMPARISON,
                         format!(
@@ -2649,7 +2670,8 @@ fn check_types(
                         item_family,
                     ) {
                         errors.push(type_issue(
-                            strict,
+                            strict
+                                && !coercion::runtime_comparison(dialect, this_family, item_family),
                             validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
                             validation_codes::W_IMPLICIT_CAST_COMPARISON,
                             format!(
@@ -2674,7 +2696,23 @@ fn check_types(
                     continue;
                 }
 
-                if !coercion::arithmetic(dialect, node, left, right) {
+                let literal_numeric = !(dialect == DialectType::DuckDB
+                    && matches!(node, Expression::Add(_)))
+                    && ((left.is_numeric() && coercion::literal_coerces(dialect, &op.right, left))
+                        || (right.is_numeric()
+                            && coercion::literal_coerces(dialect, &op.left, right)));
+                if literal_numeric
+                    && (expressions::invalid_literal_for(&op.left, right)
+                        || expressions::invalid_literal_for(&op.right, left))
+                {
+                    errors.push(type_issue(
+                        false,
+                        validation_codes::E_INVALID_ARITHMETIC_TYPE,
+                        validation_codes::W_IMPLICIT_CAST_ARITHMETIC,
+                        "Arithmetic literal conversion may fail at execution".to_owned(),
+                    ));
+                }
+                if !literal_numeric && !coercion::arithmetic(dialect, node, left, right) {
                     errors.push(type_issue(
                         strict,
                         validation_codes::E_INVALID_ARITHMETIC_TYPE,
@@ -3036,6 +3074,7 @@ fn check_types(
 
 fn predicate_compatible(family: TypeFamily, dialect: DialectType) -> bool {
     matches!(family, TypeFamily::Unknown | TypeFamily::Boolean)
+        || (dialect != DialectType::Generic && !coercion::fully_modelled(family))
         || coercion::predicate(dialect, family)
         || (matches!(dialect, DialectType::MySQL | DialectType::SQLite) && family.is_numeric())
 }
@@ -3595,8 +3634,31 @@ fn validate_scope_columns(
         .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
         .collect();
 
+    // Pivot operands refer to the pre-pivot relation, not the output relation
+    // indexed above. Do not falsely bind them against generated pivot columns.
+    // Nested input queries still receive their own lexical validation pass.
+    let mut pivot_inputs = HashSet::new();
+    for node in walk_in_scope(&expression, false) {
+        if let Expression::Pivot(pivot) = node {
+            for operand in pivot
+                .expressions
+                .iter()
+                .chain(&pivot.fields)
+                .chain(&pivot.using)
+                .chain(pivot.group.as_deref())
+            {
+                for node in walk_in_scope(operand, false) {
+                    if let Expression::Column(column) = node {
+                        pivot_inputs.insert(column.as_ref() as *const _);
+                    }
+                }
+            }
+        }
+    }
     let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
-        Expression::Column(column) => Some((column.as_ref(), OutputNameResolution::InputOnly)),
+        Expression::Column(column) if !pivot_inputs.contains(&(column.as_ref() as *const _)) => {
+            Some((column.as_ref(), OutputNameResolution::InputOnly))
+        }
         _ => None,
     });
     let order_columns = order_by

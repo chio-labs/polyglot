@@ -90,6 +90,18 @@ pub(super) fn covered(dialect: DialectType) -> bool {
     rules(dialect).is_some()
 }
 
+pub(super) fn fully_modelled(family: TypeFamily) -> bool {
+    !matches!(
+        family,
+        TypeFamily::Unknown
+            | TypeFamily::Json
+            | TypeFamily::Uuid
+            | TypeFamily::Array
+            | TypeFamily::Map
+            | TypeFamily::Struct
+    )
+}
+
 pub(super) fn predicate(dialect: DialectType, family: TypeFamily) -> bool {
     rules(dialect).is_some_and(|rule| rule.predicates.contains(&family))
 }
@@ -126,6 +138,7 @@ pub(super) fn comparable(
     rf: TypeFamily,
 ) -> bool {
     !covered(dialect)
+        || (dialect != DialectType::Generic && (!fully_modelled(lf) || !fully_modelled(rf)))
         || are_comparable(lf, rf)
         || rules(dialect).is_some_and(|rule| {
             rule.comparison_pairs.contains(&(lf, rf)) || rule.comparison_pairs.contains(&(rf, lf))
@@ -134,7 +147,42 @@ pub(super) fn comparable(
         || literal_coerces(dialect, right, lf)
 }
 
+/// Accepted binder coercions whose success depends on the runtime value.
+pub(super) fn runtime_comparison(
+    dialect: DialectType,
+    left: TypeFamily,
+    right: TypeFamily,
+) -> bool {
+    matches!(dialect, DialectType::DuckDB | DialectType::Snowflake)
+        && ((left == TypeFamily::String
+            && (right.is_numeric() || right == TypeFamily::Boolean || right.is_temporal()))
+            || (right == TypeFamily::String
+                && (left.is_numeric() || left == TypeFamily::Boolean || left.is_temporal())))
+}
+
+/// Equality uses combination casts, whereas ordering has stricter binder rules.
+pub(super) fn runtime_equality(dialect: DialectType, left: TypeFamily, right: TypeFamily) -> bool {
+    dialect == DialectType::DuckDB
+        && fully_modelled(left)
+        && fully_modelled(right)
+        && left != right
+        && !(left.is_numeric() && right.is_numeric())
+}
+
+pub(super) fn temporal_argument(
+    dialect: DialectType,
+    expr: &Expression,
+    family: TypeFamily,
+) -> bool {
+    family.is_temporal()
+        || (dialect == DialectType::Snowflake && family == TypeFamily::String)
+        || literal_coerces(dialect, expr, TypeFamily::Timestamp)
+}
+
 pub(super) fn setop(dialect: DialectType, left: TypeFamily, right: TypeFamily) -> bool {
+    if dialect != DialectType::Generic && (!fully_modelled(left) || !fully_modelled(right)) {
+        return true;
+    }
     let Some(r) = rules(dialect) else {
         return true;
     };
@@ -180,6 +228,7 @@ pub(super) fn arithmetic(
 ) -> bool {
     use TypeFamily::*;
     if !covered(dialect)
+        || (dialect != DialectType::Generic && (!fully_modelled(left) || !fully_modelled(right)))
         || left == Unknown
         || right == Unknown
         || (left.is_numeric() && right.is_numeric())
@@ -188,6 +237,20 @@ pub(super) fn arithmetic(
     }
     let add = matches!(node, Expression::Add(_));
     let sub = matches!(node, Expression::Sub(_));
+    if dialect == DialectType::Generic {
+        return (add || sub)
+            && ((left.is_temporal() && right.is_numeric())
+                || (right.is_temporal() && left.is_numeric())
+                || (sub && left.is_temporal() && right.is_temporal()));
+    }
+    if matches!(dialect, DialectType::DuckDB | DialectType::PostgreSQL)
+        && ((matches!(node, Expression::Mul(_))
+            && ((left == Interval && right.is_numeric())
+                || (right == Interval && left.is_numeric())))
+            || (matches!(node, Expression::Div(_)) && left == Interval && right.is_numeric()))
+    {
+        return true;
+    }
     // Known date/integer and temporal/interval overloads; direction matters.
     const ADD: &[(TypeFamily, TypeFamily)] = &[
         (Date, Integer),
