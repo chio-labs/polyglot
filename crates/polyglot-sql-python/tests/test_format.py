@@ -3,6 +3,23 @@ import pytest
 import polyglot_sql
 
 
+def test_given_computed_variant_keys_when_formatting_then_preserves_source_and_roundtrips():
+    for path in [
+        "payload:customers[TO_VARCHAR(order_id)]",
+        "payload:customers[order_id + 1]",
+        "payload:customers[(order_id + 1)]",
+        "payload:customers[1 + order_id]",
+        "payload:customers[TO_VARCHAR(order_id)].name",
+        "payload:customers[TO_VARCHAR(order_id)][0]",
+    ]:
+        sql = f"SELECT {path} FROM orders"
+        parsed = polyglot_sql.parse_one(sql, dialect="snowflake")
+        formatted = polyglot_sql.format_sql(sql, dialect="snowflake")
+        assert "".join(formatted.split()) == "".join(sql.split())
+        assert polyglot_sql.parse_one(formatted, dialect="snowflake") == parsed
+        assert polyglot_sql.format_sql(formatted, dialect="snowflake") == formatted
+
+
 def test_format_sql_contains_newlines():
     formatted = polyglot_sql.format_sql("SELECT a,b FROM t WHERE x=1", dialect="postgres")
     assert "\n" in formatted

@@ -4,7 +4,7 @@
 
 use crate::dialects::DialectType;
 use crate::expressions::{DataType, Expression, Literal, OracleDataType, StructField};
-use crate::set_operation::set_operation_layout;
+use crate::set_operation::set_operation_layout_from_identifiers;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -111,7 +111,18 @@ impl OutputResolver {
     ) -> Vec<QueryOutput> {
         let left = self.resolve_inner(left, depth + 1);
         let right = self.resolve_inner(right, depth + 1);
-        let layout = set_operation_layout(query, Some(self.dialect));
+        let identifiers = |outputs: &[QueryOutput]| {
+            outputs
+                .iter()
+                .map(|output| crate::binding::schema_identifier(&output.name))
+                .collect::<Vec<_>>()
+        };
+        let layout = set_operation_layout_from_identifiers(
+            query,
+            Some(self.dialect),
+            &identifiers(&left),
+            &identifiers(&right),
+        );
         let pairs = match layout {
             Ok(Some(layout)) => layout
                 .outputs

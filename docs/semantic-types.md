@@ -103,6 +103,26 @@ unknown warehouse-defined functions never receive E202 by default.
 
 ## Snowflake engine regression fixture
 
+### Scope and source-location follow-ups
+
+Derived-table and VALUES column alias lists are validated against their renamed
+outputs. UNPIVOT input columns belong to the input relation, rather than its
+generated name/value columns. Grouping validation recognizes both typed and
+generic parser representations of GROUPING SETS, CUBE, and ROLLUP, including
+parenthesized grouping expressions. See Snowflake's [FROM](https://docs.snowflake.com/en/sql-reference/constructs/from),
+[UNPIVOT](https://docs.snowflake.com/en/sql-reference/constructs/unpivot), and
+[GROUPING SETS](https://docs.snowflake.com/en/sql-reference/constructs/group-by-grouping-sets)
+documentation for the supported scope rules.
+
+COUNT calls retain an optional source span, including COUNT(*), so placement
+errors can point at the call. Spans are metadata and do not affect AST equality.
+Other semantic diagnostics use available function, identifier, and star spans.
+
+Wide name-aligned set operations use request-local output-name and type caches.
+Type annotation resolves the completed set-operation tree once, rather than
+recalculating every prefix. Alias binding only infers aliases that are referenced
+locally; ordinary output types are annotated on the final bound statement.
+
 `tests/fixtures/snowflake_semantic_truth.json` contains 211 synthetic cases:
 126 compile failures, 30 execution-only failures, and 55 valid queries. The
 verdicts were obtained with `EXPLAIN USING TEXT`, followed by execution when

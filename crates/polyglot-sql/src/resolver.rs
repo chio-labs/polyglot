@@ -239,7 +239,10 @@ impl<'a> Resolver<'a> {
             }
             Expression::Subquery(subquery) => {
                 // For subqueries, get named_selects from the inner query
-                self.get_named_selects(&subquery.this)
+                apply_alias_columns(
+                    self.get_named_selects(&subquery.this),
+                    &subquery.column_aliases,
+                )
             }
             Expression::Select(select) => {
                 // For derived tables that are SELECT expressions
@@ -300,7 +303,11 @@ impl<'a> Resolver<'a> {
             }
             Expression::Intersect(intersect) => self.get_named_selects(&intersect.left),
             Expression::Except(except) => self.get_named_selects(&except.left),
-            Expression::Subquery(subquery) => self.get_named_selects(&subquery.this),
+            Expression::Subquery(subquery) => apply_alias_columns(
+                self.get_named_selects(&subquery.this),
+                &subquery.column_aliases,
+            ),
+            Expression::Values(values) => values_output_columns(values),
             Expression::Alias(alias) => {
                 let columns = self.get_named_selects(&alias.this);
                 apply_alias_columns(columns, &alias.column_aliases)
@@ -317,10 +324,13 @@ impl<'a> Resolver<'a> {
             .iter()
             .flat_map(|expr| {
                 let Expression::Star(star) = expr else {
-                    return self
+                    // Preserve unnamed projection ordinals so a derived-table
+                    // alias list can rename them without shifting later names.
+                    // Until renamed, its engine-generated name is unknown; keep
+                    // the source open instead of rejecting a valid quoted name.
+                    return vec![self
                         .get_expression_alias(expr)
-                        .into_iter()
-                        .collect::<Vec<_>>();
+                        .unwrap_or_else(|| "*".to_owned())];
                 };
                 let mut columns = Vec::new();
                 for source in select
@@ -455,7 +465,7 @@ impl<'a> Resolver<'a> {
         unpivot_output_columns(unpivot, pre_columns, self.dialect)
     }
 
-    fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
+    pub(crate) fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
         match source {
             Expression::Table(table) => {
                 if table.schema.is_none() && table.catalog.is_none() {
@@ -467,7 +477,11 @@ impl<'a> Resolver<'a> {
                 let table_name = qualified_table_name(table);
                 self.schema.column_names(&table_name).unwrap_or_default()
             }
-            Expression::Subquery(subquery) => self.get_named_selects(&subquery.this),
+            Expression::Subquery(subquery) => apply_alias_columns(
+                self.get_named_selects(&subquery.this),
+                &subquery.column_aliases,
+            ),
+            Expression::Values(values) => values_output_columns(values),
             Expression::Select(select) => self.get_select_column_names(select),
             Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => self
                 .get_source_columns_from_set_op(source)
@@ -528,8 +542,12 @@ impl<'a> Resolver<'a> {
                     Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
                 ) {
                     self.get_source_columns_from_set_op(&subquery.this)
+                        .map(|columns| apply_alias_columns(columns, &subquery.column_aliases))
                 } else {
-                    Ok(self.get_named_selects(&subquery.this))
+                    Ok(apply_alias_columns(
+                        self.get_named_selects(&subquery.this),
+                        &subquery.column_aliases,
+                    ))
                 }
             }
             Expression::Alias(alias) => {

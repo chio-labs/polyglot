@@ -6745,9 +6745,13 @@ pub struct AggFunc {
 }
 
 /// COUNT function with optional star
-#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct CountFunc {
+    /// Source range of the call; metadata, not expression identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub span: Option<Span>,
     pub this: Option<Expression>,
     pub star: bool,
     pub distinct: bool,
@@ -6762,6 +6766,18 @@ pub struct CountFunc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ast(skip)]
     pub inferred_type: Option<DataType>,
+}
+
+impl PartialEq for CountFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.this == other.this
+            && self.star == other.star
+            && self.distinct == other.distinct
+            && self.filter == other.filter
+            && self.ignore_nulls == other.ignore_nulls
+            && self.original_name == other.original_name
+            && self.inferred_type == other.inferred_type
+    }
 }
 
 /// GROUP_CONCAT function (MySQL style)
