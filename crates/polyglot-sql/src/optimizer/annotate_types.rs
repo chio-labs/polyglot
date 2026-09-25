@@ -403,6 +403,11 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate types for an expression tree
     pub fn annotate(&mut self, expr: &Expression) -> Option<DataType> {
+        if self._dialect == Some(DialectType::Snowflake)
+            && matches!(expr, Expression::ParseJson(_) | Expression::ParseJSON(_))
+        {
+            return Some(DataType::Json);
+        }
         match expr {
             // Literals
             Expression::Literal(lit) => Self::annotate_literal(lit),
@@ -1423,6 +1428,13 @@ impl<'a> TypeAnnotator<'a> {
 
         if self._dialect == Some(DialectType::Snowflake) && !func.quoted {
             match func_name.as_str() {
+                "PARSE_JSON" | "TRY_PARSE_JSON" | "TO_VARIANT" => return Some(DataType::Json),
+                "ARRAY_CONSTRUCT" | "ARRAY_CONSTRUCT_COMPACT" => {
+                    return Some(DataType::Array {
+                        element_type: Box::new(DataType::Json),
+                        dimension: None,
+                    })
+                }
                 "TO_TIMESTAMP"
                 | "TO_TIMESTAMP_NTZ"
                 | "TO_TIMESTAMP_LTZ"

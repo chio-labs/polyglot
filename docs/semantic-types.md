@@ -41,7 +41,7 @@ to VARCHAR. NULL and unknown input types are not rejected.
 | String literal to date/time/timestamp | yes | yes | yes | yes |
 | String literal to boolean | yes | yes | yes | no |
 | String/scalar set-operation combination | yes | no | yes | no |
-| Boolean/numeric set-operation combination | yes | no | no | no |
+| Boolean/numeric set-operation combination | yes | no | BOOLEAN first only | no |
 | Numeric WHERE/HAVING/ON predicates | yes | no | no | no |
 
 Numeric-family widening and date/timestamp compatibility are shared. Arithmetic
@@ -102,6 +102,30 @@ Snowflake uses a partial built-in arity table, not an allowlist of function name
 unknown warehouse-defined functions never receive E202 by default.
 
 ## Snowflake engine regression fixture
+
+### Directional set operations
+
+Snowflake set-operation compatibility is directional. Each output column retains
+its first branch's target type while checking later branches. A leading untyped
+NULL (or a missing BY NAME column) adopts the first concrete contribution.
+Unknown type metadata remains unknown. This policy applies to UNION, UNION ALL,
+INTERSECT, EXCEPT/MINUS, and supported UNION BY NAME forms; it does not change
+scalar comparison, CASE, or other dialects' coercion policies.
+
+`tests/fixtures/snowflake_set_operation_matrix.txt` records only type labels and
+verdicts from 156 synthetic engine probes, plus 13 same-type controls. Tests cover
+all pairs through seven operator forms. A pair that fails during execution for
+any sampled VARCHAR value receives W214 for the static type pair, including when
+a particular literal succeeds. Proven compile rejections receive E215. Thus
+BOOLEAN followed by NUMBER is clean, NUMBER followed by BOOLEAN errors, and
+BOOLEAN followed by VARCHAR warns. TIMESTAMP_NTZ/TIMESTAMP_TZ direction is retained.
+
+Recursive CTEs retain their separate anchor/recursive compatibility check: the
+existing engine fixture rejects a NUMBER anchor with VARCHAR recursive output
+at compilation (001112), although ordinary UNION accepts that type pair with
+runtime conversion. The ordinary set-operation node still uses the directional
+matrix. Recursive conversions require separate engine evidence before relaxing
+that additional constraint.
 
 Additional synthetic controls are in
 [`snowflake-semantic-controls.md`](snowflake-semantic-controls.md). Hierarchy

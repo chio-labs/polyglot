@@ -2,6 +2,126 @@ use super::*;
 use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFunctionCatalog};
 use std::sync::Arc;
 
+#[test]
+fn snowflake_directional_set_operation_matrix() {
+    let fixture = include_str!("../../tests/fixtures/snowflake_set_operation_matrix.txt");
+    let mut lines = fixture.lines();
+    let types: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+    let rows: Vec<Vec<_>> = lines
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(types.len(), 13);
+    assert_eq!(rows.len(), 13);
+    let static_type = |name| match name {
+        "VARCHAR_NUM" | "VARCHAR_TXT" => "VARCHAR",
+        other => other,
+    };
+    let sql_value = |name| match name {
+        "BOOLEAN" => "TRUE",
+        "NUMBER" => "1::NUMBER(38,0)",
+        "DECIMAL" => "1.25::NUMBER(10,2)",
+        "FLOAT" => "1.5::FLOAT",
+        "VARCHAR_NUM" => "'7'::VARCHAR",
+        "VARCHAR_TXT" => "'abc'::VARCHAR",
+        "DATE" => "'2026-01-01'::DATE",
+        "TIMESTAMP_NTZ" => "'2026-01-01 10:00:00'::TIMESTAMP_NTZ",
+        "TIMESTAMP_TZ" => "'2026-01-01 10:00:00 +00:00'::TIMESTAMP_TZ",
+        "TIME" => "'10:00:00'::TIME",
+        "VARIANT" => "PARSE_JSON('1')",
+        "ARRAY" => "ARRAY_CONSTRUCT(1)",
+        "NULL" => "NULL",
+        _ => panic!("unknown fixture type"),
+    };
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        check_types: true,
+        check_references: true,
+        semantic: true,
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    for (i, first) in types.iter().enumerate() {
+        assert_eq!(rows[i].len(), 14);
+        assert_eq!(&rows[i][0], first);
+        for (j, later) in types.iter().enumerate() {
+            let verdict = rows[i][j + 1];
+            // Literal-dependent conversion failures require a warning for the
+            // static pair, even when this particular sample value succeeds.
+            let runtime_risk = rows.iter().any(|row| {
+                static_type(row[0]) == static_type(first)
+                    && types.iter().enumerate().any(|(k, ty)| {
+                        static_type(ty) == static_type(later) && row[k + 1] == "runtime"
+                    })
+            });
+            for operator in [
+                "UNION ALL",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+                "MINUS",
+                "UNION ALL BY NAME",
+                "UNION BY NAME",
+            ] {
+                let sql = format!(
+                    "SELECT {} AS x {operator} SELECT {} AS x",
+                    sql_value(first),
+                    sql_value(later)
+                );
+                let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+                let error = result.errors.iter().any(|e| e.code == "E215");
+                let warning = result.errors.iter().any(|e| e.code == "W214");
+                if error != (verdict == "error")
+                    || warning != runtime_risk
+                    || result.valid == (verdict == "error")
+                {
+                    failures.push(format!("{first}|{later} {operator}: engine={verdict}, runtime_risk={runtime_risk}, {:?}", result.errors));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn snowflake_set_operation_chains_keep_first_target() {
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        check_types: true,
+        semantic: true,
+        ..Default::default()
+    };
+    for (sql, valid) in [
+        ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT 1.5", true),
+        ("SELECT 1 x UNION ALL SELECT TRUE UNION ALL SELECT 1.5", false),
+        ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT CURRENT_DATE", false),
+        ("SELECT 'abc'::VARCHAR x UNION ALL SELECT 1 UNION ALL SELECT TRUE", true),
+        ("SELECT NULL x UNION ALL SELECT 1 UNION ALL SELECT TRUE", false),
+        ("SELECT NULL x UNION ALL SELECT TRUE UNION ALL SELECT 1", true),
+        ("SELECT TRUE x UNION ALL SELECT NULL UNION ALL SELECT 1", true),
+        ("SELECT CURRENT_DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ UNION ALL SELECT NULL::TIMESTAMP_TZ", true),
+        ("SELECT NULL::TIMESTAMP_NTZ x UNION ALL SELECT CURRENT_DATE UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
+        ("SELECT PARSE_JSON('1') x UNION ALL SELECT 1 UNION ALL SELECT 'abc'::VARCHAR", false),
+        ("SELECT TRUE x, 1 y UNION ALL BY NAME SELECT 2 y, 1 x UNION ALL BY NAME SELECT 3 x, 3 y", true),
+        ("SELECT TRUE x, 1 y UNION ALL BY NAME SELECT 2 y, 1 x UNION ALL BY NAME SELECT 3 x, TRUE y", false),
+        ("SELECT 1 x UNION ALL BY NAME SELECT TRUE y UNION ALL BY NAME SELECT 1 y", true),
+        ("SELECT 1 x UNION ALL BY NAME SELECT 1 y UNION ALL BY NAME SELECT TRUE y", false),
+        ("WITH orders AS (SELECT TRUE x UNION ALL SELECT 1) SELECT x FROM orders UNION ALL SELECT 2", true),
+        ("WITH orders AS (SELECT '2026-01-01'::DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ) SELECT x FROM orders UNION ALL SELECT NULL::TIMESTAMP_TZ", true),
+        ("WITH orders AS (SELECT PARSE_JSON('1') x) SELECT x FROM orders UNION ALL SELECT 'abc'::VARCHAR", false),
+        ("WITH orders AS (SELECT ARRAY_CONSTRUCT(1) x) SELECT x FROM orders UNION ALL SELECT TRUE", false),
+        ("SELECT order_flag() x UNION ALL SELECT 1 UNION ALL SELECT TRUE", true),
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert_eq!(result.valid, valid, "{sql}: {:?}", result.errors);
+    }
+}
+
 fn snowflake_orders_schema() -> ValidationSchema {
     serde_json::from_value(
         serde_json::json!({"tables": [{"name": "orders", "columns": [
@@ -149,7 +269,7 @@ fn snowflake_realworld_function_types_and_timestamp_aliases() {
             && !issue.message.contains("name:")
     );
     for sql in [
-        "SELECT active AS result FROM orders UNION ALL SELECT quantity FROM orders",
+        "SELECT quantity AS result FROM orders UNION ALL SELECT active FROM orders",
         "SELECT DATE_PART(day,quantity) FROM orders",
     ] {
         assert!(
@@ -171,7 +291,7 @@ fn snowflake_realworld_commented_named_union_keeps_column_identity() {
     let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id,\n-- availability\nactive,\n-- subtotal\namount FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments";
     let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
     assert!(result.valid, "{:?}", result.errors);
-    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id,\n-- availability\nactive FROM shipments UNION ALL BY NAME SELECT id, amount AS active FROM shipments";
+    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id, amount AS active FROM shipments UNION ALL BY NAME SELECT id,\n-- availability\nactive FROM shipments";
     let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
     assert!(
         result.errors.iter().any(|e| e.code == "E215"),

@@ -111,8 +111,50 @@ SELECT value
 FROM (SELECT PARSE_JSON('[1]') AS value) orders,
 LATERAL FLATTEN(input => orders.value) customer;
 SELECT CAST('2026-01-01' AS UNKNOWN_ORDER_TYPE);
-SELECT TRUE AS result UNION ALL SELECT 1::NUMBER(38,0) AS result;
+SELECT 1::NUMBER(38,0) AS result UNION ALL SELECT TRUE AS result;
 ```
 
 Unknown cast targets intentionally retain W213 because validation has no
 authoritative installed-type catalogue. The other negative controls remain errors.
+
+## Directional set-operation chain probes
+
+The pair matrix is engine-verified. These additional chains exercise assumptions
+about target retention and leading NULLs that still need engine confirmation.
+
+Predicted: compiles; W214 because VARCHAR/numeric conversion depends on values.
+The chosen values are expected to execute successfully.
+
+```sql
+SELECT '7'::VARCHAR AS x
+UNION ALL SELECT 1::NUMBER(38,0)
+UNION ALL SELECT TRUE;
+```
+
+Predicted: compile error, after leading NULL adopts NUMBER as its target.
+
+```sql
+SELECT NULL AS x
+UNION ALL SELECT 1::NUMBER(38,0)
+UNION ALL SELECT TRUE;
+```
+
+Predicted: compile error, because the first ARRAY target rejects the later NUMBER.
+
+```sql
+SELECT ARRAY_CONSTRUCT(1) AS x
+UNION ALL SELECT PARSE_JSON('1')
+UNION ALL SELECT 2::NUMBER(38,0);
+```
+
+Predicted by the existing separate recursive-CTE constraint: compile error.
+Ordinary BOOLEAN-first UNION permits this numeric conversion, so recursive
+anchor behavior needs its own evidence.
+
+```sql
+WITH RECURSIVE orders(x) AS (
+  SELECT TRUE
+  UNION ALL SELECT 1::NUMBER(38,0) FROM orders WHERE FALSE
+)
+SELECT x FROM orders;
+```

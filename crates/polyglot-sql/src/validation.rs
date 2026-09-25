@@ -2068,6 +2068,7 @@ fn projection_families(
 
 #[derive(Default)]
 struct ProjectionTypes {
+    snowflake: snowflake_setops::SetResolver,
     families: HashMap<*const Expression, Option<Vec<TypeFamily>>>,
     layouts: crate::set_operation::LayoutResolver,
 }
@@ -2182,6 +2183,10 @@ fn check_set_operation_compatibility(
     errors: &mut Vec<ValidationError>,
     projections: &mut ProjectionTypes,
 ) {
+    if dialect == DialectType::Snowflake {
+        projections.snowflake.check(query, strict, errors);
+        return;
+    }
     let Some(mut left_projection) = projections.resolve(left_expr, schema_map, dialect) else {
         return;
     };
@@ -3161,6 +3166,7 @@ mod coercion;
 mod expressions;
 mod semantics;
 pub(crate) mod signatures;
+mod snowflake_setops;
 pub(crate) use semantics::check_semantics;
 
 fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<String> {
