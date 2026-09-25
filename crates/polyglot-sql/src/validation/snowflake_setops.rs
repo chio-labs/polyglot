@@ -10,7 +10,7 @@ enum Kind {
     Number,
     String,
     Date,
-    Timestamp,
+    TimestampLtz,
     TimestampNtz,
     TimestampTz,
     Time,
@@ -39,6 +39,7 @@ impl Kind {
             {
                 "TIMESTAMPNTZ" => Self::TimestampNtz,
                 "TIMESTAMPTZ" => Self::TimestampTz,
+                "TIMESTAMPLTZ" => Self::TimestampLtz,
                 _ => Self::from_family(data_type_family(ty)),
             },
             DataType::Timestamp { timezone: true, .. } => Self::TimestampTz,
@@ -52,7 +53,7 @@ impl Kind {
             TypeFamily::Integer | TypeFamily::Numeric => Self::Number,
             TypeFamily::String => Self::String,
             TypeFamily::Date => Self::Date,
-            TypeFamily::Timestamp => Self::Timestamp,
+            TypeFamily::Timestamp => Self::TimestampNtz,
             TypeFamily::Time => Self::Time,
             TypeFamily::Json => Self::Variant,
             TypeFamily::Array => Self::Array,
@@ -85,7 +86,7 @@ impl Kind {
     fn temporal(self) -> bool {
         matches!(
             self,
-            Self::Date | Self::Timestamp | Self::TimestampNtz | Self::TimestampTz | Self::Time
+            Self::Date | Self::TimestampLtz | Self::TimestampNtz | Self::TimestampTz | Self::Time
         )
     }
 }
@@ -236,7 +237,7 @@ impl SetType {
             },
             (Number, Variant) => later,
             (String, kind) if kind.temporal() => later,
-            (Date, Timestamp | TimestampNtz | TimestampTz) => later,
+            (Date, TimestampLtz | TimestampNtz | TimestampTz) => later,
             _ => self,
         };
         if self.kind.temporal() && later.kind.temporal() {
@@ -268,7 +269,10 @@ impl SetType {
             Kind::TimestampNtz => DataType::Custom {
                 name: format!("TIMESTAMP_NTZ({})", self.temporal_precision),
             },
-            Kind::Timestamp | Kind::TimestampTz => DataType::Timestamp {
+            Kind::TimestampLtz => DataType::Custom {
+                name: format!("TIMESTAMP_LTZ({})", self.temporal_precision),
+            },
+            Kind::TimestampTz => DataType::Timestamp {
                 precision: Some(self.temporal_precision),
                 timezone: self.kind == Kind::TimestampTz,
             },
@@ -315,13 +319,15 @@ fn compatibility(first: Kind, later: Kind) -> Compatibility {
         (String, value) if value.temporal() => Runtime,
         (value, String) if value.temporal() => Runtime,
         (Boolean | Date | Time, Variant) => Runtime,
-        (Number | Timestamp | TimestampNtz | TimestampTz, Variant) => Clean,
+        (Number | TimestampLtz | TimestampNtz | TimestampTz, Variant) => Clean,
         (Variant, Boolean | Number | Array) | (Array, Variant) => Clean,
-        (Date, Timestamp | TimestampNtz | TimestampTz)
-        | (Timestamp | TimestampNtz | TimestampTz, Date)
+        (Date, TimestampLtz | TimestampNtz | TimestampTz)
+        | (TimestampLtz | TimestampNtz | TimestampTz, Date)
         | (TimestampTz, TimestampNtz)
-        | (Timestamp, TimestampNtz | TimestampTz)
-        | (TimestampNtz | TimestampTz, Timestamp) => Clean,
+        // LTZ pairs retain the existing conservative compatibility policy;
+        // the measured matrix distinguishes NTZ/TZ but does not contain LTZ.
+        | (TimestampLtz, TimestampNtz | TimestampTz)
+        | (TimestampNtz | TimestampTz, TimestampLtz) => Clean,
         // All other pairs in the measured scalar/VARIANT/ARRAY domain reject.
         _ => Rejected,
     }
@@ -476,7 +482,7 @@ fn kind_name(kind: Kind) -> &'static str {
         Kind::Number => "NUMBER",
         Kind::String => "VARCHAR",
         Kind::Date => "DATE",
-        Kind::Timestamp => "TIMESTAMP",
+        Kind::TimestampLtz => "TIMESTAMP_LTZ",
         Kind::TimestampNtz => "TIMESTAMP_NTZ",
         Kind::TimestampTz => "TIMESTAMP_TZ",
         Kind::Time => "TIME",

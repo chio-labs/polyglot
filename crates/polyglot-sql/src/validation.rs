@@ -4125,9 +4125,64 @@ fn validate_scope_tree(
         .chain(ancestors.iter().copied())
         .collect();
     for child in scope.subquery_scopes.iter().chain(&scope.udtf_scopes) {
+        // A LATERAL subquery inherits only preceding relations. Pass that
+        // lexical environment into the entire child tree, so nested correlated
+        // queries share the restriction while their own FROM sources stay local.
+        let mut lateral_outer = None;
+        if child.scope_type == crate::scope::ScopeType::Udtf {
+            if let Expression::Select(select) = scope_query(&scope.expression) {
+                let mut preceding = HashSet::new();
+                for relation in select
+                    .from
+                    .iter()
+                    .flat_map(|from| &from.expressions)
+                    .chain(select.joins.iter().map(|join| &join.this))
+                {
+                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.expression)
+                    {
+                        let mut visible = selected.clone();
+                        visible.sources.retain(|name, _| preceding.contains(name));
+                        lateral_outer = Some(visible);
+                        break;
+                    }
+                    let alias = match relation {
+                        Expression::Table(table) => {
+                            Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                        }
+                        Expression::Subquery(query) => {
+                            query.alias.as_ref().map(|alias| alias.name.as_str())
+                        }
+                        Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+                        Expression::Lateral(lateral) => lateral.alias.as_deref(),
+                        _ => None,
+                    };
+                    if let Some(name) = alias
+                        .and_then(|name| resolve_scope_source_name(&selected, name))
+                        .or_else(|| {
+                            selected
+                                .sources
+                                .iter()
+                                .find(|(_, source)| source.expression.as_ref() == relation)
+                                .map(|(name, _)| name.clone())
+                        })
+                    {
+                        preceding.insert(name);
+                    }
+                }
+            }
+        }
+        let restricted: Vec<_> = lateral_outer
+            .as_ref()
+            .into_iter()
+            .chain(ancestors.iter().copied())
+            .collect();
         validate_scope_tree(
             child,
-            &outer,
+            if lateral_outer.is_some() {
+                &restricted
+            } else {
+                &outer
+            },
             schema_map,
             resolver_schema,
             options,

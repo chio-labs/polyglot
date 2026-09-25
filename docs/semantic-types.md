@@ -146,6 +146,14 @@ output alignment. Snowflake timestamp/date constructors and calendar extractors
 have explicit return types; an unmodelled function result stays unknown instead
 of inheriting its first argument's type through CASE expressions.
 
+Timestamp conversions and constructors retain their NTZ/LTZ/TZ subtype. Plain
+TO_TIMESTAMP, TRY_TO_TIMESTAMP, TIMESTAMP_FROM_PARTS and TIMESTAMP casts use the
+default NTZ mapping. LTZ output metadata is preserved; its unmeasured set-operation
+pairs retain the existing conservative compatibility policy.
+
+LATERAL subqueries inherit only preceding sources, including in nested correlated
+queries. Their local FROM sources remain available and may shadow outer aliases.
+
 ### Scope and source-location follow-ups
 
 Derived-table and VALUES column alias lists are validated against their renamed

@@ -403,6 +403,28 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate types for an expression tree
     pub fn annotate(&mut self, expr: &Expression) -> Option<DataType> {
+        if self._dialect == Some(DialectType::Snowflake) {
+            match expr {
+                Expression::CurrentTimestamp(_) | Expression::CurrentTimestampLTZ(_) => {
+                    return Some(DataType::Custom {
+                        name: "TIMESTAMPLTZ".into(),
+                    });
+                }
+                Expression::TimestampTzFromParts(_) => {
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: true,
+                    })
+                }
+                Expression::TimestampFromParts(_) | Expression::ToTimestamp(_) => {
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: false,
+                    })
+                }
+                _ => {}
+            }
+        }
         if self._dialect == Some(DialectType::Snowflake)
             && matches!(expr, Expression::ParseJson(_) | Expression::ParseJSON(_))
         {
@@ -1428,6 +1450,11 @@ impl<'a> TypeAnnotator<'a> {
 
         if self._dialect == Some(DialectType::Snowflake) && !func.quoted {
             match func_name.as_str() {
+                "CURRENT_TIMESTAMP" | "GETDATE" | "LOCALTIMESTAMP" | "SYSTIMESTAMP" => {
+                    return Some(DataType::Custom {
+                        name: "TIMESTAMPLTZ".into(),
+                    })
+                }
                 "PARSE_JSON" | "TRY_PARSE_JSON" | "TO_VARIANT" => return Some(DataType::Json),
                 "ARRAY_CONSTRUCT" | "ARRAY_CONSTRUCT_COMPACT" => {
                     return Some(DataType::Array {
@@ -1447,10 +1474,20 @@ impl<'a> TypeAnnotator<'a> {
                 | "TIMESTAMP_NTZ_FROM_PARTS"
                 | "TIMESTAMP_LTZ_FROM_PARTS"
                 | "TIMESTAMP_TZ_FROM_PARTS" => {
+                    if func_name.contains("_NTZ") || func_name.contains("_LTZ") {
+                        return Some(DataType::Custom {
+                            name: if func_name.contains("_LTZ") {
+                                "TIMESTAMPLTZ"
+                            } else {
+                                "TIMESTAMPNTZ"
+                            }
+                            .to_string(),
+                        });
+                    }
                     return Some(DataType::Timestamp {
                         precision: None,
-                        timezone: false,
-                    })
+                        timezone: func_name.contains("_TZ"),
+                    });
                 }
                 "DATE_FROM_PARTS" | "DATEFROMPARTS" | "TO_DATE" | "TRY_TO_DATE" => {
                     return Some(DataType::Date)

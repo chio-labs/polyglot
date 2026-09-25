@@ -3,6 +3,121 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn snowflake_timestamp_subtypes_survive_conversions_and_constructors() {
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    for suffix in ["", "_NTZ", "_LTZ", "_TZ"] {
+        let expected = match suffix {
+            "_NTZ" => DataType::Custom {
+                name: "TIMESTAMPNTZ".into(),
+            },
+            "_LTZ" => DataType::Custom {
+                name: "TIMESTAMPLTZ".into(),
+            },
+            _ => DataType::Timestamp {
+                precision: None,
+                timezone: suffix == "_TZ",
+            },
+        };
+        for expression in [
+            format!("TO_TIMESTAMP{suffix}('2026-01-01')"),
+            format!("TRY_TO_TIMESTAMP{suffix}('2026-01-01')"),
+            format!("TIMESTAMP{suffix}_FROM_PARTS(2026,1,1,0,0,0)"),
+        ] {
+            for sql in [
+                format!("SELECT {expression} AS x"),
+                format!("WITH orders AS (SELECT {expression} AS x) SELECT x FROM orders"),
+            ] {
+                let mut statement = crate::parse_one(&sql, DialectType::Snowflake).unwrap();
+                annotate_types(&mut statement, None, Some(DialectType::Snowflake));
+                let Expression::Select(select) = statement else {
+                    panic!()
+                };
+                assert_eq!(
+                    select.expressions[0].inferred_type(),
+                    Some(&expected),
+                    "{sql}"
+                );
+            }
+            for target in ["TIMESTAMP_NTZ", "TIMESTAMP_TZ"] {
+                let sql = format!("SELECT {expression} AS x UNION ALL SELECT NULL::{target}");
+                let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+                let rejected = matches!(suffix, "" | "_NTZ") && target == "TIMESTAMP_TZ";
+                assert_eq!(result.valid, !rejected, "{sql}: {:?}", result.errors);
+                assert_eq!(
+                    result.errors.iter().any(|e| e.code == "E215"),
+                    rejected,
+                    "{sql}"
+                );
+            }
+        }
+    }
+    let result = validate_with_schema(
+        "SELECT NULL::TIMESTAMP UNION ALL SELECT NULL::TIMESTAMP_TZ",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    assert!(result.errors.iter().any(|e| e.code == "E215"));
+    for expression in [
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMESTAMP()",
+        "LOCALTIMESTAMP()",
+        "GETDATE()",
+        "SYSTIMESTAMP()",
+    ] {
+        let sql = format!("SELECT {expression} AS x UNION ALL SELECT NULL::TIMESTAMP_TZ");
+        let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+}
+
+#[test]
+fn lateral_subqueries_only_correlate_with_preceding_sources() {
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({"tables": [{"name": "orders", "columns": [{"name": "id", "type": "INTEGER"}, {"name": "payload", "type": "VARIANT"}]}], "strict": true})).unwrap();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            check_references: true,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT g.x FROM orders o, LATERAL (SELECT f.value AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT f.value) AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT (SELECT f.value)) AS x FROM orders p) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT value AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT g.x AS x) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT p.id AS x FROM orders p WHERE f.value = p.id) g, LATERAL FLATTEN(input => o.payload) f",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(!result.valid, "{sql}");
+            assert!(result.errors.iter().any(|e| e.code == validation_codes::E_UNRESOLVED_REFERENCE || e.code == validation_codes::E_UNKNOWN_COLUMN), "{sql}: {:?}", result.errors);
+        }
+        for sql in [
+            "SELECT g.x FROM orders o, LATERAL FLATTEN(input => o.payload) f, LATERAL (SELECT f.value AS x) g",
+            "SELECT g.x FROM orders o, LATERAL FLATTEN(input => o.payload) f, LATERAL (SELECT (SELECT f.value) AS x) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT p.id AS x FROM orders p WHERE p.id = o.id) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT f.id AS x FROM orders f) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT f.id FROM orders f) AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT h.x FROM orders p, LATERAL (SELECT p.id AS x) h) g",
+            "SELECT g.x FROM orders o JOIN LATERAL (SELECT o.id AS x) g ON TRUE",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(result.valid, "{sql}: {:?}", result.errors);
+        }
+    }
+}
+
+#[test]
 fn snowflake_directional_set_operation_matrix() {
     let fixture = include_str!("../../tests/fixtures/snowflake_set_operation_matrix.txt");
     let mut lines = fixture.lines();
