@@ -83,6 +83,7 @@ pub fn validate_with_schema(
         semantic,
         strict_syntax,
         function_catalog,
+        ..Default::default()
     };
     let result = py.detach(|| polyglot_sql::validate_with_schema(sql, dialect, &schema, &options));
     Ok(validation_result_from_core(result))
