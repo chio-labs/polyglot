@@ -315,7 +315,72 @@ impl<'a> Resolver<'a> {
         select
             .expressions
             .iter()
-            .filter_map(|expr| self.get_expression_alias(expr))
+            .flat_map(|expr| {
+                let Expression::Star(star) = expr else {
+                    return self
+                        .get_expression_alias(expr)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                };
+                let mut columns = Vec::new();
+                for source in select
+                    .from
+                    .iter()
+                    .flat_map(|from| &from.expressions)
+                    .chain(select.joins.iter().map(|join| &join.this))
+                {
+                    if let Some(qualifier) = &star.table {
+                        let name = match source {
+                            Expression::Table(table) => {
+                                Some(table.alias.as_ref().unwrap_or(&table.name))
+                            }
+                            Expression::Subquery(query) => query.alias.as_ref(),
+                            Expression::Alias(alias) => Some(&alias.alias),
+                            _ => None,
+                        };
+                        if !name.is_some_and(|name| {
+                            crate::set_operation::identifier_key(name, self.dialect)
+                                == crate::set_operation::identifier_key(qualifier, self.dialect)
+                        }) {
+                            continue;
+                        }
+                    }
+                    let input = self
+                        .get_source_columns_for_expression(source)
+                        .unwrap_or_default();
+                    if input.is_empty() {
+                        columns.push("*".to_owned());
+                    } else {
+                        columns.extend(input);
+                    }
+                }
+                if columns.is_empty() {
+                    columns.push("*".to_owned());
+                }
+                let column_key = |column: &str| {
+                    crate::set_operation::identifier_key(
+                        &crate::binding::schema_identifier(column),
+                        self.dialect,
+                    )
+                };
+                columns.retain(|column| {
+                    !star.except.iter().flatten().any(|name| {
+                        crate::set_operation::identifier_key(name, self.dialect)
+                            == column_key(column)
+                    })
+                });
+                for column in &mut columns {
+                    if let Some((_, replacement)) =
+                        star.rename.iter().flatten().find(|(name, _)| {
+                            crate::set_operation::identifier_key(name, self.dialect)
+                                == column_key(column)
+                        })
+                    {
+                        *column = replacement.name.clone();
+                    }
+                }
+                columns
+            })
             .collect()
     }
 

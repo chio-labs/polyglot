@@ -142,6 +142,12 @@ pub struct ValidationSchema {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaValidationOptions {
+    /// Application-defined scalar and table functions, exempt from catalogue checks.
+    #[serde(default, alias = "knownFunctions")]
+    pub known_functions: Vec<String>,
+    /// Application-defined cast target types, exempt from unknown-type checks.
+    #[serde(default, alias = "knownTypes")]
+    pub known_types: Vec<String>,
     /// Per-call parser limits, shared by syntax and schema validation.
     #[serde(default, alias = "complexityGuard")]
     pub complexity_guard: Option<crate::ComplexityGuardOptions>,
@@ -319,6 +325,8 @@ pub mod validation_codes {
     pub const E_INVALID_GROUPING: &str = "E230";
     pub const E_INVALID_AGGREGATE: &str = "E231";
     pub const E_INVALID_WINDOW: &str = "E232";
+    pub const E_DUPLICATE_SCOPE_NAME: &str = "E233";
+    pub const E_INVALID_LIMIT_OFFSET: &str = "E234";
 
     pub const W_SELECT_STAR: &str = "W001";
     pub const W_AGGREGATE_WITHOUT_GROUP_BY: &str = "W002";
@@ -437,6 +445,14 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
             "array" | "list" => return TypeFamily::Array,
             "map" => return TypeFamily::Map,
             "struct" | "row" | "record" => return TypeFamily::Struct,
+            "number" | "numeric" | "decimal" | "dec"
+                if inner
+                    .split(',')
+                    .nth(1)
+                    .is_some_and(|scale| scale.trim() == "0") =>
+            {
+                return TypeFamily::Integer
+            }
             _ => {}
         }
     }
@@ -478,17 +494,21 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
         "tinyint" | "smallint" | "int2" | "int" | "integer" | "int4" | "int8" | "bigint"
         | "serial" | "smallserial" | "bigserial" | "utinyint" | "usmallint" | "uinteger"
         | "ubigint" | "uint8" | "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64"
-        | "hugeint" | "int128" | "largeint" | "uhugeint" | "uint128" => TypeFamily::Integer,
-        "numeric" | "decimal" | "dec" | "number" | "float" | "float4" | "float8" | "real"
-        | "double" | "double precision" | "bfloat16" | "float16" | "float32" | "float64" => {
-            TypeFamily::Numeric
+        | "hugeint" | "int128" | "largeint" | "uhugeint" | "uint128" | "varint" => {
+            TypeFamily::Integer
         }
+        "numeric" | "bignumeric" | "decimal" | "dec" | "number" | "float" | "float4" | "float8"
+        | "real" | "double" | "double precision" | "bfloat16" | "float16" | "float32"
+        | "float64" => TypeFamily::Numeric,
         "char" | "character" | "varchar" | "character varying" | "nchar" | "nvarchar" | "text"
         | "string" | "clob" => TypeFamily::String,
         "binary" | "varbinary" | "blob" | "bytea" | "bytes" => TypeFamily::Binary,
         "date" => TypeFamily::Date,
         "time" => TypeFamily::Time,
         "timestamp"
+        | "timestamp_ntz"
+        | "timestamp_ltz"
+        | "timestamp_tz"
         | "timestamptz"
         | "datetime"
         | "datetime2"
@@ -713,6 +733,7 @@ fn table_ref_display_name(table: &TableRef) -> String {
 
 #[derive(Debug, Default, Clone)]
 struct TypeCheckContext {
+    dialect: Option<DialectType>,
     referenced_tables: HashSet<String>,
     table_aliases: HashMap<String, String>,
 }
@@ -1215,6 +1236,14 @@ fn infer_expression_type_family(
     schema_map: &HashMap<String, TableSchemaEntry>,
     context: &TypeCheckContext,
 ) -> TypeFamily {
+    if let Expression::Function(function) = expr {
+        if !crate::optimizer::annotate_types::TypeAnnotator::function_result_is_known(
+            function,
+            context.dialect.unwrap_or(DialectType::Generic),
+        ) {
+            return TypeFamily::Unknown;
+        }
+    }
     // Scoped annotation wins, including Unknown; never rebind an annotated
     // reference against unrelated sources in the statement-wide catalogue.
     if let Some(data_type) = expr.inferred_type() {
@@ -1362,7 +1391,7 @@ fn check_function_argument(
     }
 
     errors.push(type_issue(
-        strict,
+        strict && coercion::fully_modelled(family),
         validation_codes::E_INVALID_FUNCTION_ARGUMENT_TYPE,
         validation_codes::W_FUNCTION_ARGUMENT_COERCION,
         format!(
@@ -1582,28 +1611,39 @@ fn check_function_catalog(
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    check_named_function_catalog(
+        &function.name,
+        function.args.len(),
+        dialect,
+        function_catalog,
+        strict,
+        errors,
+    );
+}
+
+fn check_named_function_catalog(
+    name: &str,
+    arity: usize,
+    dialect: DialectType,
+    function_catalog: Option<&dyn FunctionCatalog>,
+    strict: bool,
+    errors: &mut Vec<ValidationError>,
+) {
     let Some(catalog) = function_catalog else {
         return;
     };
 
-    let raw_name = function_base_name(&function.name);
-    let normalized_name = function_dispatch_name(&function.name);
-    let arity = function.args.len();
+    let raw_name = function_base_name(name);
+    let normalized_name = function_dispatch_name(name);
     let Some(signatures) = catalog.lookup(dialect, raw_name, &normalized_name) else {
         errors.push(if strict {
             ValidationError::error(
-                format!(
-                    "Unknown function '{}' for dialect {:?}",
-                    function.name, dialect
-                ),
+                format!("Unknown function '{}' for dialect {:?}", name, dialect),
                 validation_codes::E_UNKNOWN_FUNCTION,
             )
         } else {
             ValidationError::warning(
-                format!(
-                    "Unknown function '{}' for dialect {:?}",
-                    function.name, dialect
-                ),
+                format!("Unknown function '{}' for dialect {:?}", name, dialect),
                 validation_codes::E_UNKNOWN_FUNCTION,
             )
         });
@@ -1623,7 +1663,7 @@ fn check_function_catalog(
         ValidationError::error(
             format!(
                 "Invalid arity for function '{}': got {}, expected {}",
-                function.name, arity, expected
+                name, arity, expected
             ),
             validation_codes::E_INVALID_FUNCTION_ARITY,
         )
@@ -1631,7 +1671,7 @@ fn check_function_catalog(
         ValidationError::warning(
             format!(
                 "Invalid arity for function '{}': got {}, expected {}",
-                function.name, arity, expected
+                name, arity, expected
             ),
             validation_codes::E_INVALID_FUNCTION_ARITY,
         )
@@ -2059,7 +2099,8 @@ fn projection_families(
             {
                 return None;
             }
-            let context = collect_type_check_context(query, schema_map);
+            let mut context = collect_type_check_context(query, schema_map);
+            context.dialect = Some(dialect);
             Some(
                 select
                     .expressions
@@ -2099,9 +2140,22 @@ fn check_set_operation_compatibility(
     let Some(mut right_projection) = projection_families(right_expr, schema_map, dialect) else {
         return;
     };
+    let mut source_ordinals: Vec<_> = (0..left_projection.len())
+        .map(|index| (index, index))
+        .collect();
 
     match crate::set_operation::set_operation_layout(query, Some(dialect)) {
         Ok(Some(layout)) => {
+            source_ordinals = layout
+                .outputs
+                .iter()
+                .map(|output| {
+                    (
+                        output.left_ordinal.unwrap_or(usize::MAX),
+                        output.right_ordinal.unwrap_or(usize::MAX),
+                    )
+                })
+                .collect();
             let left = left_projection;
             let right = right_projection;
             left_projection = layout
@@ -2158,9 +2212,12 @@ fn check_set_operation_compatibility(
         .zip(right_projection)
         .enumerate()
     {
-        if !are_setop_compatible(left, right) {
+        if !coercion::setop(dialect, left, right)
+            && !coercion::setop_literal(dialect, left_expr, source_ordinals[idx].0, right)
+            && !coercion::setop_literal(dialect, right_expr, source_ordinals[idx].1, left)
+        {
             errors.push(type_issue(
-                strict,
+                strict && dialect != DialectType::DuckDB,
                 validation_codes::E_SETOP_TYPE_MISMATCH,
                 validation_codes::W_SETOP_IMPLICIT_COERCION,
                 format!(
@@ -2249,7 +2306,7 @@ fn check_insert_assignments(
                 let source_family = infer_expression_type_family(value, schema_map, &context);
                 if !are_assignment_compatible(target_family, source_family) {
                     errors.push(type_issue(
-                        strict,
+                        strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                         validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                         validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                         format!(
@@ -2297,7 +2354,7 @@ fn check_insert_assignments(
             };
             if !are_assignment_compatible(target_family, source_family) {
                 errors.push(type_issue(
-                    strict,
+                    strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                     validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                     validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                     format!(
@@ -2314,6 +2371,7 @@ fn check_insert_assignments(
 }
 
 fn check_update_assignments(
+    dialect: DialectType,
     stmt: &Expression,
     update: &Update,
     schema_map: &HashMap<String, TableSchemaEntry>,
@@ -2354,7 +2412,7 @@ fn check_update_assignments(
         let source_family = infer_expression_type_family(value, schema_map, &context);
         if !are_assignment_compatible(target_family, source_family) {
             errors.push(type_issue(
-                strict,
+                strict && !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake),
                 validation_codes::E_INVALID_ASSIGNMENT_TYPE,
                 validation_codes::W_IMPLICIT_CAST_ASSIGNMENT,
                 format!(
@@ -2369,22 +2427,49 @@ fn check_update_assignments(
     }
 }
 
+fn locate_type_issues(node: &Expression, errors: &mut [ValidationError]) {
+    if errors.is_empty() {
+        return;
+    }
+    let span = walk_in_scope(node, false).find_map(|expr| match expr {
+        Expression::Column(column) => column.span.or(column.name.span),
+        Expression::Function(function) => function.span,
+        _ => None,
+    });
+    if let Some(span) = span {
+        for error in errors {
+            if error.line.is_none() {
+                error.line = Some(span.line);
+                error.column = Some(span.column);
+                error.start = Some(span.start);
+                error.end = Some(span.end);
+            }
+        }
+    }
+}
+
 fn check_types(
     stmt: &Expression,
     dialect: DialectType,
     schema_map: &HashMap<String, TableSchemaEntry>,
     function_catalog: Option<&dyn FunctionCatalog>,
     strict: bool,
+    known_functions: &[String],
+    known_types: &[String],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let context = collect_type_check_context(stmt, schema_map);
+    let mut context = collect_type_check_context(stmt, schema_map);
+    context.dialect = Some(dialect);
+    // An unmodelled dialect must never inherit another engine's coercion errors.
+    let catalogue_strict = strict;
+    let strict = strict && coercion::covered(dialect);
 
     for node in stmt.dfs() {
         for (clause, predicate) in crate::binding::predicates(node) {
             let family = infer_expression_type_family(predicate, schema_map, &context);
-            if !predicate_compatible(family, dialect) {
+            if !clause_predicate_expression_compatible(predicate, family, dialect) {
                 errors.push(type_issue(
-                    strict,
+                    strict && dialect != DialectType::DuckDB,
                     validation_codes::E_INVALID_PREDICATE_TYPE,
                     validation_codes::W_PREDICATE_NULLABILITY,
                     format!(
@@ -2392,14 +2477,43 @@ fn check_types(
                         type_family_name(family)
                     ),
                 ));
+                let last = errors.len() - 1;
+                locate_type_issues(predicate, &mut errors[last..]);
             }
+        }
+        if matches!(node, Expression::Function(function) if known_functions.iter().any(|name| name.eq_ignore_ascii_case(&function.name)))
+        {
+            continue;
+        }
+        let issue_start = errors.len();
+        let signature_checked = signatures::check(
+            node,
+            dialect,
+            schema_map,
+            &context,
+            strict,
+            &mut errors,
+            function_catalog,
+        );
+        expressions::check(
+            node,
+            dialect,
+            schema_map,
+            &context,
+            strict,
+            known_types,
+            &mut errors,
+        );
+        if signature_checked && !matches!(node, Expression::Function(_)) {
+            locate_type_issues(node, &mut errors[issue_start..]);
+            continue;
         }
         match node {
             Expression::Insert(insert) => {
                 check_insert_assignments(dialect, stmt, insert, schema_map, strict, &mut errors);
             }
             Expression::Update(update) => {
-                check_update_assignments(stmt, update, schema_map, strict, &mut errors);
+                check_update_assignments(dialect, stmt, update, schema_map, strict, &mut errors);
             }
             Expression::Union(union) => {
                 check_set_operation_compatibility(
@@ -2440,9 +2554,9 @@ fn check_types(
             Expression::And(op) | Expression::Or(op) => {
                 for (side, expr) in [("left", &op.left), ("right", &op.right)] {
                     let family = infer_expression_type_family(expr, schema_map, &context);
-                    if !predicate_compatible(family, dialect) {
+                    if !predicate_expression_compatible(expr, family, dialect) {
                         errors.push(type_issue(
-                            strict,
+                            strict && dialect != DialectType::DuckDB,
                             validation_codes::E_INVALID_PREDICATE_TYPE,
                             validation_codes::W_PREDICATE_NULLABILITY,
                             format!(
@@ -2456,9 +2570,9 @@ fn check_types(
             }
             Expression::Not(unary) => {
                 let family = infer_expression_type_family(&unary.this, schema_map, &context);
-                if !predicate_compatible(family, dialect) {
+                if !predicate_expression_compatible(&unary.this, family, dialect) {
                     errors.push(type_issue(
-                        strict,
+                        strict && dialect != DialectType::DuckDB,
                         validation_codes::E_INVALID_PREDICATE_TYPE,
                         validation_codes::W_PREDICATE_NULLABILITY,
                         format!("NOT expects boolean, found {}", type_family_name(family)),
@@ -2473,9 +2587,17 @@ fn check_types(
             | Expression::Gte(op) => {
                 let left = infer_expression_type_family(&op.left, schema_map, &context);
                 let right = infer_expression_type_family(&op.right, schema_map, &context);
-                if !are_comparable(left, right) {
+                let runtime = (dialect == DialectType::Snowflake
+                    && coercion::runtime_comparison(dialect, left, right))
+                    || (matches!(node, Expression::Eq(_) | Expression::Neq(_))
+                        && coercion::runtime_equality(dialect, left, right));
+                if !coercion::comparable(dialect, &op.left, &op.right, left, right)
+                    || (runtime
+                        && !coercion::string_literal(&op.left)
+                        && !coercion::string_literal(&op.right))
+                {
                     errors.push(type_issue(
-                        strict,
+                        strict && !runtime,
                         validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
                         validation_codes::W_IMPLICIT_CAST_COMPARISON,
                         format!(
@@ -2492,6 +2614,7 @@ fn check_types(
                 if left != TypeFamily::Unknown
                     && right != TypeFamily::Unknown
                     && (!is_string_like(left) || !is_string_like(right))
+                    && dialect != DialectType::Snowflake
                 {
                     errors.push(type_issue(
                         strict,
@@ -2510,9 +2633,19 @@ fn check_types(
                 let low_family = infer_expression_type_family(&between.low, schema_map, &context);
                 let high_family = infer_expression_type_family(&between.high, schema_map, &context);
 
-                if !are_comparable(this_family, low_family)
-                    || !are_comparable(this_family, high_family)
-                {
+                if !coercion::comparable(
+                    dialect,
+                    &between.this,
+                    &between.low,
+                    this_family,
+                    low_family,
+                ) || !coercion::comparable(
+                    dialect,
+                    &between.this,
+                    &between.high,
+                    this_family,
+                    high_family,
+                ) {
                     errors.push(type_issue(
                         strict,
                         validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
@@ -2530,9 +2663,16 @@ fn check_types(
                 let this_family = infer_expression_type_family(&in_expr.this, schema_map, &context);
                 for value in &in_expr.expressions {
                     let item_family = infer_expression_type_family(value, schema_map, &context);
-                    if !are_comparable(this_family, item_family) {
+                    if !coercion::comparable(
+                        dialect,
+                        &in_expr.this,
+                        value,
+                        this_family,
+                        item_family,
+                    ) {
                         errors.push(type_issue(
-                            strict,
+                            strict
+                                && !coercion::runtime_comparison(dialect, this_family, item_family),
                             validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
                             validation_codes::W_IMPLICIT_CAST_COMPARISON,
                             format!(
@@ -2557,14 +2697,23 @@ fn check_types(
                     continue;
                 }
 
-                let temporal_ok = matches!(node, Expression::Add(_) | Expression::Sub(_))
-                    && ((left.is_temporal() && right.is_numeric())
-                        || (right.is_temporal() && left.is_numeric())
-                        || (matches!(node, Expression::Sub(_))
-                            && left.is_temporal()
-                            && right.is_temporal()));
-
-                if !(left.is_numeric() && right.is_numeric()) && !temporal_ok {
+                let literal_numeric = !(dialect == DialectType::DuckDB
+                    && matches!(node, Expression::Add(_)))
+                    && ((left.is_numeric() && coercion::literal_coerces(dialect, &op.right, left))
+                        || (right.is_numeric()
+                            && coercion::literal_coerces(dialect, &op.left, right)));
+                if literal_numeric
+                    && (expressions::invalid_literal_for(&op.left, right)
+                        || expressions::invalid_literal_for(&op.right, left))
+                {
+                    errors.push(type_issue(
+                        false,
+                        validation_codes::E_INVALID_ARITHMETIC_TYPE,
+                        validation_codes::W_IMPLICIT_CAST_ARITHMETIC,
+                        "Arithmetic literal conversion may fail at execution".to_owned(),
+                    ));
+                }
+                if !literal_numeric && !coercion::arithmetic(dialect, node, left, right) {
                     errors.push(type_issue(
                         strict,
                         validation_codes::E_INVALID_ARITHMETIC_TYPE,
@@ -2578,8 +2727,21 @@ fn check_types(
                 }
             }
             Expression::Function(function) => {
-                check_function_catalog(function, dialect, function_catalog, strict, &mut errors);
-                check_generic_function(function, schema_map, &context, strict, &mut errors);
+                if !known_functions
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&function.name))
+                {
+                    check_function_catalog(
+                        function,
+                        dialect,
+                        function_catalog,
+                        catalogue_strict,
+                        &mut errors,
+                    );
+                }
+                if !signature_checked {
+                    check_generic_function(function, schema_map, &context, strict, &mut errors);
+                }
             }
             Expression::Upper(func)
             | Expression::Lower(func)
@@ -2905,6 +3067,7 @@ fn check_types(
             }
             _ => {}
         }
+        locate_type_issues(node, &mut errors[issue_start..]);
     }
 
     errors
@@ -2912,13 +3075,38 @@ fn check_types(
 
 fn predicate_compatible(family: TypeFamily, dialect: DialectType) -> bool {
     matches!(family, TypeFamily::Unknown | TypeFamily::Boolean)
-        || (matches!(
-            dialect,
-            DialectType::MySQL | DialectType::SQLite | DialectType::DuckDB
-        ) && family.is_numeric())
+        || (dialect != DialectType::Generic && !coercion::fully_modelled(family))
+        || coercion::predicate(dialect, family)
+        || (matches!(dialect, DialectType::MySQL | DialectType::SQLite) && family.is_numeric())
 }
 
+fn predicate_expression_compatible(
+    expr: &Expression,
+    family: TypeFamily,
+    dialect: DialectType,
+) -> bool {
+    predicate_compatible(family, dialect)
+        || (coercion::literal_coerces(dialect, expr, TypeFamily::Boolean)
+            && !expressions::invalid_literal_for(expr, TypeFamily::Boolean))
+}
+
+fn clause_predicate_expression_compatible(
+    expr: &Expression,
+    family: TypeFamily,
+    dialect: DialectType,
+) -> bool {
+    // Snowflake coerces logical operands, but WHERE/HAVING/ON and searched
+    // CASE require a Boolean expression. The engine fixture proves this boundary.
+    if dialect == DialectType::Snowflake && coercion::fully_modelled(family) {
+        return family == TypeFamily::Boolean;
+    }
+    predicate_expression_compatible(expr, family, dialect)
+}
+
+mod coercion;
+mod expressions;
 mod semantics;
+pub(crate) mod signatures;
 pub(crate) use semantics::check_semantics;
 
 fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<String> {
@@ -3312,12 +3500,39 @@ enum OutputNameResolution {
     InputFirst,
 }
 
+/// Recognize the select-list ordering keyword only in its supported clause form.
+fn is_order_by_all(order_by: &crate::expressions::OrderBy, dialect: DialectType) -> bool {
+    if !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) || order_by.siblings {
+        return false;
+    }
+    let [ordered] = order_by.expressions.as_slice() else {
+        return false;
+    };
+    if ordered.with_fill.is_some() {
+        return false;
+    }
+    // The parser represents ORDER BY ALL as an unqualified Column (unlike
+    // GROUP BY ALL's dedicated flag). Keep the public AST unchanged. Direction
+    // and NULLS modifiers live on Ordered and apply to the entire select list.
+    // Quoted/qualified names, parenthesized expressions, and mixed sort lists
+    // remain ordinary references; Expression::All is a quantified expression.
+    let name = match &ordered.this {
+        Expression::Column(column) if column.table.is_none() && !column.join_mark => &column.name,
+        Expression::Identifier(identifier) => identifier,
+        _ => return false,
+    };
+    !name.quoted && name.name.eq_ignore_ascii_case("all")
+}
+
 /// Collect ordering references together with whether they can resolve to the
 /// current SELECT's outputs. Other clauses use the ordinary input-source walk.
 fn order_by_validation_columns(
     order_by: &crate::expressions::OrderBy,
     dialect: DialectType,
 ) -> Vec<(&Column, OutputNameResolution)> {
+    if is_order_by_all(order_by, dialect) {
+        return Vec::new();
+    }
     // Only enable aliases inside scalar expressions for dialects whose rules
     // support them. In particular, PostgreSQL and T-SQL require standalone
     // output names; `ORDER BY alias + 1` must resolve against input columns.
@@ -3460,8 +3675,31 @@ fn validate_scope_columns(
         .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
         .collect();
 
+    // Pivot operands refer to the pre-pivot relation, not the output relation
+    // indexed above. Do not falsely bind them against generated pivot columns.
+    // Nested input queries still receive their own lexical validation pass.
+    let mut pivot_inputs = HashSet::new();
+    for node in walk_in_scope(&expression, false) {
+        if let Expression::Pivot(pivot) = node {
+            for operand in pivot
+                .expressions
+                .iter()
+                .chain(&pivot.fields)
+                .chain(&pivot.using)
+                .chain(pivot.group.as_deref())
+            {
+                for node in walk_in_scope(operand, false) {
+                    if let Expression::Column(column) = node {
+                        pivot_inputs.insert(column.as_ref() as *const _);
+                    }
+                }
+            }
+        }
+    }
     let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
-        Expression::Column(column) => Some((column.as_ref(), OutputNameResolution::InputOnly)),
+        Expression::Column(column) if !pivot_inputs.contains(&(column.as_ref() as *const _)) => {
+            Some((column.as_ref(), OutputNameResolution::InputOnly))
+        }
         _ => None,
     });
     let order_columns = order_by
@@ -3961,7 +4199,16 @@ pub fn validate_parsed_with_schema(
     let schema_map = build_schema_map(schema);
     let resolver_schema = mapping_schema_from_validation_schema_with_dialect(schema, dialect);
     let mut all_errors = Vec::new();
-    let embedded_function_catalog = if options.check_types && options.function_catalog.is_none() {
+    let has_embedded_catalog = dialect == DialectType::DuckDB
+        || (dialect == DialectType::ClickHouse
+            && cfg!(any(
+                feature = "function-catalog-clickhouse",
+                feature = "function-catalog-all-dialects"
+            )));
+    let embedded_function_catalog = if (options.check_types || options.semantic)
+        && has_embedded_catalog
+        && options.function_catalog.is_none()
+    {
         default_embedded_function_catalog()
     } else {
         None
@@ -3983,6 +4230,32 @@ pub fn validate_parsed_with_schema(
     for mut statement in statements {
         if options.semantic {
             all_errors.extend(check_semantics(&statement, dialect, Some(schema)));
+            if !options.check_types {
+                for node in statement.dfs() {
+                    if let Expression::Function(function) = node {
+                        if !options
+                            .known_functions
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&function.name))
+                        {
+                            signatures::check_builtin_arity(
+                                &function.name.to_ascii_lowercase(),
+                                function.args.len(),
+                                dialect,
+                                strict,
+                                &mut all_errors,
+                            );
+                            check_function_catalog(
+                                function,
+                                dialect,
+                                effective_function_catalog,
+                                strict,
+                                &mut all_errors,
+                            );
+                        }
+                    }
+                }
+            }
         }
         crate::binding::bind_dml_pseudoreferences(&mut statement);
         let statement = bind_validation_lambdas(statement, dialect);
@@ -4030,6 +4303,8 @@ pub fn validate_parsed_with_schema(
                 &schema_map,
                 effective_function_catalog,
                 strict,
+                &options.known_functions,
+                &options.known_types,
             ));
         }
         if options.check_references {

@@ -1,0 +1,1918 @@
+{
+  "engine": "snowflake",
+  "method": "EXPLAIN USING TEXT followed by execution; synthetic inline-CTE inputs",
+  "schema": {
+    "tables": [
+      {
+        "name": "raw__orders",
+        "columns": [
+          {
+            "name": "id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "customer_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "waffle_type_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "quantity",
+            "type": "INTEGER"
+          },
+          {
+            "name": "ordered_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "status",
+            "type": "VARCHAR"
+          }
+        ]
+      },
+      {
+        "name": "raw__customers",
+        "columns": [
+          {
+            "name": "id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "first_name",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "last_name",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "email",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "created_at",
+            "type": "TIMESTAMP"
+          }
+        ]
+      },
+      {
+        "name": "raw__payments",
+        "columns": [
+          {
+            "name": "id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "order_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "amount_cents",
+            "type": "INTEGER"
+          },
+          {
+            "name": "payment_method",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "paid_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "status",
+            "type": "VARCHAR"
+          }
+        ]
+      },
+      {
+        "name": "stg_orders",
+        "columns": [
+          {
+            "name": "order_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "customer_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "waffle_type_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "quantity",
+            "type": "INTEGER"
+          },
+          {
+            "name": "ordered_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "status",
+            "type": "VARCHAR"
+          }
+        ]
+      },
+      {
+        "name": "stg_orders_typed",
+        "columns": [
+          {
+            "name": "order_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "customer_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "waffle_type_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "quantity",
+            "type": "INTEGER"
+          },
+          {
+            "name": "ordered_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "status",
+            "type": "VARCHAR"
+          }
+        ]
+      },
+      {
+        "name": "stg_payments",
+        "columns": [
+          {
+            "name": "payment_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "order_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "amount_cents",
+            "type": "INTEGER"
+          },
+          {
+            "name": "payment_method",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "paid_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "payment_status",
+            "type": "VARCHAR"
+          }
+        ]
+      },
+      {
+        "name": "waffle_types",
+        "columns": [
+          {
+            "name": "waffle_type_id",
+            "type": "BIGINT"
+          },
+          {
+            "name": "waffle_name",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "category",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "price_cents",
+            "type": "BIGINT"
+          }
+        ]
+      },
+      {
+        "name": "table_fn__customer_orders",
+        "columns": [
+          {
+            "name": "order_id",
+            "type": "INTEGER"
+          },
+          {
+            "name": "ordered_at",
+            "type": "TIMESTAMP"
+          },
+          {
+            "name": "waffle_name",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "line_total_cents",
+            "type": "INTEGER"
+          },
+          {
+            "name": "order_status",
+            "type": "VARCHAR"
+          },
+          {
+            "name": "is_completed_order",
+            "type": "BOOLEAN"
+          }
+        ]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "c01",
+      "sql": "SELECT id FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c02",
+      "sql": "SELECT quantity AS q, q + 1 AS q2 FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity AS q, q + 1 AS q2 FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c03",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at > '2026-01-01'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at > '2026-01-01'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c04",
+      "sql": "SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY ALL",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY ALL",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c05",
+      "sql": "SELECT * EXCLUDE (status) FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT * EXCLUDE (status) FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c06",
+      "sql": "SELECT quantity * 2.5 AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity * 2.5 AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c07",
+      "sql": "SELECT o.order_id, p.amount_cents FROM stg_orders_typed o JOIN stg_payments p ON o.order_id = p.order_id",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT o.order_id, p.amount_cents FROM stg_orders_typed o JOIN stg_payments p ON o.order_id = p.order_id",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c08",
+      "sql": "SELECT quantity AS q FROM raw__orders ORDER BY q",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity AS q FROM raw__orders ORDER BY q",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c09",
+      "sql": "SELECT o.id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = o.customer_id)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = o.customer_id)",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "c10",
+      "sql": "SELECT id FROM raw__orders QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at) = 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at) = 1",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "u01",
+      "sql": "SELECT qty FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT qty FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u02",
+      "sql": "SELECT o.qty FROM raw__orders o",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT o.qty FROM raw__orders o",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u03",
+      "sql": "SELECT qty FROM stg_orders",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT qty FROM stg_orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u04",
+      "sql": "SELECT o.qty FROM stg_orders_typed o",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT o.qty FROM stg_orders_typed o",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u05",
+      "sql": "SELECT amount_usd FROM raw__payments",
+      "executed_sql": "WITH raw__payments AS (SELECT column1::INTEGER AS id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT amount_usd FROM raw__payments",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u06",
+      "sql": "SELECT price_usd FROM waffle_types",
+      "executed_sql": "WITH waffle_types AS (SELECT column1::BIGINT AS waffle_type_id, column2::VARCHAR AS waffle_name, column3::VARCHAR AS category, column4::BIGINT AS price_cents FROM VALUES (1, 'Classic', 'sweet', 850), (2, 'Liege', 'sweet', 950)) SELECT price_usd FROM waffle_types",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u07",
+      "sql": "SELECT id FROM raw__orders WHERE qty > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE qty > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u08",
+      "sql": "SELECT COUNT(*) AS n FROM raw__orders GROUP BY stat",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COUNT(*) AS n FROM raw__orders GROUP BY stat",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u09",
+      "sql": "SELECT id FROM raw__orders ORDER BY qty",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders ORDER BY qty",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u10",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.customer = c.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.customer = c.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u11",
+      "sql": "SELECT id, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ordered_at) AS rn FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ordered_at) AS rn FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u12",
+      "sql": "SELECT id FROM raw__orders QUALIFY ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ordered_at) = 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders QUALIFY ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ordered_at) = 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u13",
+      "sql": "SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY status HAVING SUM(qty) > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY status HAVING SUM(qty) > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u14",
+      "sql": "SELECT CASE WHEN qty > 1 THEN 'a' END AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CASE WHEN qty > 1 THEN 'a' END AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u15",
+      "sql": "SELECT UPPER(stat) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT UPPER(stat) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u16",
+      "sql": "WITH x AS (SELECT id FROM raw__orders) SELECT quantity FROM x",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), x AS (SELECT id FROM raw__orders) SELECT quantity FROM x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u17",
+      "sql": "SELECT s.quantity FROM (SELECT id FROM raw__orders) s",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT s.quantity FROM (SELECT id FROM raw__orders) s",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u18",
+      "sql": "SELECT z.id FROM raw__orders o",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT z.id FROM raw__orders o",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u19",
+      "sql": "WITH x AS (SELECT * FROM raw__orders) SELECT qty FROM x",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), x AS (SELECT * FROM raw__orders) SELECT qty FROM x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u20",
+      "sql": "SELECT * EXCLUDE (qty) FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT * EXCLUDE (qty) FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001431",
+      "expected_error": true
+    },
+    {
+      "id": "u21",
+      "sql": "SELECT o.id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = o.cust)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = o.cust)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u22",
+      "sql": "SELECT id FROM raw__orders WHERE customer_id IN (SELECT cust_id FROM raw__customers)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders WHERE customer_id IN (SELECT cust_id FROM raw__customers)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u23",
+      "sql": "SELECT o.order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id WHERE p.amount > 0",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT o.order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id WHERE p.amount > 0",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "u24",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c USING (cust_id)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c USING (cust_id)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002004",
+      "expected_error": true
+    },
+    {
+      "id": "a01",
+      "sql": "SELECT order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002028",
+      "expected_error": true
+    },
+    {
+      "id": "a02",
+      "sql": "SELECT id FROM raw__orders o JOIN raw__customers c ON o.customer_id = c.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders o JOIN raw__customers c ON o.customer_id = c.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002028",
+      "expected_error": true
+    },
+    {
+      "id": "a03",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON id = c.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON id = c.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002028",
+      "expected_error": true
+    },
+    {
+      "id": "a04",
+      "sql": "SELECT o.order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id WHERE order_id > 1",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT o.order_id FROM stg_orders o JOIN stg_payments p ON o.order_id = p.order_id WHERE order_id > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002028",
+      "expected_error": true
+    },
+    {
+      "id": "t01",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at > 5",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at > 5",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "t02",
+      "sql": "SELECT quantity * status AS q FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity * status AS q FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t03",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.id = c.email",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.id = c.email",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t04",
+      "sql": "SELECT SUM(status) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(status) AS s FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t05",
+      "sql": "SELECT AVG(ordered_at) AS a FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT AVG(ordered_at) AS a FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "t06",
+      "sql": "SELECT id FROM raw__orders WHERE status > 5",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE status > 5",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t07",
+      "sql": "SELECT id FROM raw__orders WHERE quantity",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002034",
+      "expected_error": true
+    },
+    {
+      "id": "t08",
+      "sql": "SELECT id FROM raw__orders WHERE status",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE status",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002034",
+      "expected_error": true
+    },
+    {
+      "id": "t09",
+      "sql": "SELECT CASE WHEN quantity > 1 THEN quantity ELSE status END AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CASE WHEN quantity > 1 THEN quantity ELSE status END AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t10",
+      "sql": "SELECT COALESCE(quantity, status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COALESCE(quantity, status) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t11",
+      "sql": "SELECT id FROM raw__orders WHERE quantity IN ('a', 'b')",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity IN ('a', 'b')",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t12",
+      "sql": "SELECT id FROM raw__orders WHERE quantity LIKE '1%'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity LIKE '1%'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t13",
+      "sql": "SELECT NOT quantity AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT NOT quantity AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t14",
+      "sql": "SELECT DATE_TRUNC('day', status) AS d FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DATE_TRUNC('day', status) AS d FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002016",
+      "expected_error": true
+    },
+    {
+      "id": "t15",
+      "sql": "SELECT ordered_at + status AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ordered_at + status AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "t16",
+      "sql": "SELECT LENGTH(quantity) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LENGTH(quantity) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t17",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at = 'not a date'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at = 'not a date'",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100035",
+      "expected_error": false
+    },
+    {
+      "id": "t18",
+      "sql": "SELECT quantity - ordered_at AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity - ordered_at AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "t19",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at BETWEEN 1 AND 5",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at BETWEEN 1 AND 5",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "t20",
+      "sql": "SELECT o.id FROM raw__orders o WHERE o.ordered_at > (SELECT MAX(email) FROM raw__customers)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o WHERE o.ordered_at > (SELECT MAX(email) FROM raw__customers)",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100035",
+      "expected_error": false
+    },
+    {
+      "id": "t21",
+      "sql": "SELECT o.order_id FROM stg_orders_typed o JOIN stg_payments p ON o.order_id = p.payment_method",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT o.order_id FROM stg_orders_typed o JOIN stg_payments p ON o.order_id = p.payment_method",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t22",
+      "sql": "SELECT SUM(p.payment_method) OVER () AS s FROM stg_payments p",
+      "executed_sql": "WITH stg_payments AS (SELECT column1::INTEGER AS payment_id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS payment_status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT SUM(p.payment_method) OVER () AS s FROM stg_payments p",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "t23",
+      "sql": "SELECT UPPER(quantity) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT UPPER(quantity) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t24",
+      "sql": "SELECT id FROM raw__orders WHERE status = TRUE",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE status = TRUE",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "t25",
+      "sql": "SELECT CAST(ordered_at AS INTEGER) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CAST(ordered_at AS INTEGER) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001007",
+      "expected_error": true
+    },
+    {
+      "id": "t26",
+      "sql": "SELECT order_id FROM stg_orders_typed WHERE ordered_at > 5",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT order_id FROM stg_orders_typed WHERE ordered_at > 5",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "t27",
+      "sql": "SELECT quantity * status AS q FROM stg_orders",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity * status AS q FROM stg_orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "g01",
+      "sql": "SELECT status, quantity, COUNT(*) AS n FROM raw__orders GROUP BY status",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status, quantity, COUNT(*) AS n FROM raw__orders GROUP BY status",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001104",
+      "expected_error": true
+    },
+    {
+      "id": "g02",
+      "sql": "SELECT id FROM raw__orders WHERE SUM(quantity) > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE SUM(quantity) > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002035",
+      "expected_error": true
+    },
+    {
+      "id": "g03",
+      "sql": "SELECT SUM(COUNT(*)) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(COUNT(*)) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002082",
+      "expected_error": true
+    },
+    {
+      "id": "g04",
+      "sql": "SELECT id FROM raw__orders WHERE ROW_NUMBER() OVER () = 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ROW_NUMBER() OVER () = 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002061",
+      "expected_error": true
+    },
+    {
+      "id": "g05",
+      "sql": "SELECT id, COUNT(*) AS n FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id, COUNT(*) AS n FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000979",
+      "expected_error": true
+    },
+    {
+      "id": "g06",
+      "sql": "SELECT status FROM raw__orders GROUP BY status HAVING quantity > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status FROM raw__orders GROUP BY status HAVING quantity > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000979",
+      "expected_error": true
+    },
+    {
+      "id": "g07",
+      "sql": "SELECT status FROM raw__orders GROUP BY 3",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status FROM raw__orders GROUP BY 3",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000979",
+      "expected_error": true
+    },
+    {
+      "id": "s01",
+      "sql": "SELECT id, status FROM raw__orders UNION ALL SELECT id FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id, status FROM raw__orders UNION ALL SELECT id FROM raw__customers",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001789",
+      "expected_error": true
+    },
+    {
+      "id": "s02",
+      "sql": "SELECT ordered_at AS x FROM raw__orders UNION ALL SELECT email FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT ordered_at AS x FROM raw__orders UNION ALL SELECT email FROM raw__customers",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100035",
+      "expected_error": false
+    },
+    {
+      "id": "s03",
+      "sql": "SELECT id FROM raw__orders INTERSECT SELECT id, email FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders INTERSECT SELECT id, email FROM raw__customers",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001789",
+      "expected_error": true
+    },
+    {
+      "id": "s04",
+      "sql": "SELECT quantity AS x FROM raw__orders UNION ALL SELECT TRUE FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT quantity AS x FROM raw__orders UNION ALL SELECT TRUE FROM raw__customers",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001790",
+      "expected_error": true
+    },
+    {
+      "id": "f01",
+      "sql": "SELECT not_a_function(id) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT not_a_function(id) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "f02",
+      "sql": "SELECT DATE_TRUNC('day') AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DATE_TRUNC('day') AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000938",
+      "expected_error": true
+    },
+    {
+      "id": "f04",
+      "sql": "SELECT ROUND(status, 2) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ROUND(status, 2) AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "f05",
+      "sql": "SELECT SUBSTRING(status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUBSTRING(status) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000938",
+      "expected_error": true
+    },
+    {
+      "id": "x01",
+      "sql": "SELECT id, id FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id, id FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "x02",
+      "sql": "SELECT id FROM raw__orders ORDER BY 5",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders ORDER BY 5",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002024",
+      "expected_error": true
+    },
+    {
+      "id": "x03",
+      "sql": "WITH c(a, b) AS (SELECT id FROM raw__orders) SELECT a FROM c",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), c(a, b) AS (SELECT id FROM raw__orders) SELECT a FROM c",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001087",
+      "expected_error": true
+    },
+    {
+      "id": "x04",
+      "sql": "WITH a AS (SELECT id FROM raw__orders) SELECT * FROM b",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), a AS (SELECT id FROM raw__orders) SELECT * FROM b",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002003",
+      "expected_error": true
+    },
+    {
+      "id": "x05",
+      "sql": "SELECT id FROM raw_orders",
+      "executed_sql": "SELECT id FROM raw_orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002003",
+      "expected_error": true
+    },
+    {
+      "id": "x06",
+      "sql": "SELECT quantity + 1 FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity + 1 FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "y01",
+      "sql": "WITH x AS (SELECT 1 AS id) SELECT quantity FROM x",
+      "executed_sql": "WITH x AS (SELECT 1 AS id) SELECT quantity FROM x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "y02",
+      "sql": "SELECT CAST('2020-01-01' AS TIMESTAMP) > 5 AS x",
+      "executed_sql": "SELECT CAST('2020-01-01' AS TIMESTAMP) > 5 AS x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "y03",
+      "sql": "SELECT order_id FROM stg_orders_typed WHERE qty > 1",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT order_id FROM stg_orders_typed WHERE qty > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "y04",
+      "sql": "SELECT o.order_id FROM stg_orders_typed o JOIN waffle_types w ON o.waffle = w.waffle_type_id",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), waffle_types AS (SELECT column1::BIGINT AS waffle_type_id, column2::VARCHAR AS waffle_name, column3::VARCHAR AS category, column4::BIGINT AS price_cents FROM VALUES (1, 'Classic', 'sweet', 850), (2, 'Liege', 'sweet', 950)) SELECT o.order_id FROM stg_orders_typed o JOIN waffle_types w ON o.waffle = w.waffle_type_id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "y05",
+      "sql": "SELECT waffle_type_id FROM stg_orders_typed o JOIN waffle_types w ON o.waffle_type_id = w.waffle_type_id",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), waffle_types AS (SELECT column1::BIGINT AS waffle_type_id, column2::VARCHAR AS waffle_name, column3::VARCHAR AS category, column4::BIGINT AS price_cents FROM VALUES (1, 'Classic', 'sweet', 850), (2, 'Liege', 'sweet', 950)) SELECT waffle_type_id FROM stg_orders_typed o JOIN waffle_types w ON o.waffle_type_id = w.waffle_type_id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002028",
+      "expected_error": true
+    },
+    {
+      "id": "y06",
+      "sql": "WITH x AS (SELECT order_id FROM stg_orders_typed) SELECT quantity FROM x",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), x AS (SELECT order_id FROM stg_orders_typed) SELECT quantity FROM x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "y07",
+      "sql": "SELECT qty FROM stg_orders_typed",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT qty FROM stg_orders_typed",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "y08",
+      "sql": "SELECT quantity * status AS q FROM stg_orders_typed",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity * status AS q FROM stg_orders_typed",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "y09",
+      "sql": "SELECT w.price_usd FROM raw__orders o JOIN waffle_types w ON o.waffle_type_id = w.waffle_type_id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), waffle_types AS (SELECT column1::BIGINT AS waffle_type_id, column2::VARCHAR AS waffle_name, column3::VARCHAR AS category, column4::BIGINT AS price_cents FROM VALUES (1, 'Classic', 'sweet', 850), (2, 'Liege', 'sweet', 950)) SELECT w.price_usd FROM raw__orders o JOIN waffle_types w ON o.waffle_type_id = w.waffle_type_id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "A01",
+      "sql": "SELECT SUM(status = 'x') AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(status = 'x') AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "A02",
+      "sql": "SELECT SUM(ordered_at) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(ordered_at) AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "A03",
+      "sql": "SELECT AVG(status) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT AVG(status) AS s FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "A04",
+      "sql": "SELECT SUM(CAST(ordered_at AS DATE)) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(CAST(ordered_at AS DATE)) AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "A05",
+      "sql": "SELECT SUM(quantity, id) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(quantity, id) AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000939",
+      "expected_error": true
+    },
+    {
+      "id": "A06",
+      "sql": "SELECT STDDEV(status) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT STDDEV(status) AS s FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "A07",
+      "sql": "SELECT SUM(status) AS s FROM stg_orders_typed",
+      "executed_sql": "WITH stg_orders_typed AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(status) AS s FROM stg_orders_typed",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "A08",
+      "sql": "SELECT SUM(waffle_name) AS s FROM waffle_types",
+      "executed_sql": "WITH waffle_types AS (SELECT column1::BIGINT AS waffle_type_id, column2::VARCHAR AS waffle_name, column3::VARCHAR AS category, column4::BIGINT AS price_cents FROM VALUES (1, 'Classic', 'sweet', 850), (2, 'Liege', 'sweet', 950)) SELECT SUM(waffle_name) AS s FROM waffle_types",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "A09",
+      "sql": "SELECT COUNT(*) AS n FROM raw__orders GROUP BY SUM(quantity)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COUNT(*) AS n FROM raw__orders GROUP BY SUM(quantity)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000979",
+      "expected_error": true
+    },
+    {
+      "id": "A10",
+      "sql": "SELECT COUNT(*) FILTER (WHERE status) AS n FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COUNT(*) FILTER (WHERE status) AS n FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "A11",
+      "sql": "SELECT COUNT(*) FILTER (WHERE qty > 1) AS n FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COUNT(*) FILTER (WHERE qty > 1) AS n FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "A12",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON SUM(o.customer_id) = c.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON SUM(o.customer_id) = c.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002083",
+      "expected_error": true
+    },
+    {
+      "id": "A13",
+      "sql": "SELECT SUM(ROW_NUMBER() OVER ()) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(ROW_NUMBER() OVER ()) AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002061",
+      "expected_error": true
+    },
+    {
+      "id": "N01",
+      "sql": "SELECT ROW_NUMBER() AS rn FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ROW_NUMBER() AS rn FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002064",
+      "expected_error": true
+    },
+    {
+      "id": "N02",
+      "sql": "SELECT LAG(quantity, status) OVER (ORDER BY id) AS l FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LAG(quantity, status) OVER (ORDER BY id) AS l FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001015",
+      "expected_error": true
+    },
+    {
+      "id": "N03",
+      "sql": "SELECT NTILE('a') OVER (ORDER BY id) AS t FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT NTILE('a') OVER (ORDER BY id) AS t FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "N04",
+      "sql": "SELECT SUM(quantity) OVER (ORDER BY status RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(quantity) OVER (ORDER BY status RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "010054",
+      "expected_error": true
+    },
+    {
+      "id": "N05",
+      "sql": "SELECT COUNT(*) AS n FROM raw__orders GROUP BY ROW_NUMBER() OVER ()",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COUNT(*) AS n FROM raw__orders GROUP BY ROW_NUMBER() OVER ()",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002061",
+      "expected_error": true
+    },
+    {
+      "id": "N06",
+      "sql": "SELECT SUM(quantity) OVER w AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SUM(quantity) OVER w AS s FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "N07",
+      "sql": "SELECT LAG(quantity) OVER (ORDER BY ordered) AS l FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LAG(quantity) OVER (ORDER BY ordered) AS l FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "N08",
+      "sql": "SELECT id FROM raw__orders QUALIFY quantity > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders QUALIFY quantity > 1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000992",
+      "expected_error": true
+    },
+    {
+      "id": "F01",
+      "sql": "SELECT ABS(status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ABS(status) AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "F02",
+      "sql": "SELECT ROUND(ordered_at) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ROUND(ordered_at) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "F03",
+      "sql": "SELECT EXTRACT(year FROM status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT EXTRACT(year FROM status) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002016",
+      "expected_error": true
+    },
+    {
+      "id": "F04",
+      "sql": "SELECT DATE_DIFF('day', status, ordered_at) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DATE_DIFF('day', status, ordered_at) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "F05",
+      "sql": "SELECT SPLIT_PART(quantity, ',', 1) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SPLIT_PART(quantity, ',', 1) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "F06",
+      "sql": "SELECT REGEXP_MATCHES(quantity, 'a') AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT REGEXP_MATCHES(quantity, 'a') AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "F07",
+      "sql": "SELECT SQRT(status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SQRT(status) AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "F08",
+      "sql": "SELECT GREATEST(quantity, status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT GREATEST(quantity, status) AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "F09",
+      "sql": "SELECT LEAST(ordered_at, quantity) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LEAST(ordered_at, quantity) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "F10",
+      "sql": "SELECT NULLIF(quantity, status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT NULLIF(quantity, status) AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "F11",
+      "sql": "SELECT IFNULL(ordered_at, quantity) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT IFNULL(ordered_at, quantity) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "F12",
+      "sql": "SELECT STRFTIME(quantity, '%Y') AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT STRFTIME(quantity, '%Y') AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": true
+    },
+    {
+      "id": "F13",
+      "sql": "SELECT LOWER(ordered_at) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LOWER(ordered_at) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "F14",
+      "sql": "SELECT LEFT(quantity, 2) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LEFT(quantity, 2) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "F15",
+      "sql": "SELECT COALESCE() AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COALESCE() AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000938",
+      "expected_error": true
+    },
+    {
+      "id": "F16",
+      "sql": "SELECT UPPER(status, status) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT UPPER(status, status) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000939",
+      "expected_error": true
+    },
+    {
+      "id": "F17",
+      "sql": "SELECT id FROM raw__orders WHERE is_valid(status)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE is_valid(status)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "F18",
+      "sql": "SELECT not_an_agg(quantity) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT not_an_agg(quantity) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "O01",
+      "sql": "SELECT id FROM raw__orders WHERE quantity AND status = 'x'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity AND status = 'x'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "O02",
+      "sql": "SELECT id FROM raw__orders WHERE status OR quantity > 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE status OR quantity > 1",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100037",
+      "expected_error": false
+    },
+    {
+      "id": "O03",
+      "sql": "SELECT ordered_at * 2 AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ordered_at * 2 AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "O04",
+      "sql": "SELECT status % 2 AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status % 2 AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "O05",
+      "sql": "SELECT id FROM raw__orders WHERE status IS TRUE",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE status IS TRUE",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "O06",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at LIKE '2026%'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at LIKE '2026%'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "O07",
+      "sql": "SELECT id FROM raw__orders WHERE quantity BETWEEN 'a' AND 'b'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity BETWEEN 'a' AND 'b'",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "O08",
+      "sql": "SELECT CASE WHEN status THEN 1 END AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CASE WHEN status THEN 1 END AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "O09",
+      "sql": "SELECT -status AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT -status AS x FROM raw__orders",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "O10",
+      "sql": "SELECT ordered_at - status AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ordered_at - status AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "O11",
+      "sql": "SELECT status FROM raw__orders GROUP BY status HAVING status",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status FROM raw__orders GROUP BY status HAVING status",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002034",
+      "expected_error": true
+    },
+    {
+      "id": "O12",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.customer_id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON o.customer_id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002034",
+      "expected_error": true
+    },
+    {
+      "id": "L01",
+      "sql": "SELECT CAST(quantity AS NOT_A_TYPE) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CAST(quantity AS NOT_A_TYPE) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002040",
+      "expected_error": false
+    },
+    {
+      "id": "L02",
+      "sql": "SELECT CAST(status = 'x' AS TIMESTAMP) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CAST(status = 'x' AS TIMESTAMP) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001007",
+      "expected_error": true
+    },
+    {
+      "id": "L03",
+      "sql": "SELECT CAST(ordered_at AS BOOLEAN) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT CAST(ordered_at AS BOOLEAN) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001007",
+      "expected_error": true
+    },
+    {
+      "id": "L04",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at > DATE '2026-13-45'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at > DATE '2026-13-45'",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100040",
+      "expected_error": false
+    },
+    {
+      "id": "L05",
+      "sql": "SELECT ordered_at + INTERVAL 'banana' AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ordered_at + INTERVAL 'banana' AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "Q01",
+      "sql": "SELECT id FROM raw__orders WHERE customer_id IN (SELECT id, email FROM raw__customers)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders WHERE customer_id IN (SELECT id, email FROM raw__customers)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001044",
+      "expected_error": true
+    },
+    {
+      "id": "Q02",
+      "sql": "SELECT (SELECT id, email FROM raw__customers LIMIT 1) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT (SELECT id, email FROM raw__customers LIMIT 1) AS x FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002096",
+      "expected_error": true
+    },
+    {
+      "id": "Q03",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at IN (SELECT email FROM raw__customers)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders WHERE ordered_at IN (SELECT email FROM raw__customers)",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100035",
+      "expected_error": false
+    },
+    {
+      "id": "Q04",
+      "sql": "SELECT x.id FROM (SELECT id FROM raw__orders)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT x.id FROM (SELECT id FROM raw__orders)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "Q05",
+      "sql": "SELECT id FROM raw__orders WHERE (id, customer_id) = (1, 2, 3)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE (id, customer_id) = (1, 2, 3)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001038",
+      "expected_error": true
+    },
+    {
+      "id": "Q06",
+      "sql": "SELECT id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = z.customer_id)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders o WHERE EXISTS (SELECT 1 FROM raw__customers c WHERE c.id = z.customer_id)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "Q07",
+      "sql": "SELECT o.id, l.x FROM raw__orders o, LATERAL (SELECT o.qty AS x) l",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT o.id, l.x FROM raw__orders o, LATERAL (SELECT o.qty AS x) l",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "J01",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers o ON o.id = o.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT o.id FROM raw__orders o JOIN raw__customers o ON o.id = o.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002027",
+      "expected_error": true
+    },
+    {
+      "id": "J02",
+      "sql": "SELECT * FROM (SELECT id FROM raw__orders) a JOIN (SELECT email AS id FROM raw__customers) b USING (id)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT * FROM (SELECT id FROM raw__orders) a JOIN (SELECT email AS id FROM raw__customers) b USING (id)",
+      "verdict": "runtime_error",
+      "snowflake_error_code": "100038",
+      "expected_error": false
+    },
+    {
+      "id": "J03",
+      "sql": "SELECT a.id FROM (SELECT id, status FROM raw__orders) a JOIN (SELECT id FROM raw__customers) b USING (status)",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT a.id FROM (SELECT id, status FROM raw__orders) a JOIN (SELECT id FROM raw__customers) b USING (status)",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002004",
+      "expected_error": true
+    },
+    {
+      "id": "J04",
+      "sql": "SELECT id FROM raw__orders JOIN raw__orders ON id = id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders JOIN raw__orders ON id = id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002027",
+      "expected_error": true
+    },
+    {
+      "id": "J05",
+      "sql": "SELECT o.id FROM raw__orders o JOIN raw__customers c ON c.id = p.order_id JOIN raw__payments p ON p.order_id = o.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')), raw__payments AS (SELECT column1::INTEGER AS id, column2::INTEGER AS order_id, column3::INTEGER AS amount_cents, column4::VARCHAR AS payment_method, column5::TIMESTAMP AS paid_at, column6::VARCHAR AS status FROM VALUES (1, 1, 1700, 'credit_card', '2026-04-01 09:16:00', 'success'), (2, 2, 950, 'cash', '2026-04-02 09:30:00', 'success')) SELECT o.id FROM raw__orders o JOIN raw__customers c ON c.id = p.order_id JOIN raw__payments p ON p.order_id = o.id",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "E01",
+      "sql": "WITH a AS (SELECT id FROM raw__orders), a AS (SELECT id FROM raw__customers) SELECT id FROM a",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')), a AS (SELECT id FROM raw__orders), a AS (SELECT id FROM raw__customers) SELECT id FROM a",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "E02",
+      "sql": "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'x' FROM r WHERE n < 3) SELECT n FROM r",
+      "executed_sql": "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'x' FROM r WHERE n < 3) SELECT n FROM r",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001112",
+      "expected_error": true
+    },
+    {
+      "id": "E03",
+      "sql": "WITH a AS (SELECT id FROM b), b AS (SELECT id FROM raw__orders) SELECT id FROM a",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), a AS (SELECT id FROM b), b AS (SELECT id FROM raw__orders) SELECT id FROM a",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002003",
+      "expected_error": true
+    },
+    {
+      "id": "E04",
+      "sql": "WITH c(a, b, d) AS (SELECT id, status FROM raw__orders) SELECT a FROM c",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), c(a, b, d) AS (SELECT id, status FROM raw__orders) SELECT a FROM c",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001087",
+      "expected_error": true
+    },
+    {
+      "id": "S01",
+      "sql": "SELECT id FROM raw__orders UNION ALL SELECT id FROM raw__customers ORDER BY status",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id FROM raw__orders UNION ALL SELECT id FROM raw__customers ORDER BY status",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "S02",
+      "sql": "SELECT id, status FROM raw__orders EXCEPT SELECT id FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT id, status FROM raw__orders EXCEPT SELECT id FROM raw__customers",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001789",
+      "expected_error": true
+    },
+    {
+      "id": "S03",
+      "sql": "SELECT quantity AS x FROM raw__orders UNION ALL SELECT created_at FROM raw__customers",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT quantity AS x FROM raw__orders UNION ALL SELECT created_at FROM raw__customers",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001790",
+      "expected_error": true
+    },
+    {
+      "id": "S04",
+      "sql": "SELECT z FROM (SELECT id FROM raw__orders UNION ALL BY NAME SELECT id FROM raw__customers) u",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT z FROM (SELECT id FROM raw__orders UNION ALL BY NAME SELECT id FROM raw__customers) u",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "R01",
+      "sql": "SELECT z.* FROM raw__orders o",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT z.* FROM raw__orders o",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002001",
+      "expected_error": true
+    },
+    {
+      "id": "R02",
+      "sql": "SELECT * REPLACE (1 AS qty) FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT * REPLACE (1 AS qty) FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001431",
+      "expected_error": true
+    },
+    {
+      "id": "R03",
+      "sql": "SELECT COLUMNS('^nothing_') FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COLUMNS('^nothing_') FROM raw__orders",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002139",
+      "expected_error": false
+    },
+    {
+      "id": "R04",
+      "sql": "SELECT x.qty FROM (SELECT * FROM stg_orders) x",
+      "executed_sql": "WITH stg_orders AS (SELECT column1::INTEGER AS order_id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT x.qty FROM (SELECT * FROM stg_orders) x",
+      "verdict": "compile_error",
+      "snowflake_error_code": "000904",
+      "expected_error": true
+    },
+    {
+      "id": "R05",
+      "sql": "SELECT * FROM raw__orders o JOIN raw__customers c ON o.customer_id = c.id",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')), raw__customers AS (SELECT column1::INTEGER AS id, column2::VARCHAR AS first_name, column3::VARCHAR AS last_name, column4::VARCHAR AS email, column5::TIMESTAMP AS created_at FROM VALUES (100, 'Ann', 'Lee', 'ann@example.com', '2026-01-01 00:00:00'), (101, 'Bo', 'Ray', 'bo@example.com', '2026-01-02 00:00:00')) SELECT * FROM raw__orders o JOIN raw__customers c ON o.customer_id = c.id",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "M01",
+      "sql": "SELECT id FROM raw__orders LIMIT 'x'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders LIMIT 'x'",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "M02",
+      "sql": "SELECT id FROM raw__orders LIMIT -1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders LIMIT -1",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "M03",
+      "sql": "SELECT id FROM raw__orders LIMIT quantity",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders LIMIT quantity",
+      "verdict": "compile_error",
+      "snowflake_error_code": "001003",
+      "expected_error": true
+    },
+    {
+      "id": "M04",
+      "sql": "SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY status ORDER BY quantity",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY status ORDER BY quantity",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002024",
+      "expected_error": true
+    },
+    {
+      "id": "M05",
+      "sql": "SELECT DISTINCT status FROM raw__orders ORDER BY quantity",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DISTINCT status FROM raw__orders ORDER BY quantity",
+      "verdict": "compile_error",
+      "snowflake_error_code": "002024",
+      "expected_error": true
+    },
+    {
+      "id": "SF01",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at > '2026-01-01'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at > '2026-01-01'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF02",
+      "sql": "SELECT SUBSTR('abc', x, 1) AS s FROM (SELECT 2::NUMBER(38,0) AS x)",
+      "executed_sql": "SELECT SUBSTR('abc', x, 1) AS s FROM (SELECT 2::NUMBER(38,0) AS x)",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF03",
+      "sql": "SELECT DATEDIFF(day, '2024-01-01', '2024-01-02') AS d",
+      "executed_sql": "SELECT DATEDIFF(day, '2024-01-01', '2024-01-02') AS d",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF04",
+      "sql": "SELECT '1' IN (SELECT 1) AS x",
+      "executed_sql": "SELECT '1' IN (SELECT 1) AS x",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF05",
+      "sql": "SELECT DATEADD(day, 1, ordered_at) AS d FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DATEADD(day, 1, ordered_at) AS d FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF06",
+      "sql": "SELECT IFF(quantity > 1, 'many', 'one') AS a, NVL(status, 'x') AS b FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT IFF(quantity > 1, 'many', 'one') AS a, NVL(status, 'x') AS b FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF07",
+      "sql": "SELECT id FROM raw__orders WHERE ordered_at::TIMESTAMP_NTZ >= '2026-04-01'::DATE",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE ordered_at::TIMESTAMP_NTZ >= '2026-04-01'::DATE",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF08",
+      "sql": "SELECT status || quantity AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status || quantity AS s FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF09",
+      "sql": "SELECT PARSE_JSON('{\"a\": 1}'):a::INTEGER AS a",
+      "executed_sql": "SELECT PARSE_JSON('{\"a\": 1}'):a::INTEGER AS a",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF10",
+      "sql": "SELECT TRY_CAST(status AS INTEGER) AS x FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT TRY_CAST(status AS INTEGER) AS x FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF11",
+      "sql": "SELECT LISTAGG(status, ',') WITHIN GROUP (ORDER BY status) AS s FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT LISTAGG(status, ',') WITHIN GROUP (ORDER BY status) AS s FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF12",
+      "sql": "SELECT DATE_TRUNC('day', ordered_at) AS d FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DATE_TRUNC('day', ordered_at) AS d FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF13",
+      "sql": "SELECT id FROM raw__orders WHERE quantity = '3'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE quantity = '3'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF14",
+      "sql": "SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY ALL",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT status, COUNT(*) AS n FROM raw__orders GROUP BY ALL",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF15",
+      "sql": "SELECT * EXCLUDE (status) FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT * EXCLUDE (status) FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF16",
+      "sql": "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM raw__orders QUALIFY rn = 1",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM raw__orders QUALIFY rn = 1",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF17",
+      "sql": "SELECT f.value::INTEGER AS v FROM (SELECT PARSE_JSON('[1,2]') AS arr) t, LATERAL FLATTEN(input => t.arr) f",
+      "executed_sql": "SELECT f.value::INTEGER AS v FROM (SELECT PARSE_JSON('[1,2]') AS arr) t, LATERAL FLATTEN(input => t.arr) f",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF18",
+      "sql": "SELECT SUM(x) AS s FROM (SELECT 1.25::NUMBER(12,2) AS x)",
+      "executed_sql": "SELECT SUM(x) AS s FROM (SELECT 1.25::NUMBER(12,2) AS x)",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF19",
+      "sql": "SELECT AVG(quantity) AS a FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT AVG(quantity) AS a FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF20",
+      "sql": "SELECT MIN(status) AS a, MAX(ordered_at) AS b FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT MIN(status) AS a, MAX(ordered_at) AS b FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF21",
+      "sql": "SELECT ordered_at - INTERVAL '1 day' AS d FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT ordered_at - INTERVAL '1 day' AS d FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF22",
+      "sql": "SELECT '2026-01-01'::DATE + 1 AS d",
+      "executed_sql": "SELECT '2026-01-01'::DATE + 1 AS d",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF23",
+      "sql": "SELECT OBJECT_CONSTRUCT('a', 1) AS o, ARRAY_AGG(id) AS a FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT OBJECT_CONSTRUCT('a', 1) AS o, ARRAY_AGG(id) AS a FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF24",
+      "sql": "SELECT id FROM raw__orders WHERE (quantity > 1) = 'true'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT id FROM raw__orders WHERE (quantity > 1) = 'true'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF25",
+      "sql": "SELECT ROUND(1.234, x) AS r FROM (SELECT 1::NUMBER(38,0) AS x)",
+      "executed_sql": "SELECT ROUND(1.234, x) AS r FROM (SELECT 1::NUMBER(38,0) AS x)",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF26",
+      "sql": "SELECT COALESCE(quantity, '0') AS q FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT COALESCE(quantity, '0') AS q FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF27",
+      "sql": "SELECT DECODE(status, 'placed', 1, 0) AS d FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT DECODE(status, 'placed', 1, 0) AS d FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF28",
+      "sql": "SELECT TO_CHAR(ordered_at, 'YYYY-MM') AS m FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT TO_CHAR(ordered_at, 'YYYY-MM') AS m FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF29",
+      "sql": "SELECT SPLIT_PART(status, 'e', 1) AS p FROM raw__orders",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT SPLIT_PART(status, 'e', 1) AS p FROM raw__orders",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    },
+    {
+      "id": "SF30",
+      "sql": "SELECT quantity AS x FROM raw__orders UNION ALL SELECT '5'",
+      "executed_sql": "WITH raw__orders AS (SELECT column1::INTEGER AS id, column2::INTEGER AS customer_id, column3::INTEGER AS waffle_type_id, column4::INTEGER AS quantity, column5::TIMESTAMP AS ordered_at, column6::VARCHAR AS status FROM VALUES (1, 100, 2, 3, '2026-04-01 10:00:00', 'completed'), (2, 101, 1, 1, '2026-04-02 09:00:00', 'placed')) SELECT quantity AS x FROM raw__orders UNION ALL SELECT '5'",
+      "verdict": "valid",
+      "snowflake_error_code": null,
+      "expected_error": false
+    }
+  ]
+}

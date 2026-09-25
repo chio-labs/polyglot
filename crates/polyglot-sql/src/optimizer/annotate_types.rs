@@ -467,10 +467,7 @@ impl<'a> TypeAnnotator<'a> {
             Expression::Count(_) => Some(DataType::BigInt { length: None }),
             Expression::Sum(agg) => self.annotate_sum(&agg.this),
             Expression::SumIf(f) => self.annotate_sum(&f.this),
-            Expression::Avg(_) => Some(DataType::Double {
-                precision: None,
-                scale: None,
-            }),
+            Expression::Avg(agg) => self.annotate_avg(&agg.this),
             Expression::Min(agg) => self.annotate(&agg.this),
             Expression::Max(agg) => self.annotate(&agg.this),
             Expression::Median(agg) => {
@@ -1032,6 +1029,12 @@ impl<'a> TypeAnnotator<'a> {
             // WindowFunction
             Expression::WindowFunction(w) => {
                 self.annotate_in_place(&mut w.this);
+                for expression in &mut w.over.partition_by {
+                    self.annotate_in_place(expression);
+                }
+                for ordered in &mut w.over.order_by {
+                    self.annotate_in_place(&mut ordered.this);
+                }
             }
 
             // Subquery
@@ -1418,11 +1421,20 @@ impl<'a> TypeAnnotator<'a> {
         }
         let func_name = func.name.to_uppercase();
 
+        if self._dialect == Some(DialectType::PostgreSQL) && !func.quoted {
+            match func_name.as_str() {
+                "SUM" => return func.args.first().and_then(|arg| self.annotate_sum(arg)),
+                "AVG" => return func.args.first().and_then(|arg| self.annotate_avg(arg)),
+                _ => {}
+            }
+        }
+
         if self._dialect == Some(DialectType::DuckDB) && !func.quoted {
             match func_name.as_str() {
                 // Builder-created Function nodes use the same inference as the
                 // dedicated nodes produced when parsing these built-ins.
                 "SUM" => return func.args.first().and_then(|arg| self.annotate_sum(arg)),
+                "AVG" => return func.args.first().and_then(|arg| self.annotate_avg(arg)),
                 "COALESCE" | "IFNULL" => return self.coerce_arg_types(&func.args),
                 "DATE_TRUNC" => return self.annotate_duckdb_date_trunc(func),
                 "REGEXP_EXTRACT_ALL" => return self.annotate_duckdb_regexp_extract_all(func),
@@ -1469,6 +1481,36 @@ impl<'a> TypeAnnotator<'a> {
                 }
             }
             _ => {
+                if let Some(signature) = self._dialect.and_then(|dialect| {
+                    polyglot_sql_function_catalogs::types::type_signature(
+                        crate::validation::signatures::dialect_key(dialect),
+                        &func_name.to_lowercase(),
+                    )
+                }) {
+                    use polyglot_sql_function_catalogs::types::ReturnType;
+                    return match signature.returns {
+                        ReturnType::Average => {
+                            func.args.first().and_then(|arg| self.annotate_avg(arg))
+                        }
+                        ReturnType::Argument(index) => {
+                            func.args.get(index).and_then(|arg| self.annotate(arg))
+                        }
+                        ReturnType::Integer => Some(DataType::BigInt { length: None }),
+                        ReturnType::Numeric => Some(DataType::Double {
+                            precision: None,
+                            scale: None,
+                        }),
+                        ReturnType::String => Some(DataType::VarChar {
+                            length: None,
+                            parenthesized_length: false,
+                        }),
+                        ReturnType::Boolean => Some(DataType::Boolean),
+                        ReturnType::Timestamp => Some(DataType::Timestamp {
+                            precision: None,
+                            timezone: false,
+                        }),
+                    };
+                }
                 self.used_unknown_function_fallback = true;
                 func.args.first().and_then(|arg| self.annotate(arg))
             }
@@ -1477,7 +1519,7 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Relation outputs cannot rely on the scalar annotator's legacy fallback
     /// that assigns an unknown function the type of its first argument.
-    pub(super) fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
+    pub(crate) fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
         let mut annotator = Self::new(None, Some(dialect));
         // Probe dispatch without traversing or cloning a query argument. The
         // original annotation already supplied the type for recognized rules.
@@ -1713,8 +1755,40 @@ impl<'a> TypeAnnotator<'a> {
     }
 
     /// Annotate SUM function - promotes to at least BigInt
+    fn annotate_avg(&mut self, arg: &Expression) -> Option<DataType> {
+        if matches!(
+            self._dialect,
+            Some(DialectType::PostgreSQL | DialectType::DuckDB)
+        ) {
+            if let Some(ty @ DataType::Interval { .. }) = self.annotate(arg) {
+                return Some(ty);
+            }
+        }
+        if self._dialect == Some(DialectType::DuckDB) {
+            match self.annotate(arg) {
+                Some(DataType::Date) => {
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: false,
+                    })
+                }
+                Some(ty @ (DataType::Timestamp { .. } | DataType::Time { .. })) => return Some(ty),
+                _ => {}
+            }
+        }
+        Some(DataType::Double {
+            precision: None,
+            scale: None,
+        })
+    }
+
     fn annotate_sum(&mut self, arg: &Expression) -> Option<DataType> {
         let arg_type = self.annotate(arg);
+        if self._dialect == Some(DialectType::PostgreSQL)
+            && matches!(arg_type, Some(DataType::Interval { .. }))
+        {
+            return arg_type;
+        }
         if self._dialect == Some(DialectType::DuckDB) {
             // These are DuckDB's bound aggregate result types, not the generic
             // integer-to-BIGINT promotion. UHUGEINT binds to the DOUBLE overload.
