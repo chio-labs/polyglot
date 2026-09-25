@@ -105,9 +105,11 @@ unknown warehouse-defined functions never receive E202 by default.
 
 ### Directional set operations
 
-Snowflake set-operation compatibility is directional. Each output column retains
-its first branch's target type while checking later branches. A leading untyped
-NULL (or a missing BY NAME column) adopts the first concrete contribution.
+Snowflake set-operation compatibility is directional. Each operator checks its
+child result types and folds them into its output type, per column. Thus
+VARCHAR/NUMBER produces NUMBER, and a following BOOLEAN is rejected. Runtime
+warnings do not interrupt type folding. A leading untyped NULL (or a missing
+BY NAME column) adopts the first concrete contribution.
 Unknown type metadata remains unknown. This policy applies to UNION, UNION ALL,
 INTERSECT, EXCEPT/MINUS, and supported UNION BY NAME forms; it does not change
 scalar comparison, CASE, or other dialects' coercion policies.
@@ -119,6 +121,14 @@ any sampled VARCHAR value receives W214 for the static type pair, including when
 a particular literal succeeds. Proven compile rejections receive E215. Thus
 BOOLEAN followed by NUMBER is clean, NUMBER followed by BOOLEAN errors, and
 BOOLEAN followed by VARCHAR warns. TIMESTAMP_NTZ/TIMESTAMP_TZ direction is retained.
+
+`tests/fixtures/snowflake_set_operation_results.txt` contains the 88 measured
+non-erroring pair result types, without storage suffixes. Numeric folding retains
+precision and scale (capped at 38), uses NUMBER(18,5) for VARCHAR/numeric
+conversion, and promotes floating combinations to FLOAT. The same fold drives
+CTE/derived-table output inference. Mixed operators follow the parsed tree;
+Snowflake INTERSECT takes precedence over UNION/EXCEPT. Six engine-verified
+chains are recorded in `snowflake_set_operation_chains.json`.
 
 Recursive CTEs retain their separate anchor/recursive compatibility check: the
 existing engine fixture rejects a NUMBER anchor with VARCHAR recursive output

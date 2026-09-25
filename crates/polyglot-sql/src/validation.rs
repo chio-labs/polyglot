@@ -3166,7 +3166,7 @@ mod coercion;
 mod expressions;
 mod semantics;
 pub(crate) mod signatures;
-mod snowflake_setops;
+pub(crate) mod snowflake_setops;
 pub(crate) use semantics::check_semantics;
 
 fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<String> {

@@ -2882,6 +2882,16 @@ mod tests {
                         actual.is_none_or(|t| *t == DataType::Unknown),
                         "{dialect:?}: {actual:?}"
                     ),
+                    Snowflake => assert!(
+                        matches!(
+                            actual,
+                            Some(DataType::Decimal {
+                                precision: Some(38),
+                                scale: Some(0)
+                            })
+                        ),
+                        "{dialect:?}: {actual:?}"
+                    ),
                     Teradata if left == "INT" => assert!(
                         matches!(actual, Some(DataType::Int { .. })),
                         "{dialect:?}: {actual:?}"

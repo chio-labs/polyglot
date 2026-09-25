@@ -117,13 +117,15 @@ SELECT 1::NUMBER(38,0) AS result UNION ALL SELECT TRUE AS result;
 Unknown cast targets intentionally retain W213 because validation has no
 authoritative installed-type catalogue. The other negative controls remain errors.
 
-## Directional set-operation chain probes
+## Engine-verified set-operation chains
 
-The pair matrix is engine-verified. These additional chains exercise assumptions
-about target retention and leading NULLs that still need engine confirmation.
+The pair verdict and result-type matrices are engine-verified. Snowflake folds
+the result type at each operator node; it does not retain the original first
+branch type across the entire chain. INTERSECT binds more tightly than UNION and
+EXCEPT; explicit parentheses override precedence.
 
-Predicted: compiles; W214 because VARCHAR/numeric conversion depends on values.
-The chosen values are expected to execute successfully.
+Verified: compile error 001790. VARCHAR/NUMBER produces NUMBER, which rejects the
+following BOOLEAN. Validation emits E215 (and W214 for the earlier conversion).
 
 ```sql
 SELECT '7'::VARCHAR AS x
@@ -131,7 +133,7 @@ UNION ALL SELECT 1::NUMBER(38,0)
 UNION ALL SELECT TRUE;
 ```
 
-Predicted: compile error, after leading NULL adopts NUMBER as its target.
+Verified: compile error, after leading NULL adopts NUMBER as its target.
 
 ```sql
 SELECT NULL AS x
@@ -139,7 +141,7 @@ UNION ALL SELECT 1::NUMBER(38,0)
 UNION ALL SELECT TRUE;
 ```
 
-Predicted: compile error, because the first ARRAY target rejects the later NUMBER.
+Verified: compile error, because ARRAY/VARIANT produces ARRAY, rejecting NUMBER.
 
 ```sql
 SELECT ARRAY_CONSTRUCT(1) AS x
@@ -147,9 +149,8 @@ UNION ALL SELECT PARSE_JSON('1')
 UNION ALL SELECT 2::NUMBER(38,0);
 ```
 
-Predicted by the existing separate recursive-CTE constraint: compile error.
-Ordinary BOOLEAN-first UNION permits this numeric conversion, so recursive
-anchor behavior needs its own evidence.
+Verified: compile error 001112 under the separate recursive-CTE constraint.
+Ordinary BOOLEAN-first UNION permits this numeric conversion.
 
 ```sql
 WITH RECURSIVE orders(x) AS (
@@ -157,4 +158,21 @@ WITH RECURSIVE orders(x) AS (
   UNION ALL SELECT 1::NUMBER(38,0) FROM orders WHERE FALSE
 )
 SELECT x FROM orders;
+```
+
+Verified: runtime-only failure (W214, no blocking error). BOOLEAN/NUMBER produces
+BOOLEAN, so the final VARCHAR undergoes a value-dependent BOOLEAN conversion.
+
+```sql
+SELECT TRUE AS x
+UNION ALL SELECT 1::NUMBER(38,0)
+UNION ALL SELECT 'abc';
+```
+
+Verified: compile error. NUMBER/VARCHAR produces NUMBER(38,5), rejecting BOOLEAN.
+
+```sql
+SELECT 1::NUMBER(38,0) AS x
+UNION ALL SELECT '7'
+UNION ALL SELECT TRUE;
 ```

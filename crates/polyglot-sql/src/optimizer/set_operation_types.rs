@@ -354,6 +354,22 @@ fn combine(
     if depth > 64 || matches!(left, Unknown) || matches!(right, Unknown) {
         return Unknown;
     }
+    if dialect == DialectType::Snowflake {
+        if matches!((left, right), (Null, Null)) {
+            return Null;
+        }
+        let data_type = |value: &OutputType| match value {
+            Known(ty) => Some(ty.clone()),
+            StringLiteral(_) => Some(text_type(dialect)),
+            _ => None,
+        };
+        return crate::validation::snowflake_setops::result_type(
+            data_type(left).as_ref(),
+            data_type(right).as_ref(),
+        )
+        .map(Known)
+        .unwrap_or(Unknown);
+    }
     match (left, right) {
         (Null, Null) => match family(dialect) {
             Family::Postgres => Known(DataType::Text),

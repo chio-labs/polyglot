@@ -86,7 +86,7 @@ fn snowflake_directional_set_operation_matrix() {
 }
 
 #[test]
-fn snowflake_set_operation_chains_keep_first_target() {
+fn snowflake_set_operation_chains_fold_results() {
     let schema = ValidationSchema {
         tables: vec![],
         strict: Some(true),
@@ -100,11 +100,11 @@ fn snowflake_set_operation_chains_keep_first_target() {
         ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT 1.5", true),
         ("SELECT 1 x UNION ALL SELECT TRUE UNION ALL SELECT 1.5", false),
         ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT CURRENT_DATE", false),
-        ("SELECT 'abc'::VARCHAR x UNION ALL SELECT 1 UNION ALL SELECT TRUE", true),
+        ("SELECT 'abc'::VARCHAR x UNION ALL SELECT 1 UNION ALL SELECT TRUE", false),
         ("SELECT NULL x UNION ALL SELECT 1 UNION ALL SELECT TRUE", false),
         ("SELECT NULL x UNION ALL SELECT TRUE UNION ALL SELECT 1", true),
         ("SELECT TRUE x UNION ALL SELECT NULL UNION ALL SELECT 1", true),
-        ("SELECT CURRENT_DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ UNION ALL SELECT NULL::TIMESTAMP_TZ", true),
+        ("SELECT CURRENT_DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
         ("SELECT NULL::TIMESTAMP_NTZ x UNION ALL SELECT CURRENT_DATE UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
         ("SELECT PARSE_JSON('1') x UNION ALL SELECT 1 UNION ALL SELECT 'abc'::VARCHAR", false),
         ("SELECT TRUE x, 1 y UNION ALL BY NAME SELECT 2 y, 1 x UNION ALL BY NAME SELECT 3 x, 3 y", true),
@@ -112,7 +112,7 @@ fn snowflake_set_operation_chains_keep_first_target() {
         ("SELECT 1 x UNION ALL BY NAME SELECT TRUE y UNION ALL BY NAME SELECT 1 y", true),
         ("SELECT 1 x UNION ALL BY NAME SELECT 1 y UNION ALL BY NAME SELECT TRUE y", false),
         ("WITH orders AS (SELECT TRUE x UNION ALL SELECT 1) SELECT x FROM orders UNION ALL SELECT 2", true),
-        ("WITH orders AS (SELECT '2026-01-01'::DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ) SELECT x FROM orders UNION ALL SELECT NULL::TIMESTAMP_TZ", true),
+        ("WITH orders AS (SELECT '2026-01-01'::DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ) SELECT x FROM orders UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
         ("WITH orders AS (SELECT PARSE_JSON('1') x) SELECT x FROM orders UNION ALL SELECT 'abc'::VARCHAR", false),
         ("WITH orders AS (SELECT ARRAY_CONSTRUCT(1) x) SELECT x FROM orders UNION ALL SELECT TRUE", false),
         ("SELECT order_flag() x UNION ALL SELECT 1 UNION ALL SELECT TRUE", true),
@@ -133,6 +133,45 @@ fn snowflake_orders_schema() -> ValidationSchema {
         ]}]}),
     )
     .unwrap()
+}
+
+#[test]
+fn snowflake_measured_chain_verdicts() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/snowflake_set_operation_chains.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let sql = case["sql"].as_str().unwrap();
+        let result = validate_with_schema(
+            sql,
+            DialectType::Snowflake,
+            &ValidationSchema {
+                tables: vec![],
+                strict: Some(true),
+            },
+            &SchemaValidationOptions {
+                semantic: true,
+                check_types: true,
+                check_references: true,
+                ..Default::default()
+            },
+        );
+        let runtime = case["verdict"] == "runtime_error";
+        assert_eq!(result.valid, runtime, "{sql}: {:?}", result.errors);
+        if runtime {
+            assert!(result.errors.iter().any(|e| e.code == "W214"));
+        } else {
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.code == "E215" || e.code == "E213"),
+                "{:?}",
+                result.errors
+            );
+        }
+    }
 }
 
 #[test]
