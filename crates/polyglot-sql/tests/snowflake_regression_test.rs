@@ -9,6 +9,39 @@ use polyglot_sql::expressions::{Expression, Literal};
 use polyglot_sql::tokens::TokenType;
 use polyglot_sql::{generate, parse_one, transpile, ExpressionWalk};
 
+#[test]
+fn computed_variant_bracket_keys_preserve_formatting() {
+    for key in [
+        "TO_VARCHAR(order_id)",
+        "order_id + 1",
+        "(order_id + 1)",
+        "1 + order_id",
+        "order_id",
+    ] {
+        for suffix in ["", ".name", "[0]"] {
+            let sql = format!("SELECT payload:customers[{key}]{suffix} FROM orders");
+            let original = parse_one(&sql, DialectType::Snowflake).unwrap();
+            let formatted = polyglot_sql::format(&sql, DialectType::Snowflake)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                formatted.split_whitespace().collect::<String>(),
+                sql.split_whitespace().collect::<String>()
+            );
+            assert_eq!(
+                parse_one(&formatted, DialectType::Snowflake).unwrap(),
+                original
+            );
+        }
+    }
+    for sql in [
+        "SELECT payload:customers[TO_VARCHAR(order_id) FROM orders",
+        "SELECT payload:customers[] FROM orders",
+    ] {
+        assert!(parse_one(sql, DialectType::Snowflake).is_err());
+    }
+}
+
 fn parse_and_generate(sql: &str) -> String {
     let result = transpile(sql, DialectType::Snowflake, DialectType::Snowflake).unwrap();
     result.join(";\n")

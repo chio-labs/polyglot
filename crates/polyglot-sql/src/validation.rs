@@ -290,6 +290,14 @@ fn embedded_function_catalog_arc() -> Arc<dyn FunctionCatalog> {
             dialect_cache: HashMap::new(),
         };
         polyglot_sql_function_catalogs::register_enabled_catalogs(&mut sink);
+        // Grouping syntax is not listed in DuckDB's ordinary function catalogue.
+        for name in ["grouping", "grouping_id", "grouping sets", "cube", "rollup"] {
+            catalog.register(
+                DialectType::DuckDB,
+                name,
+                vec![CoreFunctionSignature::variadic(1)],
+            );
+        }
         Arc::new(catalog)
     });
 
@@ -2053,74 +2061,111 @@ fn projection_families(
     schema_map: &HashMap<String, TableSchemaEntry>,
     dialect: DialectType,
 ) -> Option<Vec<TypeFamily>> {
-    let pair = match query {
-        Expression::Union(query) => Some((&query.left, &query.right)),
-        Expression::Intersect(query) => Some((&query.left, &query.right)),
-        Expression::Except(query) => Some((&query.left, &query.right)),
-        _ => None,
-    };
-    if let Some((left, right)) = pair {
-        let left = projection_families(left, schema_map, dialect)?;
-        let right = projection_families(right, schema_map, dialect)?;
-        return match crate::set_operation::set_operation_layout(query, Some(dialect)).ok()? {
-            Some(layout) => Some(
-                layout
-                    .outputs
+    ProjectionTypes::default().resolve(query, schema_map, dialect)
+}
+
+#[derive(Default)]
+struct ProjectionTypes {
+    families: HashMap<*const Expression, Option<Vec<TypeFamily>>>,
+    layouts: crate::set_operation::LayoutResolver,
+}
+
+impl ProjectionTypes {
+    fn resolve(
+        &mut self,
+        query: &Expression,
+        schema_map: &HashMap<String, TableSchemaEntry>,
+        dialect: DialectType,
+    ) -> Option<Vec<TypeFamily>> {
+        let key = query as *const Expression;
+        if let Some(result) = self.families.get(&key) {
+            return result.clone();
+        }
+        let result = self.resolve_inner(query, schema_map, dialect);
+        self.families.insert(key, result.clone());
+        result
+    }
+    fn resolve_inner(
+        &mut self,
+        query: &Expression,
+        schema_map: &HashMap<String, TableSchemaEntry>,
+        dialect: DialectType,
+    ) -> Option<Vec<TypeFamily>> {
+        let pair = match query {
+            Expression::Union(query) => Some((&query.left, &query.right)),
+            Expression::Intersect(query) => Some((&query.left, &query.right)),
+            Expression::Except(query) => Some((&query.left, &query.right)),
+            _ => None,
+        };
+        if let Some((left, right)) = pair {
+            let left = self.resolve(left, schema_map, dialect)?;
+            let right = self.resolve(right, schema_map, dialect)?;
+            return match self.layouts.layout(query, Some(dialect)).ok()? {
+                Some(layout) => Some(
+                    layout
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            merged_setop_family(
+                                output
+                                    .left_ordinal
+                                    .and_then(|i| left.get(i).copied())
+                                    .unwrap_or(TypeFamily::Unknown),
+                                output
+                                    .right_ordinal
+                                    .and_then(|i| right.get(i).copied())
+                                    .unwrap_or(TypeFamily::Unknown),
+                            )
+                        })
+                        .collect(),
+                ),
+                None if left.len() == right.len() => Some(
+                    left.into_iter()
+                        .zip(right)
+                        .map(|(l, r)| merged_setop_family(l, r))
+                        .collect(),
+                ),
+                _ => None,
+            };
+        }
+        match query {
+            Expression::Select(select) => {
+                if select
+                    .expressions
                     .iter()
-                    .map(|output| {
-                        merged_setop_family(
-                            output
-                                .left_ordinal
-                                .and_then(|i| left.get(i).copied())
-                                .unwrap_or(TypeFamily::Unknown),
-                            output
-                                .right_ordinal
-                                .and_then(|i| right.get(i).copied())
-                                .unwrap_or(TypeFamily::Unknown),
-                        )
+                    .any(|e| matches!(e, Expression::Star(_) | Expression::BracedWildcard(_)))
+                {
+                    return None;
+                }
+                // References were already bound and annotated. Rebuilding a
+                // scope here only clones nested set-operation prefixes.
+                let context = TypeCheckContext {
+                    dialect: Some(dialect),
+                    ..Default::default()
+                };
+                Some(
+                    select
+                        .expressions
+                        .iter()
+                        .map(|e| infer_expression_type_family(e, schema_map, &context))
+                        .collect(),
+                )
+            }
+            Expression::Subquery(query) => self.resolve(&query.this, schema_map, dialect),
+            Expression::Paren(query) => self.resolve(&query.this, schema_map, dialect),
+            Expression::Values(values) => Some(
+                values
+                    .expressions
+                    .first()?
+                    .expressions
+                    .iter()
+                    .map(|e| {
+                        infer_expression_type_family(e, schema_map, &TypeCheckContext::default())
                     })
                     .collect(),
             ),
-            None if left.len() == right.len() => Some(
-                left.into_iter()
-                    .zip(right)
-                    .map(|(l, r)| merged_setop_family(l, r))
-                    .collect(),
-            ),
             _ => None,
-        };
-    }
-    match query {
-        Expression::Select(select) => {
-            if select
-                .expressions
-                .iter()
-                .any(|e| matches!(e, Expression::Star(_) | Expression::BracedWildcard(_)))
-            {
-                return None;
-            }
-            let mut context = collect_type_check_context(query, schema_map);
-            context.dialect = Some(dialect);
-            Some(
-                select
-                    .expressions
-                    .iter()
-                    .map(|e| infer_expression_type_family(e, schema_map, &context))
-                    .collect(),
-            )
         }
-        Expression::Subquery(query) => projection_families(&query.this, schema_map, dialect),
-        Expression::Paren(query) => projection_families(&query.this, schema_map, dialect),
-        Expression::Values(values) => Some(
-            values
-                .expressions
-                .first()?
-                .expressions
-                .iter()
-                .map(|e| infer_expression_type_family(e, schema_map, &TypeCheckContext::default()))
-                .collect(),
-        ),
-        _ => None,
     }
 }
 
@@ -2133,18 +2178,19 @@ fn check_set_operation_compatibility(
     schema_map: &HashMap<String, TableSchemaEntry>,
     strict: bool,
     errors: &mut Vec<ValidationError>,
+    projections: &mut ProjectionTypes,
 ) {
-    let Some(mut left_projection) = projection_families(left_expr, schema_map, dialect) else {
+    let Some(mut left_projection) = projections.resolve(left_expr, schema_map, dialect) else {
         return;
     };
-    let Some(mut right_projection) = projection_families(right_expr, schema_map, dialect) else {
+    let Some(mut right_projection) = projections.resolve(right_expr, schema_map, dialect) else {
         return;
     };
     let mut source_ordinals: Vec<_> = (0..left_projection.len())
         .map(|index| (index, index))
         .collect();
 
-    match crate::set_operation::set_operation_layout(query, Some(dialect)) {
+    match projections.layouts.layout(query, Some(dialect)) {
         Ok(Some(layout)) => {
             source_ordinals = layout
                 .outputs
@@ -2458,11 +2504,14 @@ fn check_types(
     known_types: &[String],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let mut context = collect_type_check_context(stmt, schema_map);
-    context.dialect = Some(dialect);
+    let context = TypeCheckContext {
+        dialect: Some(dialect),
+        ..Default::default()
+    };
     // An unmodelled dialect must never inherit another engine's coercion errors.
     let catalogue_strict = strict;
     let strict = strict && coercion::covered(dialect);
+    let mut projections = ProjectionTypes::default();
 
     for node in stmt.dfs() {
         for (clause, predicate) in crate::binding::predicates(node) {
@@ -2525,6 +2574,7 @@ fn check_types(
                     schema_map,
                     strict,
                     &mut errors,
+                    &mut projections,
                 );
             }
             Expression::Intersect(intersect) => {
@@ -2537,6 +2587,7 @@ fn check_types(
                     schema_map,
                     strict,
                     &mut errors,
+                    &mut projections,
                 );
             }
             Expression::Except(except) => {
@@ -2549,6 +2600,7 @@ fn check_types(
                     schema_map,
                     strict,
                     &mut errors,
+                    &mut projections,
                 );
             }
             Expression::And(op) | Expression::Or(op) => {
@@ -3312,9 +3364,22 @@ fn bind_scope_projection_aliases(
         return;
     }
 
+    // Only aliases used as local references need a type during binding. Output
+    // types are annotated once on the final bound statement. Re-annotating all
+    // preceding CTEs for every unused output makes wide CTE chains quadratic.
+    let referenced: HashSet<_> = walk_in_scope(&scope.expression, false)
+        .filter_map(|node| match node {
+            Expression::Column(column) if column.table.is_none() => {
+                Some(normalize_identifier(column.name.clone(), strategy).name)
+            }
+            _ => None,
+        })
+        .filter(|name| !inputs.contains(name))
+        .collect();
     // A child SELECT can use CTEs declared in a containing WITH. Reconstruct
     // that lexical catalogue for type inference, in original declaration order.
-    let mut ctes: Vec<_> = if check_types {
+    let needs_alias_types = check_types && !referenced.is_empty();
+    let mut ctes: Vec<_> = if needs_alias_types {
         scope
             .cte_sources
             .values()
@@ -3334,7 +3399,7 @@ fn bind_scope_projection_aliases(
     // Keep the original sources/CTEs for scoped type inference, without copying
     // the entire projection list for each alias. Bound uses are constant-size.
     let mut projections = std::mem::take(&mut select.expressions);
-    let mut type_select = check_types.then(|| select.clone());
+    let mut type_select = needs_alias_types.then(|| select.clone());
     if let Some(type_select) = type_select.as_mut().filter(|_| !ctes.is_empty()) {
         type_select.with = Some(crate::expressions::With {
             ctes,
@@ -3368,6 +3433,9 @@ fn bind_scope_projection_aliases(
         bindings.extend(references);
         if let Expression::Alias(alias) = projection {
             let name = normalize_identifier(alias.alias.clone(), strategy).name;
+            if !referenced.contains(&name) {
+                continue;
+            }
             // Duplicate names are not evidence of an unambiguous binding.
             if aliases.contains_key(&name) {
                 aliases.insert(name, None);
@@ -3680,6 +3748,15 @@ fn validate_scope_columns(
     // Nested input queries still receive their own lexical validation pass.
     let mut pivot_inputs = HashSet::new();
     for node in walk_in_scope(&expression, false) {
+        if let Expression::Unpivot(unpivot) = node {
+            for operand in &unpivot.columns {
+                for node in walk_in_scope(operand, false) {
+                    if let Expression::Column(column) = node {
+                        pivot_inputs.insert(column.as_ref() as *const _);
+                    }
+                }
+            }
+        }
         if let Expression::Pivot(pivot) = node {
             for operand in pivot
                 .expressions

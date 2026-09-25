@@ -3065,7 +3065,9 @@ impl Dialect {
     pub fn generate_pretty(&self, expr: &Expression) -> Result<String> {
         let mut config = self.get_config_for_expr(expr);
         config.pretty = true;
-        let mut generator = Generator::with_config(config).with_preserved_null_ordering();
+        let mut generator = Generator::with_config(config)
+            .with_preserved_null_ordering()
+            .with_preserved_variant_paths();
         generator.generate(expr)
     }
 

@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 pub struct Generator {
     /// Formatting preserves the parsed null-ordering clauses instead of normalizing them.
     preserve_null_ordering: bool,
+    preserve_variant_paths: bool,
     config: Arc<GeneratorConfig>,
     output: String,
     unsupported_messages: Vec<String>,
@@ -2201,6 +2202,7 @@ impl Generator {
     pub(crate) fn with_arc_config(config: Arc<GeneratorConfig>) -> Self {
         Self {
             preserve_null_ordering: false,
+            preserve_variant_paths: false,
             config,
             output: String::new(),
             unsupported_messages: Vec::new(),
@@ -2217,9 +2219,15 @@ impl Generator {
         self
     }
 
+    pub(crate) fn with_preserved_variant_paths(mut self) -> Self {
+        self.preserve_variant_paths = true;
+        self
+    }
+
     fn child_generator(&self) -> Self {
         let mut generator = Self::with_arc_config(self.config.clone());
         generator.preserve_null_ordering = self.preserve_null_ordering;
+        generator.preserve_variant_paths = self.preserve_variant_paths;
         generator
     }
 
@@ -27993,6 +28001,7 @@ impl Generator {
         };
         let mut gen = Generator::with_config(config);
         gen.preserve_null_ordering = self.preserve_null_ordering;
+        gen.preserve_variant_paths = self.preserve_variant_paths;
         gen.generate_expression(expr)?;
         Ok(gen.output)
     }
@@ -33291,12 +33300,23 @@ impl Generator {
         // Otherwise output JSON_EXTRACT(this, expression)
         if e.variant_extract.is_some() {
             use crate::dialects::DialectType;
-            if matches!(self.config.dialect, Some(DialectType::Databricks)) {
+            if matches!(self.config.dialect, Some(DialectType::Databricks))
+                || (self.preserve_variant_paths
+                    && self.config.dialect == Some(DialectType::Snowflake))
+            {
                 // Databricks: output col:path syntax (e.g., c1:price, c1:price.foo, c1:price.bar[1])
                 // Keys that are not safe identifiers (contain hyphens, spaces, etc.) must use
                 // bracket notation: c:["x-y"] instead of c:x-y
                 self.generate_expression(&e.this)?;
-                self.write(":");
+                self.write(
+                    if self.preserve_variant_paths
+                        && matches!(e.this.as_ref(), Expression::Subscript(_))
+                    {
+                        "."
+                    } else {
+                        ":"
+                    },
+                );
                 match e.expression.as_ref() {
                     Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_)) => {
                         let Literal::String(s) = lit.as_ref() else {

@@ -416,6 +416,7 @@ pub fn condition(sql: &str) -> Expr {
 /// Create a `COUNT(expr)` expression.
 pub fn count(expr: Expr) -> Expr {
     Expr(Expression::Count(Box::new(CountFunc {
+        span: None,
         this: Some(expr.0),
         star: false,
         distinct: false,
@@ -429,6 +430,7 @@ pub fn count(expr: Expr) -> Expr {
 /// Create a `COUNT(*)` expression.
 pub fn count_star() -> Expr {
     Expr(Expression::Count(Box::new(CountFunc {
+        span: None,
         this: None,
         star: true,
         distinct: false,
@@ -442,6 +444,7 @@ pub fn count_star() -> Expr {
 /// Create a `COUNT(DISTINCT expr)` expression.
 pub fn count_distinct(expr: Expr) -> Expr {
     Expr(Expression::Count(Box::new(CountFunc {
+        span: None,
         this: Some(expr.0),
         star: false,
         distinct: true,

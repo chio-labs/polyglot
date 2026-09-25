@@ -10,6 +10,55 @@ use crate::expressions::{Expression, Identifier};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+/// Request-local output-name cache for an immutable query tree.
+#[derive(Default)]
+pub(crate) struct LayoutResolver {
+    names: HashMap<*const Expression, Result<Vec<Identifier>, SetOperationLayoutError>>,
+}
+
+impl LayoutResolver {
+    pub(crate) fn names(
+        &mut self,
+        query: &Expression,
+        dialect: Option<DialectType>,
+    ) -> Result<Vec<Identifier>, SetOperationLayoutError> {
+        let key = query as *const Expression;
+        if let Some(names) = self.names.get(&key) {
+            return names.clone();
+        }
+        let result = if let Some(op) = set_operation_ref(query) {
+            match self.layout(query, dialect)? {
+                Some(layout) => Ok(layout
+                    .outputs
+                    .into_iter()
+                    .map(|output| output.identifier)
+                    .collect()),
+                None => self.names(op.left, dialect),
+            }
+        } else {
+            query_output_identifiers(query, dialect)
+        };
+        self.names.insert(key, result.clone());
+        result
+    }
+
+    pub(crate) fn layout(
+        &mut self,
+        query: &Expression,
+        dialect: Option<DialectType>,
+    ) -> Result<Option<SetOperationLayout>, SetOperationLayoutError> {
+        let Some(op) = set_operation_ref(query) else {
+            return Ok(None);
+        };
+        if alignment_mode(&op, dialect).is_none() {
+            return Ok(None);
+        }
+        let left = self.names(op.left, dialect)?;
+        let right = self.names(op.right, dialect)?;
+        set_operation_layout_from_identifiers(query, dialect, &left, &right)
+    }
+}
+
 /// One output of an immediate name-aligned set operation.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SetOperationOutput {
@@ -100,12 +149,29 @@ pub(crate) fn set_operation_layout(
     let Some(set_op) = set_operation_ref(expression) else {
         return Ok(None);
     };
-    let Some(mode) = alignment_mode(&set_op, dialect) else {
+    let Some(_) = alignment_mode(&set_op, dialect) else {
         return Ok(None);
     };
 
     let left = query_output_identifiers(set_op.left, dialect)?;
     let right = query_output_identifiers(set_op.right, dialect)?;
+    set_operation_layout_from_identifiers(expression, dialect, &left, &right)
+}
+
+/// Build an immediate layout from already resolved child outputs. Type inference
+/// uses this to avoid recursively rediscovering every prefix of a UNION chain.
+pub(crate) fn set_operation_layout_from_identifiers(
+    expression: &Expression,
+    dialect: Option<DialectType>,
+    left: &[Identifier],
+    right: &[Identifier],
+) -> Result<Option<SetOperationLayout>, SetOperationLayoutError> {
+    let Some(set_op) = set_operation_ref(expression) else {
+        return Ok(None);
+    };
+    let Some(mode) = alignment_mode(&set_op, dialect) else {
+        return Ok(None);
+    };
     let left_index = identifier_index(&left, dialect)?;
     let right_index = identifier_index(&right, dialect)?;
 

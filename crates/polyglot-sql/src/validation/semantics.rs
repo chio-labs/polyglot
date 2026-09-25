@@ -45,8 +45,14 @@ fn issue(node: &Expression, code: &str, message: &str) -> ValidationError {
         Expression::Column(column) => column.span.or(column.name.span),
         Expression::Identifier(identifier) => identifier.span,
         Expression::Star(star) => star.span,
+        Expression::Count(count) if count.span.is_some() => count.span,
+        Expression::Function(function) if function.span.is_some() => function.span,
         _ => walk_in_scope(node, false).find_map(|node| match node {
             Expression::Column(column) => column.span.or(column.name.span),
+            Expression::Identifier(identifier) => identifier.span,
+            Expression::Star(star) => star.span,
+            Expression::Count(count) => count.span,
+            Expression::Function(function) => function.span,
             _ => None,
         }),
     };
@@ -214,7 +220,9 @@ fn grouping(
                 | Expression::Cube(_)
                 | Expression::Rollup(_)
                 | Expression::Tuple(_)
-        ) {
+                | Expression::Paren(_)
+        ) || matches!(node, Expression::Function(function) if !function.quoted && matches!(function.name.to_ascii_uppercase().as_str(), "GROUPING SETS" | "CUBE" | "ROLLUP"))
+        {
             pending.extend(node.children());
         }
     }

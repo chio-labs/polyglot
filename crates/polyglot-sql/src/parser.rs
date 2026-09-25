@@ -31451,7 +31451,7 @@ impl Parser {
                 // Handle array index: [0], [1], [*], ['key'], ["key"], etc.
                 if self.match_token(TokenType::LBracket) {
                     // Parse the index expression (typically a number, identifier, * for wildcard, or string key)
-                    if self.check(TokenType::Number) {
+                    if self.check(TokenType::Number) && self.check_next(TokenType::RBracket) {
                         path_string.push('[');
                         let idx = self.advance_text()?;
                         path_string.push_str(&idx);
@@ -31464,7 +31464,8 @@ impl Parser {
                         path_string.push('*');
                         self.expect(TokenType::RBracket)?;
                         path_string.push(']');
-                    } else if self.check(TokenType::String) {
+                    } else if self.check(TokenType::String) && self.check_next(TokenType::RBracket)
+                    {
                         // Single-quoted string key access: ['bicycle']
                         // Databricks preserves string-key access as bracket notation, even
                         // for safe identifiers. Other dialects keep the older normalization
@@ -31513,15 +31514,19 @@ impl Parser {
                             }
                         }
                         path_string.push_str("\"]");
-                    } else if self.is_identifier_token() {
-                        // Check if this is a "dynamic bracket" — a column reference like s.x
-                        // inside brackets. We detect this by checking if the identifier is
-                        // followed by a dot (making it a qualified column reference).
+                    } else if self.is_identifier_token()
+                        || self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                    {
+                        // Snowflake bracket keys are expressions, including function
+                        // calls, arithmetic, and unqualified columns. Other dialects
+                        // retain the existing qualified-column dynamic-key behavior.
                         let saved_bracket_pos = self.current;
                         let ident_text = self.advance_text()?;
-                        if self.check(TokenType::Dot) {
-                            // Dynamic bracket: [s.x] where s.x is a column reference
-                            // Backtrack to before the identifier so we can parse the full expression
+                        if self.check(TokenType::Dot)
+                            || self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                        {
+                            // Backtrack so the normal expression parser consumes the
+                            // complete key, rather than mistaking a function for a name.
                             self.current = saved_bracket_pos;
                             // Parse the full expression inside the brackets
                             let index_expr = self.parse_expression()?;
@@ -37384,6 +37389,7 @@ impl Parser {
         match canonical_upper_name {
             // COUNT function
             "COUNT" => {
+                let count_start = self.tokens[self.current.saturating_sub(2)].span;
                 let (this, star, distinct) = if self.check(TokenType::RParen) {
                     (None, false, false)
                 } else if self.match_token(TokenType::Star) {
@@ -37483,6 +37489,7 @@ impl Parser {
                     None
                 };
                 Ok(Expression::Count(Box::new(CountFunc {
+                    span: Some(count_start.through(self.previous().span)),
                     this,
                     star,
                     distinct,

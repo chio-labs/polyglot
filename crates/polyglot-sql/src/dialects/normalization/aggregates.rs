@@ -866,6 +866,7 @@ pub(super) fn rewrite(
                             inferred_type: None,
                         }));
                         Ok(Expression::Count(Box::new(crate::expressions::CountFunc {
+                            span: None,
                             this: Some(case_expr),
                             star: false,
                             distinct: true,

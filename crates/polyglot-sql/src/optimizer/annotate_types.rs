@@ -2673,6 +2673,16 @@ fn annotate_scoped_expression_with_outer(
     dialect: Option<DialectType>,
     outer: Option<&dyn Schema>,
 ) -> OutputColumns {
+    annotate_scoped_outputs(expression, parent, dialect, outer, true)
+}
+
+fn annotate_scoped_outputs(
+    expression: &mut Expression,
+    parent: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+    outer: Option<&dyn Schema>,
+    resolve_outputs: bool,
+) -> OutputColumns {
     match expression {
         Expression::Select(select) => annotate_select(select, parent, dialect, outer),
         Expression::Subquery(subquery) => {
@@ -2692,33 +2702,35 @@ fn annotate_scoped_expression_with_outer(
         Expression::Union(union) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut union.with, &mut schema, dialect, outer);
-            annotate_scoped_expression_with_outer(&mut union.left, Some(&schema), dialect, outer);
-            annotate_scoped_expression_with_outer(&mut union.right, Some(&schema), dialect, outer);
-            super::set_operation_types::query_columns(expression, dialect)
+            annotate_scoped_outputs(&mut union.left, Some(&schema), dialect, outer, false);
+            annotate_scoped_outputs(&mut union.right, Some(&schema), dialect, outer, false);
+            if resolve_outputs {
+                super::set_operation_types::query_columns(expression, dialect)
+            } else {
+                Vec::new()
+            }
         }
         Expression::Intersect(intersect) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut intersect.with, &mut schema, dialect, outer);
-            annotate_scoped_expression_with_outer(
-                &mut intersect.left,
-                Some(&schema),
-                dialect,
-                outer,
-            );
-            annotate_scoped_expression_with_outer(
-                &mut intersect.right,
-                Some(&schema),
-                dialect,
-                outer,
-            );
-            super::set_operation_types::query_columns(expression, dialect)
+            annotate_scoped_outputs(&mut intersect.left, Some(&schema), dialect, outer, false);
+            annotate_scoped_outputs(&mut intersect.right, Some(&schema), dialect, outer, false);
+            if resolve_outputs {
+                super::set_operation_types::query_columns(expression, dialect)
+            } else {
+                Vec::new()
+            }
         }
         Expression::Except(except) => {
             let mut schema = ScopedSchema::new(parent, dialect);
             annotate_with(&mut except.with, &mut schema, dialect, outer);
-            annotate_scoped_expression_with_outer(&mut except.left, Some(&schema), dialect, outer);
-            annotate_scoped_expression_with_outer(&mut except.right, Some(&schema), dialect, outer);
-            super::set_operation_types::query_columns(expression, dialect)
+            annotate_scoped_outputs(&mut except.left, Some(&schema), dialect, outer, false);
+            annotate_scoped_outputs(&mut except.right, Some(&schema), dialect, outer, false);
+            if resolve_outputs {
+                super::set_operation_types::query_columns(expression, dialect)
+            } else {
+                Vec::new()
+            }
         }
         _ => {
             if let Some(mut selected) = crate::binding::dml_scope(expression) {
