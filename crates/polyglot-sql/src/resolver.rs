@@ -465,7 +465,7 @@ impl<'a> Resolver<'a> {
         unpivot_output_columns(unpivot, pre_columns, self.dialect)
     }
 
-    fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
+    pub(crate) fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
         match source {
             Expression::Table(table) => {
                 if table.schema.is_none() && table.catalog.is_none() {

@@ -3568,6 +3568,31 @@ enum OutputNameResolution {
     InputFirst,
 }
 
+/// Return an exact width only when it is independent of unknown source columns.
+fn known_relation_width(source: &Expression, resolver: &Resolver<'_>) -> Option<usize> {
+    match source {
+        Expression::Select(select) if select.expressions.iter().any(|expr| expr.dfs().any(|node|
+            matches!(node, Expression::Function(function) if function.name.eq_ignore_ascii_case("columns"))
+        )) => None,
+        Expression::Select(select)
+            if !select.expressions.iter().any(|expr| {
+                matches!(expr, Expression::Star(_) | Expression::BracedWildcard(_))
+            }) =>
+        {
+            Some(select.expressions.len())
+        }
+        Expression::Values(values) => values.expressions.first().map(|row| row.expressions.len()),
+        Expression::Subquery(query) => known_relation_width(&query.this, resolver),
+        Expression::Alias(alias) => known_relation_width(&alias.this, resolver),
+        Expression::Paren(paren) => known_relation_width(&paren.this, resolver),
+        _ => {
+            let columns = resolver.get_source_output_columns(source);
+            (!columns.is_empty() && !columns.iter().any(|name| name == "*"))
+                .then_some(columns.len())
+        }
+    }
+}
+
 /// Recognize the select-list ordering keyword only in its supported clause form.
 fn is_order_by_all(order_by: &crate::expressions::OrderBy, dialect: DialectType) -> bool {
     if !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) || order_by.siblings {
@@ -3743,16 +3768,70 @@ fn validate_scope_columns(
         .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
         .collect();
 
+    if matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) {
+        let resolver = Resolver::new(scope, resolver_schema, true);
+        for node in select
+            .from
+            .iter()
+            .flat_map(|from| &from.expressions)
+            .chain(select.joins.iter().map(|join| &join.this))
+        {
+            let (source, aliases) = match node {
+                Expression::Subquery(query) => (&query.this, &query.column_aliases),
+                Expression::Alias(alias) => (&alias.this, &alias.column_aliases),
+                _ => continue,
+            };
+            if !aliases.is_empty()
+                && known_relation_width(source, &resolver)
+                    .is_some_and(|width| aliases.len() > width)
+            {
+                errors.push(reference_diagnostic(
+                    "Derived-table column alias count exceeds its output column count".to_owned(),
+                    validation_codes::E_CTE_COLUMN_COUNT_MISMATCH,
+                    strict,
+                    aliases.last().and_then(|alias| alias.span),
+                ));
+            }
+        }
+    }
+
     // Pivot operands refer to the pre-pivot relation, not the output relation
     // indexed above. Do not falsely bind them against generated pivot columns.
     // Nested input queries still receive their own lexical validation pass.
     let mut pivot_inputs = HashSet::new();
     for node in walk_in_scope(&expression, false) {
         if let Expression::Unpivot(unpivot) = node {
+            let resolver = Resolver::new(scope, resolver_schema, true);
+            let columns = resolver.get_source_output_columns(&unpivot.this);
+            let identifiers = source_output_identifiers(&unpivot.this);
+            let input_names: HashSet<_> = columns
+                .iter()
+                .map(|name| {
+                    let identifier = identifiers
+                        .iter()
+                        .find(|id| id.name == *name)
+                        .copied()
+                        .cloned()
+                        .unwrap_or_else(|| crate::binding::schema_identifier(name));
+                    normalize_identifier(identifier, strategy).name
+                })
+                .collect();
+            let closed = !columns.is_empty() && !columns.iter().any(|name| name == "*");
             for operand in &unpivot.columns {
                 for node in walk_in_scope(operand, false) {
                     if let Expression::Column(column) = node {
                         pivot_inputs.insert(column.as_ref() as *const _);
+                        if closed
+                            && !input_names
+                                .contains(&normalize_identifier(column.name.clone(), strategy).name)
+                        {
+                            errors.push(reference_diagnostic(
+                                format!("Unknown UNPIVOT input column '{}'", column.name.name),
+                                validation_codes::E_UNKNOWN_COLUMN,
+                                strict,
+                                column.span.or(column.name.span),
+                            ));
+                        }
                     }
                 }
             }

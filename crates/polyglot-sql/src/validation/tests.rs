@@ -3,6 +3,79 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn semantic_followups_closed_relation_negative_controls() {
+    let result = validate_with_schema(
+        "SELECT t.a FROM (SELECT COLUMNS(*) FROM orders) t(a,b)",
+        DialectType::DuckDB,
+        &semantic_type_schema(),
+        &SchemaValidationOptions {
+            semantic: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|error| error.code == validation_codes::E_CTE_COLUMN_COUNT_MISMATCH),
+        "{:?}",
+        result.errors
+    );
+    for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
+        for check_types in [false, true] {
+            let options = SchemaValidationOptions {
+                semantic: true,
+                check_types,
+                ..Default::default()
+            };
+            for (sql, code) in [
+                ("SELECT t.a FROM (SELECT 1,2) t(a,b,c)", validation_codes::E_CTE_COLUMN_COUNT_MISMATCH),
+                ("SELECT v.a FROM (VALUES (1,2)) v(a,b,c)", validation_codes::E_CTE_COLUMN_COUNT_MISMATCH),
+                ("SELECT t.a FROM (SELECT * FROM orders) t(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p)", validation_codes::E_CTE_COLUMN_COUNT_MISMATCH),
+                ("SELECT value,name FROM (SELECT 1 col1,2 col2) UNPIVOT (value FOR name IN (col1,missing))", "E201"),
+                ("WITH input AS (SELECT 1 col1,2 col2) SELECT value,name FROM input UNPIVOT (value FOR name IN (col1,missing))", "E201"),
+            ] {
+                let result = validate_with_schema(sql, dialect, &semantic_type_schema(), &options);
+                assert!(!result.valid && result.errors.iter().any(|error| error.code == code), "{dialect:?}, types={check_types}: {sql}: {:?}", result.errors);
+            }
+            for sql in [
+                "SELECT t.a FROM (SELECT 1,2) t(a)",
+                "SELECT v.a FROM (VALUES (1,2)) v(a)",
+                "SELECT t.a FROM (SELECT 1,2) t(a,b)",
+                "SELECT v.a FROM (VALUES (1,2)) v(a,b)",
+                "SELECT value,name FROM (SELECT 1 col1,2 col2) UNPIVOT (value FOR name IN (col1,col2))",
+            ] {
+                let result = validate_with_schema(sql, dialect, &semantic_type_schema(), &options);
+                assert!(result.valid, "{dialect:?}, types={check_types}: {sql}: {:?}", result.errors);
+            }
+            for sql in [
+                "SELECT t.a FROM (SELECT * FROM unknown_orders) t(a,b,c)",
+                "SELECT value,name FROM unknown_orders UNPIVOT (value FOR name IN (col1,missing))",
+            ] {
+                let result = validate_with_schema(
+                    sql,
+                    dialect,
+                    &ValidationSchema {
+                        tables: vec![],
+                        strict: None,
+                    },
+                    &options,
+                );
+                assert!(
+                    !result
+                        .errors
+                        .iter()
+                        .any(|error| matches!(error.code.as_str(), "E201")
+                            || error.code == validation_codes::E_CTE_COLUMN_COUNT_MISMATCH),
+                    "{sql}: {:?}",
+                    result.errors
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn semantic_followups_relation_aliases_unpivot_and_grouping() {
     let schema = semantic_type_schema();
     for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
