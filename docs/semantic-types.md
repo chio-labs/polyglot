@@ -41,7 +41,7 @@ to VARCHAR. NULL and unknown input types are not rejected.
 | String literal to date/time/timestamp | yes | yes | yes | yes |
 | String literal to boolean | yes | yes | yes | no |
 | String/scalar set-operation combination | yes | no | yes | no |
-| Boolean/numeric set-operation combination | yes | no | no | no |
+| Boolean/numeric set-operation combination | yes | no | BOOLEAN first only | no |
 | Numeric WHERE/HAVING/ON predicates | yes | no | no | no |
 
 Numeric-family widening and date/timestamp compatibility are shared. Arithmetic
@@ -102,6 +102,57 @@ Snowflake uses a partial built-in arity table, not an allowlist of function name
 unknown warehouse-defined functions never receive E202 by default.
 
 ## Snowflake engine regression fixture
+
+### Directional set operations
+
+Snowflake set-operation compatibility is directional. Each operator checks its
+child result types and folds them into its output type, per column. Thus
+VARCHAR/NUMBER produces NUMBER, and a following BOOLEAN is rejected. Runtime
+warnings do not interrupt type folding. A leading untyped NULL (or a missing
+BY NAME column) adopts the first concrete contribution.
+Unknown type metadata remains unknown. This policy applies to UNION, UNION ALL,
+INTERSECT, EXCEPT/MINUS, and supported UNION BY NAME forms; it does not change
+scalar comparison, CASE, or other dialects' coercion policies.
+
+`tests/fixtures/snowflake_set_operation_matrix.txt` records only type labels and
+verdicts from 156 synthetic engine probes, plus 13 same-type controls. Tests cover
+all pairs through seven operator forms. A pair that fails during execution for
+any sampled VARCHAR value receives W214 for the static type pair, including when
+a particular literal succeeds. Proven compile rejections receive E215. Thus
+BOOLEAN followed by NUMBER is clean, NUMBER followed by BOOLEAN errors, and
+BOOLEAN followed by VARCHAR warns. TIMESTAMP_NTZ/TIMESTAMP_TZ direction is retained.
+
+`tests/fixtures/snowflake_set_operation_results.txt` contains the 88 measured
+non-erroring pair result types, without storage suffixes. Numeric folding retains
+precision and scale (capped at 38), uses NUMBER(18,5) for VARCHAR/numeric
+conversion, and promotes floating combinations to FLOAT. The same fold drives
+CTE/derived-table output inference. Mixed operators follow the parsed tree;
+Snowflake INTERSECT takes precedence over UNION/EXCEPT. Six engine-verified
+chains are recorded in `snowflake_set_operation_chains.json`.
+
+Recursive CTEs retain their separate anchor/recursive compatibility check: the
+existing engine fixture rejects a NUMBER anchor with VARCHAR recursive output
+at compilation (001112), although ordinary UNION accepts that type pair with
+runtime conversion. The ordinary set-operation node still uses the directional
+matrix. Recursive conversions require separate engine evidence before relaxing
+that additional constraint.
+
+Additional synthetic controls are in
+[`snowflake-semantic-controls.md`](snowflake-semantic-controls.md). Hierarchy
+pseudo-columns are scoped to CONNECT BY queries; lateral function arguments
+exclude that function's own generated outputs. Multi-argument COUNT retains its
+aggregate identity. Comments on projections are transparent to UNION BY NAME
+output alignment. Snowflake timestamp/date constructors and calendar extractors
+have explicit return types; an unmodelled function result stays unknown instead
+of inheriting its first argument's type through CASE expressions.
+
+Timestamp conversions and constructors retain their NTZ/LTZ/TZ subtype. Plain
+TO_TIMESTAMP, TRY_TO_TIMESTAMP, TIMESTAMP_FROM_PARTS and TIMESTAMP casts use the
+default NTZ mapping. LTZ output metadata is preserved; its unmeasured set-operation
+pairs retain the existing conservative compatibility policy.
+
+LATERAL subqueries inherit only preceding sources, including in nested correlated
+queries. Their local FROM sources remain available and may shadow outer aliases.
 
 ### Scope and source-location follow-ups
 

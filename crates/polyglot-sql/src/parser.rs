@@ -10588,6 +10588,10 @@ impl Parser {
                     strict,
                     on_columns,
                 }));
+                // INTERSECT binds more tightly than UNION and EXCEPT on Snowflake.
+                if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+                    result = Self::snowflake_intersect_precedence(result);
+                }
                 found_set_op = true;
             } else if self.check_set_operation_start(TokenType::Except) {
                 self.skip();
@@ -10645,6 +10649,42 @@ impl Parser {
             self.parse_set_operation_modifiers(&mut result)?;
         }
         Ok(result)
+    }
+
+    fn snowflake_intersect_precedence(expression: Expression) -> Expression {
+        let Expression::Intersect(mut intersect) = expression else {
+            return expression;
+        };
+        match std::mem::replace(&mut intersect.left, Expression::null()) {
+            Expression::Annotated(mut annotated) => {
+                intersect.left = std::mem::replace(&mut annotated.this, Expression::null());
+                annotated.this =
+                    Self::snowflake_intersect_precedence(Expression::Intersect(intersect));
+                Expression::Annotated(annotated)
+            }
+            Expression::Union(mut outer) => {
+                intersect.left = std::mem::replace(&mut outer.right, Expression::null());
+                outer.order_by = intersect.order_by.take();
+                outer.limit = intersect.limit.take();
+                outer.offset = intersect.offset.take();
+                outer.right =
+                    Self::snowflake_intersect_precedence(Expression::Intersect(intersect));
+                Expression::Union(outer)
+            }
+            Expression::Except(mut outer) => {
+                intersect.left = std::mem::replace(&mut outer.right, Expression::null());
+                outer.order_by = intersect.order_by.take();
+                outer.limit = intersect.limit.take();
+                outer.offset = intersect.offset.take();
+                outer.right =
+                    Self::snowflake_intersect_precedence(Expression::Intersect(intersect));
+                Expression::Except(outer)
+            }
+            left => {
+                intersect.left = left;
+                Expression::Intersect(intersect)
+            }
+        }
     }
 
     /// Canonicalize a VALUES set-operation branch as a SELECT from a derived table.
@@ -37450,18 +37490,12 @@ impl Parser {
                             }
                         }
                         self.expect(TokenType::RParen)?;
-                        // Multiple args without DISTINCT - treat as generic function
-                        return Ok(Expression::Function(Box::new(Function {
-                            name: name.to_string(),
-                            args,
-                            distinct: false,
-                            trailing_comments: Vec::new(),
-                            use_bracket_syntax: false,
-                            no_parens: false,
-                            quoted: false,
-                            span: None,
-                            inferred_type: None,
-                        })));
+                        // Multi-argument COUNT is still an aggregate (Snowflake).
+                        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+                            let filter = self.parse_filter_clause()?;
+                            return Ok(Self::make_simple_aggregate(name, args, false, filter));
+                        }
+                        return Ok(Self::make_unquoted_function(name, args));
                     }
                     (Some(first_expr), false, false)
                 };

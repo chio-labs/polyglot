@@ -397,6 +397,7 @@ impl<'a> Resolver<'a> {
     /// Get the alias or name for a select expression
     fn get_expression_alias(&self, expr: &Expression) -> Option<String> {
         match expr {
+            Expression::Annotated(annotated) => self.get_expression_alias(&annotated.this),
             Expression::Alias(alias) => Some(alias.alias.name.clone()),
             Expression::Column(col) => Some(col.name.name.clone()),
             Expression::Star(_) => Some("*".to_string()),

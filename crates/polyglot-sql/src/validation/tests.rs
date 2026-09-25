@@ -3,6 +3,458 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn snowflake_timestamp_subtypes_survive_conversions_and_constructors() {
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    for suffix in ["", "_NTZ", "_LTZ", "_TZ"] {
+        let expected = match suffix {
+            "_NTZ" => DataType::Custom {
+                name: "TIMESTAMPNTZ".into(),
+            },
+            "_LTZ" => DataType::Custom {
+                name: "TIMESTAMPLTZ".into(),
+            },
+            _ => DataType::Timestamp {
+                precision: None,
+                timezone: suffix == "_TZ",
+            },
+        };
+        for expression in [
+            format!("TO_TIMESTAMP{suffix}('2026-01-01')"),
+            format!("TRY_TO_TIMESTAMP{suffix}('2026-01-01')"),
+            format!("TIMESTAMP{suffix}_FROM_PARTS(2026,1,1,0,0,0)"),
+        ] {
+            for sql in [
+                format!("SELECT {expression} AS x"),
+                format!("WITH orders AS (SELECT {expression} AS x) SELECT x FROM orders"),
+            ] {
+                let mut statement = crate::parse_one(&sql, DialectType::Snowflake).unwrap();
+                annotate_types(&mut statement, None, Some(DialectType::Snowflake));
+                let Expression::Select(select) = statement else {
+                    panic!()
+                };
+                assert_eq!(
+                    select.expressions[0].inferred_type(),
+                    Some(&expected),
+                    "{sql}"
+                );
+            }
+            for target in ["TIMESTAMP_NTZ", "TIMESTAMP_TZ"] {
+                let sql = format!("SELECT {expression} AS x UNION ALL SELECT NULL::{target}");
+                let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+                let rejected = matches!(suffix, "" | "_NTZ") && target == "TIMESTAMP_TZ";
+                assert_eq!(result.valid, !rejected, "{sql}: {:?}", result.errors);
+                assert_eq!(
+                    result.errors.iter().any(|e| e.code == "E215"),
+                    rejected,
+                    "{sql}"
+                );
+            }
+        }
+    }
+    let result = validate_with_schema(
+        "SELECT NULL::TIMESTAMP UNION ALL SELECT NULL::TIMESTAMP_TZ",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    assert!(result.errors.iter().any(|e| e.code == "E215"));
+    for expression in [
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMESTAMP()",
+        "LOCALTIMESTAMP()",
+        "GETDATE()",
+        "SYSTIMESTAMP()",
+    ] {
+        let sql = format!("SELECT {expression} AS x UNION ALL SELECT NULL::TIMESTAMP_TZ");
+        let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+}
+
+#[test]
+fn lateral_subqueries_only_correlate_with_preceding_sources() {
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({"tables": [{"name": "orders", "columns": [{"name": "id", "type": "INTEGER"}, {"name": "payload", "type": "VARIANT"}]}], "strict": true})).unwrap();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            check_references: true,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT g.x FROM orders o, LATERAL (SELECT f.value AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT f.value) AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT (SELECT f.value)) AS x FROM orders p) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT value AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT g.x AS x) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT p.id AS x FROM orders p WHERE f.value = p.id) g, LATERAL FLATTEN(input => o.payload) f",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(!result.valid, "{sql}");
+            assert!(result.errors.iter().any(|e| e.code == validation_codes::E_UNRESOLVED_REFERENCE || e.code == validation_codes::E_UNKNOWN_COLUMN), "{sql}: {:?}", result.errors);
+        }
+        for sql in [
+            "SELECT g.x FROM orders o, LATERAL FLATTEN(input => o.payload) f, LATERAL (SELECT f.value AS x) g",
+            "SELECT g.x FROM orders o, LATERAL FLATTEN(input => o.payload) f, LATERAL (SELECT (SELECT f.value) AS x) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT p.id AS x FROM orders p WHERE p.id = o.id) g",
+            "SELECT g.x FROM orders o, LATERAL (SELECT f.id AS x FROM orders f) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT (SELECT f.id FROM orders f) AS x) g, LATERAL FLATTEN(input => o.payload) f",
+            "SELECT g.x FROM orders o, LATERAL (SELECT h.x FROM orders p, LATERAL (SELECT p.id AS x) h) g",
+            "SELECT g.x FROM orders o JOIN LATERAL (SELECT o.id AS x) g ON TRUE",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(result.valid, "{sql}: {:?}", result.errors);
+        }
+    }
+}
+
+#[test]
+fn snowflake_directional_set_operation_matrix() {
+    let fixture = include_str!("../../tests/fixtures/snowflake_set_operation_matrix.txt");
+    let mut lines = fixture.lines();
+    let types: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+    let rows: Vec<Vec<_>> = lines
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(types.len(), 13);
+    assert_eq!(rows.len(), 13);
+    let static_type = |name| match name {
+        "VARCHAR_NUM" | "VARCHAR_TXT" => "VARCHAR",
+        other => other,
+    };
+    let sql_value = |name| match name {
+        "BOOLEAN" => "TRUE",
+        "NUMBER" => "1::NUMBER(38,0)",
+        "DECIMAL" => "1.25::NUMBER(10,2)",
+        "FLOAT" => "1.5::FLOAT",
+        "VARCHAR_NUM" => "'7'::VARCHAR",
+        "VARCHAR_TXT" => "'abc'::VARCHAR",
+        "DATE" => "'2026-01-01'::DATE",
+        "TIMESTAMP_NTZ" => "'2026-01-01 10:00:00'::TIMESTAMP_NTZ",
+        "TIMESTAMP_TZ" => "'2026-01-01 10:00:00 +00:00'::TIMESTAMP_TZ",
+        "TIME" => "'10:00:00'::TIME",
+        "VARIANT" => "PARSE_JSON('1')",
+        "ARRAY" => "ARRAY_CONSTRUCT(1)",
+        "NULL" => "NULL",
+        _ => panic!("unknown fixture type"),
+    };
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        check_types: true,
+        check_references: true,
+        semantic: true,
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    for (i, first) in types.iter().enumerate() {
+        assert_eq!(rows[i].len(), 14);
+        assert_eq!(&rows[i][0], first);
+        for (j, later) in types.iter().enumerate() {
+            let verdict = rows[i][j + 1];
+            // Literal-dependent conversion failures require a warning for the
+            // static pair, even when this particular sample value succeeds.
+            let runtime_risk = rows.iter().any(|row| {
+                static_type(row[0]) == static_type(first)
+                    && types.iter().enumerate().any(|(k, ty)| {
+                        static_type(ty) == static_type(later) && row[k + 1] == "runtime"
+                    })
+            });
+            for operator in [
+                "UNION ALL",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+                "MINUS",
+                "UNION ALL BY NAME",
+                "UNION BY NAME",
+            ] {
+                let sql = format!(
+                    "SELECT {} AS x {operator} SELECT {} AS x",
+                    sql_value(first),
+                    sql_value(later)
+                );
+                let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+                let error = result.errors.iter().any(|e| e.code == "E215");
+                let warning = result.errors.iter().any(|e| e.code == "W214");
+                if error != (verdict == "error")
+                    || warning != runtime_risk
+                    || result.valid == (verdict == "error")
+                {
+                    failures.push(format!("{first}|{later} {operator}: engine={verdict}, runtime_risk={runtime_risk}, {:?}", result.errors));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn snowflake_set_operation_chains_fold_results() {
+    let schema = ValidationSchema {
+        tables: vec![],
+        strict: Some(true),
+    };
+    let options = SchemaValidationOptions {
+        check_types: true,
+        semantic: true,
+        ..Default::default()
+    };
+    for (sql, valid) in [
+        ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT 1.5", true),
+        ("SELECT 1 x UNION ALL SELECT TRUE UNION ALL SELECT 1.5", false),
+        ("SELECT TRUE x UNION ALL SELECT 1 UNION ALL SELECT CURRENT_DATE", false),
+        ("SELECT 'abc'::VARCHAR x UNION ALL SELECT 1 UNION ALL SELECT TRUE", false),
+        ("SELECT NULL x UNION ALL SELECT 1 UNION ALL SELECT TRUE", false),
+        ("SELECT NULL x UNION ALL SELECT TRUE UNION ALL SELECT 1", true),
+        ("SELECT TRUE x UNION ALL SELECT NULL UNION ALL SELECT 1", true),
+        ("SELECT CURRENT_DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
+        ("SELECT NULL::TIMESTAMP_NTZ x UNION ALL SELECT CURRENT_DATE UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
+        ("SELECT PARSE_JSON('1') x UNION ALL SELECT 1 UNION ALL SELECT 'abc'::VARCHAR", false),
+        ("SELECT TRUE x, 1 y UNION ALL BY NAME SELECT 2 y, 1 x UNION ALL BY NAME SELECT 3 x, 3 y", true),
+        ("SELECT TRUE x, 1 y UNION ALL BY NAME SELECT 2 y, 1 x UNION ALL BY NAME SELECT 3 x, TRUE y", false),
+        ("SELECT 1 x UNION ALL BY NAME SELECT TRUE y UNION ALL BY NAME SELECT 1 y", true),
+        ("SELECT 1 x UNION ALL BY NAME SELECT 1 y UNION ALL BY NAME SELECT TRUE y", false),
+        ("WITH orders AS (SELECT TRUE x UNION ALL SELECT 1) SELECT x FROM orders UNION ALL SELECT 2", true),
+        ("WITH orders AS (SELECT '2026-01-01'::DATE x UNION ALL SELECT NULL::TIMESTAMP_NTZ) SELECT x FROM orders UNION ALL SELECT NULL::TIMESTAMP_TZ", false),
+        ("WITH orders AS (SELECT PARSE_JSON('1') x) SELECT x FROM orders UNION ALL SELECT 'abc'::VARCHAR", false),
+        ("WITH orders AS (SELECT ARRAY_CONSTRUCT(1) x) SELECT x FROM orders UNION ALL SELECT TRUE", false),
+        ("SELECT order_flag() x UNION ALL SELECT 1 UNION ALL SELECT TRUE", true),
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert_eq!(result.valid, valid, "{sql}: {:?}", result.errors);
+    }
+}
+
+fn snowflake_orders_schema() -> ValidationSchema {
+    serde_json::from_value(
+        serde_json::json!({"tables": [{"name": "orders", "columns": [
+            {"name":"id","type":"NUMBER(38,0)"}, {"name":"parent_id","type":"NUMBER(38,0)"},
+            {"name":"quantity","type":"NUMBER(38,0)"}, {"name":"amount","type":"FLOAT"},
+            {"name":"ordered_on","type":"DATE"}, {"name":"ordered_at","type":"TIMESTAMP_NTZ"},
+            {"name":"status","type":"VARCHAR"}, {"name":"active","type":"BOOLEAN"},
+            {"name":"payload","type":"VARIANT"}, {"name":"value","type":"VARCHAR"}
+        ]}]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn snowflake_measured_chain_verdicts() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/snowflake_set_operation_chains.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let sql = case["sql"].as_str().unwrap();
+        let result = validate_with_schema(
+            sql,
+            DialectType::Snowflake,
+            &ValidationSchema {
+                tables: vec![],
+                strict: Some(true),
+            },
+            &SchemaValidationOptions {
+                semantic: true,
+                check_types: true,
+                check_references: true,
+                ..Default::default()
+            },
+        );
+        let runtime = case["verdict"] == "runtime_error";
+        assert_eq!(result.valid, runtime, "{sql}: {:?}", result.errors);
+        if runtime {
+            assert!(result.errors.iter().any(|e| e.code == "W214"));
+        } else {
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.code == "E215" || e.code == "E213"),
+                "{:?}",
+                result.errors
+            );
+        }
+    }
+}
+
+#[test]
+fn snowflake_realworld_scope_and_aggregate_regressions() {
+    let schema = snowflake_orders_schema();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            check_references: true,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT id, LEVEL - 1, CONNECT_BY_ROOT id, SYS_CONNECT_BY_PATH(id::VARCHAR, ',') FROM orders START WITH parent_id IS NULL CONNECT BY parent_id = PRIOR id",
+            "SELECT LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+            "SELECT COUNT(id, quantity, amount), COUNT(DISTINCT id, quantity) FROM orders",
+            "SELECT status, COUNT(id, quantity) FROM orders GROUP BY status",
+            "SELECT COUNT(id, quantity) OVER () FROM orders",
+            "SELECT OBJECT_AGG(status,payload), CORR(quantity,amount), COVAR_POP(quantity,amount), REGR_SLOPE(quantity,amount) FROM orders",
+            "SELECT m.value FROM orders, LATERAL FLATTEN(input => PARSE_JSON(value):customers) m",
+            "SELECT m.value FROM orders, LATERAL FLATTEN(input => payload:customers) m",
+            "SELECT m.value FROM orders o JOIN orders c ON o.id=c.id, LATERAL FLATTEN(input => c.payload) m",
+            "SELECT m.value, c.value FROM orders, LATERAL FLATTEN(input => PARSE_JSON(value):customers) m, LATERAL FLATTEN(input => m.value:shipments) c",
+            "SELECT f.value FROM (SELECT payload FROM orders) source, LATERAL FLATTEN(input => payload:customers), LATERAL FLATTEN(input => value) f",
+            "SELECT m.value, c.value FROM orders, LATERAL FLATTEN(input => payload:customers) m, LATERAL FLATTEN(input => m.value:shipments) c",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(result.valid, "types={check_types}: {sql}: {:?}", result.errors);
+        }
+        for (sql, code) in [
+            ("SELECT LEVEL FROM orders", "E201"),
+            ("SELECT CONNECT_BY_ISLEAF FROM orders", "E201"),
+            (
+                "SELECT missing FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            (
+                "SELECT orders.LEVEL FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            ("SELECT status, COUNT(id,quantity) FROM orders", "E230"),
+            ("SELECT id FROM orders WHERE COUNT(id,quantity)>1", "E231"),
+            (
+                "SELECT value FROM orders, LATERAL FLATTEN(input => payload:customers) m",
+                "E221",
+            ),
+            (
+                "SELECT m.value FROM orders, LATERAL FLATTEN(input => missing) m",
+                "E201",
+            ),
+            (
+                "SELECT m.value FROM orders, LATERAL FLATTEN(input => m.value) m",
+                "E222",
+            ),
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(
+                !result.valid && result.errors.iter().any(|e| e.code == code),
+                "types={check_types}: {sql}: {:?}",
+                result.errors
+            );
+        }
+    }
+}
+
+#[test]
+fn snowflake_realworld_function_types_and_timestamp_aliases() {
+    let schema = snowflake_orders_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    for (expression, expected) in [
+        ("DATE_FROM_PARTS(2026,1,1)", TypeFamily::Date),
+        ("DAYOFWEEKISO(CURRENT_DATE)", TypeFamily::Integer),
+        (
+            "CASE WHEN TRUE THEN TO_TIMESTAMP(0) ELSE TRY_TO_TIMESTAMP('2026-01-01') END",
+            TypeFamily::Timestamp,
+        ),
+        ("CASE WHEN TRUE THEN order_date(1) END", TypeFamily::Unknown),
+    ] {
+        let mut statement =
+            crate::parse_one(&format!("SELECT {expression}"), DialectType::Snowflake).unwrap();
+        annotate_types(&mut statement, None, Some(DialectType::Snowflake));
+        let Expression::Select(select) = statement else {
+            unreachable!()
+        };
+        let actual = select.expressions[0]
+            .inferred_type()
+            .map(data_type_family)
+            .unwrap_or(TypeFamily::Unknown);
+        assert_eq!(actual, expected, "{expression}");
+    }
+    for sql in [
+        "WITH shipments AS (SELECT CASE WHEN active THEN TO_TIMESTAMP(quantity) ELSE TRY_TO_TIMESTAMP(status) END AS shipped_at FROM orders) SELECT DATE_PART(EPOCH_SECOND, shipped_at) FROM shipments",
+        "WITH shipments AS (SELECT CASE WHEN active THEN TO_TIMESTAMP(quantity) ELSE TRY_TO_TIMESTAMP(REGEXP_SUBSTR(status,'[0-9-]+')) END AS shipped_at FROM orders) SELECT DATE_PART(EPOCH_SECOND, shipped_at) FROM shipments",
+        "SELECT COALESCE(TRY_CAST(status AS DATE), ordered_on, CASE WHEN active THEN DATE_FROM_PARTS(YEAR(ordered_on)-quantity,1,1) END) FROM orders",
+        "SELECT COALESCE(ordered_on, CASE WHEN active THEN DATE_FROM_PARTS(YEAR(ordered_on)-quantity,1,1) END) FROM orders",
+        "WITH shipments AS (SELECT 5 + DAYOFWEEKISO(ordered_on) AS delivery_days, DATEDIFF(day,ordered_on,CURRENT_DATE) AS elapsed_days FROM orders) SELECT delivery_days >= elapsed_days FROM shipments",
+        "SELECT COALESCE(ordered_on, CASE WHEN active THEN order_date(quantity) END) FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for target in [
+        "TIMESTAMP_NTZ",
+        "TIMESTAMP_LTZ",
+        "TIMESTAMP_TZ",
+        "TIMESTAMPNTZ",
+        "TIMESTAMPLTZ",
+        "TIMESTAMPTZ",
+        "TIMESTAMP_LTZ(9)",
+    ] {
+        let sql = format!("SELECT CAST(ordered_at AS {target}) FROM orders");
+        let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+        assert!(
+            result.valid && !result.errors.iter().any(|e| e.code == "W213"),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+    let result = validate_with_schema(
+        "SELECT CAST(status AS UNKNOWN_ORDER_TYPE) FROM orders",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    let issue = result.errors.iter().find(|e| e.code == "W213").unwrap();
+    assert!(
+        issue.message.contains("UNKNOWN_ORDER_TYPE")
+            && !issue.message.contains("Custom {")
+            && !issue.message.contains("name:")
+    );
+    for sql in [
+        "SELECT quantity AS result FROM orders UNION ALL SELECT active FROM orders",
+        "SELECT DATE_PART(day,quantity) FROM orders",
+    ] {
+        assert!(
+            !validate_with_schema(sql, DialectType::Snowflake, &schema, &options).valid,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn snowflake_realworld_commented_named_union_keeps_column_identity() {
+    let schema = snowflake_orders_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id,\n-- availability\nactive,\n-- subtotal\namount FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments";
+    let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+    assert!(result.valid, "{:?}", result.errors);
+    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id, amount AS active FROM shipments UNION ALL BY NAME SELECT id,\n-- availability\nactive FROM shipments";
+    let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+    assert!(
+        result.errors.iter().any(|e| e.code == "E215"),
+        "{:?}",
+        result.errors
+    );
+}
+
+#[test]
 fn semantic_followups_closed_relation_negative_controls() {
     let result = validate_with_schema(
         "SELECT t.a FROM (SELECT COLUMNS(*) FROM orders) t(a,b)",

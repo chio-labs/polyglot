@@ -1,0 +1,14 @@
+BOOLEAN NUMBER DECIMAL FLOAT VARCHAR_NUM VARCHAR_TXT DATE TIMESTAMP_NTZ TIMESTAMP_TZ TIME VARIANT ARRAY NULL
+BOOLEAN valid valid valid valid runtime runtime error error error error runtime error valid
+NUMBER error valid valid valid valid runtime error error error error valid error valid
+DECIMAL error valid valid valid valid runtime error error error error valid error valid
+FLOAT error valid valid valid valid runtime error error error error valid error valid
+VARCHAR_NUM valid valid valid valid valid valid valid valid valid valid valid error valid
+VARCHAR_TXT valid runtime runtime runtime valid valid runtime runtime runtime runtime valid error valid
+DATE error error error error valid runtime valid valid valid error runtime error valid
+TIMESTAMP_NTZ error error error error valid runtime valid valid error error valid error valid
+TIMESTAMP_TZ error error error error valid runtime valid valid valid error valid error valid
+TIME error error error error valid runtime error error error valid runtime error valid
+VARIANT valid valid valid valid error error error error error error valid valid valid
+ARRAY error error error error error error error error error error valid valid valid
+NULL valid valid valid valid valid valid valid valid valid valid valid valid valid

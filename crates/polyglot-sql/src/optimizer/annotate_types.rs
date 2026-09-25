@@ -403,6 +403,33 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate types for an expression tree
     pub fn annotate(&mut self, expr: &Expression) -> Option<DataType> {
+        if self._dialect == Some(DialectType::Snowflake) {
+            match expr {
+                Expression::CurrentTimestamp(_) | Expression::CurrentTimestampLTZ(_) => {
+                    return Some(DataType::Custom {
+                        name: "TIMESTAMPLTZ".into(),
+                    });
+                }
+                Expression::TimestampTzFromParts(_) => {
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: true,
+                    })
+                }
+                Expression::TimestampFromParts(_) | Expression::ToTimestamp(_) => {
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: false,
+                    })
+                }
+                _ => {}
+            }
+        }
+        if self._dialect == Some(DialectType::Snowflake)
+            && matches!(expr, Expression::ParseJson(_) | Expression::ParseJSON(_))
+        {
+            return Some(DataType::Json);
+        }
         match expr {
             // Literals
             Expression::Literal(lit) => Self::annotate_literal(lit),
@@ -1421,6 +1448,56 @@ impl<'a> TypeAnnotator<'a> {
         }
         let func_name = func.name.to_uppercase();
 
+        if self._dialect == Some(DialectType::Snowflake) && !func.quoted {
+            match func_name.as_str() {
+                "CURRENT_TIMESTAMP" | "GETDATE" | "LOCALTIMESTAMP" | "SYSTIMESTAMP" => {
+                    return Some(DataType::Custom {
+                        name: "TIMESTAMPLTZ".into(),
+                    })
+                }
+                "PARSE_JSON" | "TRY_PARSE_JSON" | "TO_VARIANT" => return Some(DataType::Json),
+                "ARRAY_CONSTRUCT" | "ARRAY_CONSTRUCT_COMPACT" => {
+                    return Some(DataType::Array {
+                        element_type: Box::new(DataType::Json),
+                        dimension: None,
+                    })
+                }
+                "TO_TIMESTAMP"
+                | "TO_TIMESTAMP_NTZ"
+                | "TO_TIMESTAMP_LTZ"
+                | "TO_TIMESTAMP_TZ"
+                | "TRY_TO_TIMESTAMP"
+                | "TRY_TO_TIMESTAMP_NTZ"
+                | "TRY_TO_TIMESTAMP_LTZ"
+                | "TRY_TO_TIMESTAMP_TZ"
+                | "TIMESTAMP_FROM_PARTS"
+                | "TIMESTAMP_NTZ_FROM_PARTS"
+                | "TIMESTAMP_LTZ_FROM_PARTS"
+                | "TIMESTAMP_TZ_FROM_PARTS" => {
+                    if func_name.contains("_NTZ") || func_name.contains("_LTZ") {
+                        return Some(DataType::Custom {
+                            name: if func_name.contains("_LTZ") {
+                                "TIMESTAMPLTZ"
+                            } else {
+                                "TIMESTAMPNTZ"
+                            }
+                            .to_string(),
+                        });
+                    }
+                    return Some(DataType::Timestamp {
+                        precision: None,
+                        timezone: func_name.contains("_TZ"),
+                    });
+                }
+                "DATE_FROM_PARTS" | "DATEFROMPARTS" | "TO_DATE" | "TRY_TO_DATE" => {
+                    return Some(DataType::Date)
+                }
+                "DAYOFWEEKISO" | "WEEKISO" | "WEEKOFYEAR" | "YEAROFWEEK" | "YEAROFWEEKISO"
+                | "DAYOFYEAR" => return Some(DataType::BigInt { length: None }),
+                _ => {}
+            }
+        }
+
         if self._dialect == Some(DialectType::PostgreSQL) && !func.quoted {
             match func_name.as_str() {
                 "SUM" => return func.args.first().and_then(|arg| self.annotate_sum(arg)),
@@ -1512,7 +1589,11 @@ impl<'a> TypeAnnotator<'a> {
                     };
                 }
                 self.used_unknown_function_fallback = true;
-                func.args.first().and_then(|arg| self.annotate(arg))
+                if self._dialect == Some(DialectType::Snowflake) {
+                    Some(DataType::Unknown)
+                } else {
+                    func.args.first().and_then(|arg| self.annotate(arg))
+                }
             }
         }
     }
@@ -2838,6 +2919,16 @@ mod tests {
                         actual.is_none_or(|t| *t == DataType::Unknown),
                         "{dialect:?}: {actual:?}"
                     ),
+                    Snowflake => assert!(
+                        matches!(
+                            actual,
+                            Some(DataType::Decimal {
+                                precision: Some(38),
+                                scale: Some(0)
+                            })
+                        ),
+                        "{dialect:?}: {actual:?}"
+                    ),
                     Teradata if left == "INT" => assert!(
                         matches!(actual, Some(DataType::Int { .. })),
                         "{dialect:?}: {actual:?}"
@@ -3740,7 +3831,7 @@ mod tests {
     #[test]
     fn test_regexp_extract_all_rule_is_duckdb_specific() {
         // Other dialects have different overloads, notably BigQuery BYTES.
-        // Preserve their existing behavior rather than installing a global rule.
+        // No DuckDB-specific return rule may leak into another dialect.
         for dialect in [
             None,
             Some(DialectType::Generic),
@@ -3753,7 +3844,13 @@ mod tests {
                 Expression::Literal(Box::new(Literal::ByteString("a1".to_string()))),
             ] {
                 let mut annotator = TypeAnnotator::new(None, dialect);
-                let expected = annotator.annotate(&input);
+                let expected = if dialect == Some(DialectType::Snowflake) {
+                    // An unmodelled warehouse function must not acquire its
+                    // input type and propagate that guess into CASE/CTE outputs.
+                    Some(DataType::Unknown)
+                } else {
+                    annotator.annotate(&input)
+                };
                 let function = Expression::Function(Box::new(Function::new(
                     "REGEXP_EXTRACT_ALL",
                     vec![input, make_string_literal("[0-9]+")],

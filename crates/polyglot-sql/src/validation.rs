@@ -517,6 +517,8 @@ pub fn canonical_type_family(data_type: &str) -> TypeFamily {
         | "timestamp_ntz"
         | "timestamp_ltz"
         | "timestamp_tz"
+        | "timestampntz"
+        | "timestampltz"
         | "timestamptz"
         | "datetime"
         | "datetime2"
@@ -2066,6 +2068,7 @@ fn projection_families(
 
 #[derive(Default)]
 struct ProjectionTypes {
+    snowflake: snowflake_setops::SetResolver,
     families: HashMap<*const Expression, Option<Vec<TypeFamily>>>,
     layouts: crate::set_operation::LayoutResolver,
 }
@@ -2180,6 +2183,10 @@ fn check_set_operation_compatibility(
     errors: &mut Vec<ValidationError>,
     projections: &mut ProjectionTypes,
 ) {
+    if dialect == DialectType::Snowflake {
+        projections.snowflake.check(query, strict, errors);
+        return;
+    }
     let Some(mut left_projection) = projections.resolve(left_expr, schema_map, dialect) else {
         return;
     };
@@ -3159,6 +3166,7 @@ mod coercion;
 mod expressions;
 mod semantics;
 pub(crate) mod signatures;
+pub(crate) mod snowflake_setops;
 pub(crate) use semantics::check_semantics;
 
 fn resolve_scope_source_name(scope: &crate::scope::Scope, name: &str) -> Option<String> {
@@ -3862,7 +3870,62 @@ fn validate_scope_columns(
         .as_ref()
         .into_iter()
         .flat_map(|order| order_by_validation_columns(order, dialect));
+    // A lateral relation's arguments see preceding sources, never its own
+    // generated columns or following relations. Ordinary projections see all.
+    let mut lateral_inputs = HashMap::new();
+    let mut preceding = HashSet::new();
+    if let Expression::Select(selected) = &expression {
+        for relation in selected
+            .from
+            .iter()
+            .flat_map(|from| &from.expressions)
+            .chain(selected.joins.iter().map(|join| &join.this))
+        {
+            if let Expression::Lateral(lateral) = relation {
+                for node in walk_in_scope(&lateral.this, false) {
+                    if let Expression::Column(column) = node {
+                        lateral_inputs.insert(column.as_ref() as *const _, preceding.clone());
+                    }
+                }
+            }
+            let alias = match relation {
+                Expression::Table(table) => {
+                    Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                }
+                Expression::Subquery(query) => {
+                    query.alias.as_ref().map(|alias| alias.name.as_str())
+                }
+                Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+                Expression::Lateral(lateral) => lateral.alias.as_deref(),
+                _ => None,
+            };
+            let source = alias
+                .and_then(|alias| resolve_scope_source_name(scope, alias))
+                .or_else(|| {
+                    scope
+                        .sources
+                        .iter()
+                        .find(|(_, source)| source.expression.as_ref() == relation)
+                        .map(|(name, _)| name.clone())
+                });
+            if let Some(source) = source {
+                preceding.insert(source);
+            }
+        }
+    }
     for (column, resolution) in input_columns.chain(order_columns) {
+        if dialect == DialectType::Snowflake
+            && select.connect.is_some()
+            && column.table.is_none()
+            && !column.name.quoted
+            && matches!(
+                column.name.name.to_ascii_uppercase().as_str(),
+                "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
+            )
+        {
+            continue;
+        }
+        let visible_sources = lateral_inputs.get(&(column as *const _));
         let output_matches =
             if resolution != OutputNameResolution::InputOnly && column.table.is_none() {
                 let name = normalize_identifier(column.name.clone(), strategy).name;
@@ -3883,15 +3946,20 @@ fn validate_scope_columns(
         let normalized_name = normalize_identifier(column.name.clone(), strategy).name;
         if let Some(qualifier) = &column.table {
             let resolved = sources_by_scope.iter().find_map(|(scope, columns)| {
-                resolve_scope_source_name(scope, &qualifier.name).map(|source| {
-                    (
-                        *scope,
-                        columns
-                            .get(source.as_str())
-                            .expect("indexed lexical source"),
-                        source,
-                    )
-                })
+                resolve_scope_source_name(scope, &qualifier.name)
+                    .filter(|source| {
+                        !std::ptr::eq(*scope, sources_by_scope[0].0)
+                            || visible_sources.is_none_or(|visible| visible.contains(source))
+                    })
+                    .map(|source| {
+                        (
+                            *scope,
+                            columns
+                                .get(source.as_str())
+                                .expect("indexed lexical source"),
+                            source,
+                        )
+                    })
             });
             if let Some((source_scope, columns, source)) = resolved {
                 if !columns.empty && !columns.wildcard && !columns.names.contains(&normalized_name)
@@ -3922,10 +3990,15 @@ fn validate_scope_columns(
         }
 
         let mut found = false;
-        for (_, source_columns) in &sources_by_scope {
+        for (source_scope, source_columns) in &sources_by_scope {
             let mut matches = 0;
             let mut open = false;
-            for columns in source_columns.values() {
+            for (source, columns) in source_columns {
+                if std::ptr::eq(*source_scope, scope)
+                    && visible_sources.is_some_and(|visible| !visible.contains(*source))
+                {
+                    continue;
+                }
                 open |= columns.empty || columns.wildcard;
                 // Wildcards are not evidence of a definite ambiguity.
                 matches +=
@@ -4052,9 +4125,64 @@ fn validate_scope_tree(
         .chain(ancestors.iter().copied())
         .collect();
     for child in scope.subquery_scopes.iter().chain(&scope.udtf_scopes) {
+        // A LATERAL subquery inherits only preceding relations. Pass that
+        // lexical environment into the entire child tree, so nested correlated
+        // queries share the restriction while their own FROM sources stay local.
+        let mut lateral_outer = None;
+        if child.scope_type == crate::scope::ScopeType::Udtf {
+            if let Expression::Select(select) = scope_query(&scope.expression) {
+                let mut preceding = HashSet::new();
+                for relation in select
+                    .from
+                    .iter()
+                    .flat_map(|from| &from.expressions)
+                    .chain(select.joins.iter().map(|join| &join.this))
+                {
+                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.expression)
+                    {
+                        let mut visible = selected.clone();
+                        visible.sources.retain(|name, _| preceding.contains(name));
+                        lateral_outer = Some(visible);
+                        break;
+                    }
+                    let alias = match relation {
+                        Expression::Table(table) => {
+                            Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                        }
+                        Expression::Subquery(query) => {
+                            query.alias.as_ref().map(|alias| alias.name.as_str())
+                        }
+                        Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+                        Expression::Lateral(lateral) => lateral.alias.as_deref(),
+                        _ => None,
+                    };
+                    if let Some(name) = alias
+                        .and_then(|name| resolve_scope_source_name(&selected, name))
+                        .or_else(|| {
+                            selected
+                                .sources
+                                .iter()
+                                .find(|(_, source)| source.expression.as_ref() == relation)
+                                .map(|(name, _)| name.clone())
+                        })
+                    {
+                        preceding.insert(name);
+                    }
+                }
+            }
+        }
+        let restricted: Vec<_> = lateral_outer
+            .as_ref()
+            .into_iter()
+            .chain(ancestors.iter().copied())
+            .collect();
         validate_scope_tree(
             child,
-            &outer,
+            if lateral_outer.is_some() {
+                &restricted
+            } else {
+                &outer
+            },
             schema_map,
             resolver_schema,
             options,

@@ -933,9 +933,11 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             scope.derived_table_scopes.push(derived_scope);
         }
         Expression::Lateral(lateral) => {
-            if let Some(alias) = &lateral.alias {
-                scope.add_virtual_source(alias.clone(), expr.clone());
-            }
+            let name = lateral
+                .alias
+                .clone()
+                .unwrap_or_else(|| scope.next_virtual_source_name());
+            scope.add_virtual_source(name, expr.clone());
         }
         Expression::LateralView(lateral_view) => {
             add_lateral_view_to_scope(lateral_view, scope);
