@@ -1198,23 +1198,28 @@ pub fn qualify_outputs(scope: &Scope) -> QualifyColumnsResult<()> {
 }
 
 fn qualify_outputs_select(select: &mut Select) -> QualifyColumnsResult<()> {
-    let mut new_selections: Vec<Expression> = Vec::new();
-
-    for (i, expr) in select.expressions.iter().enumerate() {
+    fn qualify_output(expr: &Expression, i: usize) -> Expression {
         match expr {
-            Expression::Alias(_) => new_selections.push(expr.clone()),
-            Expression::Column(col) => {
-                new_selections.push(create_alias(expr.clone(), &col.name.name));
+            Expression::Annotated(annotated) => {
+                let mut annotated = annotated.clone();
+                annotated.this = qualify_output(&annotated.this, i);
+                Expression::Annotated(annotated)
             }
-            Expression::Star(_) => new_selections.push(expr.clone()),
+            Expression::Alias(_) => expr.clone(),
+            Expression::Column(col) => create_alias(expr.clone(), &col.name.name),
+            Expression::Star(_) => expr.clone(),
             _ => {
                 let alias_name = get_output_name(expr).unwrap_or_else(|| format!("_col_{}", i));
-                new_selections.push(create_alias(expr.clone(), &alias_name));
+                create_alias(expr.clone(), &alias_name)
             }
         }
     }
-
-    select.expressions = new_selections;
+    select.expressions = select
+        .expressions
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| qualify_output(expr, i))
+        .collect();
     Ok(())
 }
 
@@ -3071,6 +3076,7 @@ fn create_alias(expr: Expression, alias_name: &str) -> Expression {
 /// Get the output name for an expression
 fn get_output_name(expr: &Expression) -> Option<String> {
     match expr {
+        Expression::Annotated(annotated) => get_output_name(&annotated.this),
         Expression::Column(col) => Some(col.name.name.clone()),
         Expression::Alias(alias) => Some(alias.alias.name.clone()),
         Expression::Identifier(id) => Some(id.name.clone()),

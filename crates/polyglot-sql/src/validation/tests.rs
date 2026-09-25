@@ -2,6 +2,184 @@ use super::*;
 use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFunctionCatalog};
 use std::sync::Arc;
 
+fn snowflake_orders_schema() -> ValidationSchema {
+    serde_json::from_value(
+        serde_json::json!({"tables": [{"name": "orders", "columns": [
+            {"name":"id","type":"NUMBER(38,0)"}, {"name":"parent_id","type":"NUMBER(38,0)"},
+            {"name":"quantity","type":"NUMBER(38,0)"}, {"name":"amount","type":"FLOAT"},
+            {"name":"ordered_on","type":"DATE"}, {"name":"ordered_at","type":"TIMESTAMP_NTZ"},
+            {"name":"status","type":"VARCHAR"}, {"name":"active","type":"BOOLEAN"},
+            {"name":"payload","type":"VARIANT"}, {"name":"value","type":"VARCHAR"}
+        ]}]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn snowflake_realworld_scope_and_aggregate_regressions() {
+    let schema = snowflake_orders_schema();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            check_references: true,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT id, LEVEL - 1, CONNECT_BY_ROOT id, SYS_CONNECT_BY_PATH(id::VARCHAR, ',') FROM orders START WITH parent_id IS NULL CONNECT BY parent_id = PRIOR id",
+            "SELECT LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+            "SELECT COUNT(id, quantity, amount), COUNT(DISTINCT id, quantity) FROM orders",
+            "SELECT status, COUNT(id, quantity) FROM orders GROUP BY status",
+            "SELECT COUNT(id, quantity) OVER () FROM orders",
+            "SELECT OBJECT_AGG(status,payload), CORR(quantity,amount), COVAR_POP(quantity,amount), REGR_SLOPE(quantity,amount) FROM orders",
+            "SELECT m.value FROM orders, LATERAL FLATTEN(input => PARSE_JSON(value):customers) m",
+            "SELECT m.value FROM orders, LATERAL FLATTEN(input => payload:customers) m",
+            "SELECT m.value FROM orders o JOIN orders c ON o.id=c.id, LATERAL FLATTEN(input => c.payload) m",
+            "SELECT m.value, c.value FROM orders, LATERAL FLATTEN(input => PARSE_JSON(value):customers) m, LATERAL FLATTEN(input => m.value:shipments) c",
+            "SELECT f.value FROM (SELECT payload FROM orders) source, LATERAL FLATTEN(input => payload:customers), LATERAL FLATTEN(input => value) f",
+            "SELECT m.value, c.value FROM orders, LATERAL FLATTEN(input => payload:customers) m, LATERAL FLATTEN(input => m.value:shipments) c",
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(result.valid, "types={check_types}: {sql}: {:?}", result.errors);
+        }
+        for (sql, code) in [
+            ("SELECT LEVEL FROM orders", "E201"),
+            ("SELECT CONNECT_BY_ISLEAF FROM orders", "E201"),
+            (
+                "SELECT missing FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            (
+                "SELECT orders.LEVEL FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            ("SELECT status, COUNT(id,quantity) FROM orders", "E230"),
+            ("SELECT id FROM orders WHERE COUNT(id,quantity)>1", "E231"),
+            (
+                "SELECT value FROM orders, LATERAL FLATTEN(input => payload:customers) m",
+                "E221",
+            ),
+            (
+                "SELECT m.value FROM orders, LATERAL FLATTEN(input => missing) m",
+                "E201",
+            ),
+            (
+                "SELECT m.value FROM orders, LATERAL FLATTEN(input => m.value) m",
+                "E222",
+            ),
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert!(
+                !result.valid && result.errors.iter().any(|e| e.code == code),
+                "types={check_types}: {sql}: {:?}",
+                result.errors
+            );
+        }
+    }
+}
+
+#[test]
+fn snowflake_realworld_function_types_and_timestamp_aliases() {
+    let schema = snowflake_orders_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    for (expression, expected) in [
+        ("DATE_FROM_PARTS(2026,1,1)", TypeFamily::Date),
+        ("DAYOFWEEKISO(CURRENT_DATE)", TypeFamily::Integer),
+        (
+            "CASE WHEN TRUE THEN TO_TIMESTAMP(0) ELSE TRY_TO_TIMESTAMP('2026-01-01') END",
+            TypeFamily::Timestamp,
+        ),
+        ("CASE WHEN TRUE THEN order_date(1) END", TypeFamily::Unknown),
+    ] {
+        let mut statement =
+            crate::parse_one(&format!("SELECT {expression}"), DialectType::Snowflake).unwrap();
+        annotate_types(&mut statement, None, Some(DialectType::Snowflake));
+        let Expression::Select(select) = statement else {
+            unreachable!()
+        };
+        let actual = select.expressions[0]
+            .inferred_type()
+            .map(data_type_family)
+            .unwrap_or(TypeFamily::Unknown);
+        assert_eq!(actual, expected, "{expression}");
+    }
+    for sql in [
+        "WITH shipments AS (SELECT CASE WHEN active THEN TO_TIMESTAMP(quantity) ELSE TRY_TO_TIMESTAMP(status) END AS shipped_at FROM orders) SELECT DATE_PART(EPOCH_SECOND, shipped_at) FROM shipments",
+        "WITH shipments AS (SELECT CASE WHEN active THEN TO_TIMESTAMP(quantity) ELSE TRY_TO_TIMESTAMP(REGEXP_SUBSTR(status,'[0-9-]+')) END AS shipped_at FROM orders) SELECT DATE_PART(EPOCH_SECOND, shipped_at) FROM shipments",
+        "SELECT COALESCE(TRY_CAST(status AS DATE), ordered_on, CASE WHEN active THEN DATE_FROM_PARTS(YEAR(ordered_on)-quantity,1,1) END) FROM orders",
+        "SELECT COALESCE(ordered_on, CASE WHEN active THEN DATE_FROM_PARTS(YEAR(ordered_on)-quantity,1,1) END) FROM orders",
+        "WITH shipments AS (SELECT 5 + DAYOFWEEKISO(ordered_on) AS delivery_days, DATEDIFF(day,ordered_on,CURRENT_DATE) AS elapsed_days FROM orders) SELECT delivery_days >= elapsed_days FROM shipments",
+        "SELECT COALESCE(ordered_on, CASE WHEN active THEN order_date(quantity) END) FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for target in [
+        "TIMESTAMP_NTZ",
+        "TIMESTAMP_LTZ",
+        "TIMESTAMP_TZ",
+        "TIMESTAMPNTZ",
+        "TIMESTAMPLTZ",
+        "TIMESTAMPTZ",
+        "TIMESTAMP_LTZ(9)",
+    ] {
+        let sql = format!("SELECT CAST(ordered_at AS {target}) FROM orders");
+        let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+        assert!(
+            result.valid && !result.errors.iter().any(|e| e.code == "W213"),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+    let result = validate_with_schema(
+        "SELECT CAST(status AS UNKNOWN_ORDER_TYPE) FROM orders",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    let issue = result.errors.iter().find(|e| e.code == "W213").unwrap();
+    assert!(
+        issue.message.contains("UNKNOWN_ORDER_TYPE")
+            && !issue.message.contains("Custom {")
+            && !issue.message.contains("name:")
+    );
+    for sql in [
+        "SELECT active AS result FROM orders UNION ALL SELECT quantity FROM orders",
+        "SELECT DATE_PART(day,quantity) FROM orders",
+    ] {
+        assert!(
+            !validate_with_schema(sql, DialectType::Snowflake, &schema, &options).valid,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn snowflake_realworld_commented_named_union_keeps_column_identity() {
+    let schema = snowflake_orders_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    };
+    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id,\n-- availability\nactive,\n-- subtotal\namount FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments UNION ALL BY NAME SELECT amount,id,\n-- availability\nactive FROM shipments";
+    let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+    assert!(result.valid, "{:?}", result.errors);
+    let sql = "WITH shipments AS (SELECT * FROM orders) SELECT id,\n-- availability\nactive FROM shipments UNION ALL BY NAME SELECT id, amount AS active FROM shipments";
+    let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+    assert!(
+        result.errors.iter().any(|e| e.code == "E215"),
+        "{:?}",
+        result.errors
+    );
+}
+
 #[test]
 fn semantic_followups_closed_relation_negative_controls() {
     let result = validate_with_schema(

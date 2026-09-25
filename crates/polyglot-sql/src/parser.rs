@@ -37450,18 +37450,12 @@ impl Parser {
                             }
                         }
                         self.expect(TokenType::RParen)?;
-                        // Multiple args without DISTINCT - treat as generic function
-                        return Ok(Expression::Function(Box::new(Function {
-                            name: name.to_string(),
-                            args,
-                            distinct: false,
-                            trailing_comments: Vec::new(),
-                            use_bracket_syntax: false,
-                            no_parens: false,
-                            quoted: false,
-                            span: None,
-                            inferred_type: None,
-                        })));
+                        // Multi-argument COUNT is still an aggregate (Snowflake).
+                        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+                            let filter = self.parse_filter_clause()?;
+                            return Ok(Self::make_simple_aggregate(name, args, false, filter));
+                        }
+                        return Ok(Self::make_unquoted_function(name, args));
                     }
                     (Some(first_expr), false, false)
                 };

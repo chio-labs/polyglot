@@ -103,6 +103,15 @@ unknown warehouse-defined functions never receive E202 by default.
 
 ## Snowflake engine regression fixture
 
+Additional synthetic controls are in
+[`snowflake-semantic-controls.md`](snowflake-semantic-controls.md). Hierarchy
+pseudo-columns are scoped to CONNECT BY queries; lateral function arguments
+exclude that function's own generated outputs. Multi-argument COUNT retains its
+aggregate identity. Comments on projections are transparent to UNION BY NAME
+output alignment. Snowflake timestamp/date constructors and calendar extractors
+have explicit return types; an unmodelled function result stays unknown instead
+of inheriting its first argument's type through CASE expressions.
+
 ### Scope and source-location follow-ups
 
 Derived-table and VALUES column alias lists are validated against their renamed

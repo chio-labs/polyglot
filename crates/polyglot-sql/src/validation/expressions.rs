@@ -332,7 +332,13 @@ pub(super) fn check(
                     false,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
-                    format!("Unknown cast target type {:?}", expr.to),
+                    format!(
+                        "Unknown cast target type '{}'",
+                        match &expr.to {
+                            DataType::Custom { name } => name.as_str(),
+                            _ => unreachable!(),
+                        }
+                    ),
                 ));
             }
         }
