@@ -19,8 +19,6 @@ const SNOWFLAKE_COMPARISONS: &[(TypeFamily, TypeFamily)] = &[
     (TypeFamily::String, TypeFamily::Date),
     (TypeFamily::String, TypeFamily::Time),
     (TypeFamily::String, TypeFamily::Timestamp),
-    (TypeFamily::Integer, TypeFamily::Timestamp),
-    (TypeFamily::Numeric, TypeFamily::Timestamp),
     (TypeFamily::Integer, TypeFamily::Boolean),
     (TypeFamily::Numeric, TypeFamily::Boolean),
 ];
@@ -66,7 +64,7 @@ const RULES: &[Rules] = &[
         temporal_literal: true,
         boolean_literal: true,
         string_setop: true,
-        boolean_numeric_setop: true,
+        boolean_numeric_setop: false,
         predicates: &[TypeFamily::Integer, TypeFamily::Numeric, TypeFamily::String],
         comparison_pairs: SNOWFLAKE_COMPARISONS,
     },
@@ -177,6 +175,19 @@ pub(super) fn temporal_argument(
     family.is_temporal()
         || (dialect == DialectType::Snowflake && family == TypeFamily::String)
         || literal_coerces(dialect, expr, TypeFamily::Timestamp)
+}
+
+/// DATE_TRUNC/EXTRACT do not share DATEDIFF's Snowflake VARCHAR overloads.
+pub(super) fn temporal_function_argument(
+    name: &str,
+    dialect: DialectType,
+    expr: &Expression,
+    family: TypeFamily,
+) -> bool {
+    if dialect == DialectType::Snowflake && matches!(name, "date_trunc" | "extract" | "date_part") {
+        return family.is_temporal();
+    }
+    temporal_argument(dialect, expr, family)
 }
 
 pub(super) fn setop(dialect: DialectType, left: TypeFamily, right: TypeFamily) -> bool {

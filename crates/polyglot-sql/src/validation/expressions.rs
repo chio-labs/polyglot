@@ -243,7 +243,7 @@ pub(super) fn check(
     }
     let family = |expr: &Expression| infer_expression_type_family(expr, schema, context);
     let mut predicate = |expr: &Expression| {
-        if !predicate_expression_compatible(expr, family(expr), dialect) {
+        if !clause_predicate_expression_compatible(expr, family(expr), dialect) {
             errors.push(type_issue(
                 strict && dialect != DialectType::DuckDB,
                 validation_codes::E_INVALID_PREDICATE_TYPE,
@@ -258,7 +258,7 @@ pub(super) fn check(
     match node {
         Expression::Select(select) => {
             check_using(node, select, dialect, schema, strict, errors);
-            if dialect != DialectType::DuckDB {
+            if !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) {
                 return;
             }
             if let Some(with) = select.with.as_ref().filter(|with| with.recursive) {
@@ -272,16 +272,19 @@ pub(super) fn check(
                                 anchor.into_iter().zip(recursive).enumerate()
                             {
                                 let literal = coercion::projection_literal(&union.right, index);
-                                let invalid = literal
-                                    .is_some_and(|expr| invalid_literal_for(expr, target))
-                                    || (source == TypeFamily::String
-                                        && target != TypeFamily::String
-                                        && target != TypeFamily::Unknown
-                                        && literal.is_none())
-                                    || !coercion::setop(dialect, target, source);
+                                let invalid = if dialect == DialectType::Snowflake {
+                                    !are_setop_compatible(target, source)
+                                } else {
+                                    literal.is_some_and(|expr| invalid_literal_for(expr, target))
+                                        || (source == TypeFamily::String
+                                            && target != TypeFamily::String
+                                            && target != TypeFamily::Unknown
+                                            && literal.is_none())
+                                        || !coercion::setop(dialect, target, source)
+                                };
                                 if invalid {
                                     errors.push(type_issue(
-                                        false,
+                                        strict && dialect == DialectType::Snowflake,
                                         validation_codes::E_SETOP_TYPE_MISMATCH,
                                         validation_codes::W_SETOP_IMPLICIT_COERCION,
                                         "Recursive branch cannot convert to the anchor column type"
@@ -294,7 +297,9 @@ pub(super) fn check(
                 }
             }
         }
-        Expression::WindowFunction(window) if dialect == DialectType::DuckDB => {
+        Expression::WindowFunction(window)
+            if matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) =>
+        {
             use crate::expressions::{WindowFrameBound, WindowFrameKind};
             if let Some(frame) = &window.over.frame {
                 let offset = |bound: &WindowFrameBound| {
@@ -346,12 +351,14 @@ pub(super) fn check(
                 }
             }
         }
-        Expression::Interval(interval) if dialect == DialectType::DuckDB => {
+        Expression::Interval(interval)
+            if matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) =>
+        {
             if let Some(Expression::Literal(literal)) = &interval.this {
                 if let crate::expressions::Literal::String(value) = literal.as_ref() {
                     if !value.chars().any(|c| c.is_ascii_digit()) {
                         errors.push(type_issue(
-                            false,
+                            strict && dialect == DialectType::Snowflake,
                             validation_codes::E_INVALID_CAST,
                             validation_codes::W_LOSSY_CAST,
                             "Invalid interval literal".to_owned(),
@@ -369,7 +376,7 @@ pub(super) fn check(
                 1,
                 ty,
                 "a temporal argument",
-                coercion::temporal_argument(dialect, &expr.this, ty),
+                coercion::temporal_function_argument("date_trunc", dialect, &expr.this, ty),
             );
         }
         Expression::Extract(expr) => {
@@ -381,7 +388,7 @@ pub(super) fn check(
                 1,
                 ty,
                 "a temporal argument",
-                coercion::temporal_argument(dialect, &expr.this, ty),
+                coercion::temporal_function_argument("extract", dialect, &expr.this, ty),
             );
         }
         Expression::DateDiff(expr) => {
@@ -410,7 +417,15 @@ pub(super) fn check(
             signatures::unify(&values, dialect, schema, context, strict, errors);
         }
         Expression::IfFunc(expr) => {
-            predicate(&expr.condition);
+            if dialect != DialectType::Snowflake
+                || !predicate_expression_compatible(
+                    &expr.condition,
+                    family(&expr.condition),
+                    dialect,
+                )
+            {
+                predicate(&expr.condition);
+            }
             let mut values = vec![&expr.true_value];
             values.extend(expr.false_value.iter());
             signatures::unify(&values, dialect, schema, context, strict, errors);
@@ -438,24 +453,29 @@ pub(super) fn check(
                 && ty != TypeFamily::Interval
             {
                 errors.push(type_issue(
-                    strict,
+                    strict && !(dialect == DialectType::Snowflake && ty == TypeFamily::String),
                     validation_codes::E_INVALID_ARITHMETIC_TYPE,
                     validation_codes::W_IMPLICIT_CAST_ARITHMETIC,
                     format!("Unary minus cannot operate on {}", type_family_name(ty)),
                 ));
             }
         }
-        Expression::Cast(expr) if dialect == DialectType::DuckDB => {
+        Expression::Cast(expr)
+            if matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) =>
+        {
             let source = family(&expr.this);
             let target = data_type_family(&expr.to);
             // Only reject established impossible built-in conversions. Unknown
             // names may be application-defined types and remain unchecked.
             if (source == TypeFamily::Timestamp
-                && matches!(target, TypeFamily::Boolean | TypeFamily::Integer))
+                && matches!(
+                    target,
+                    TypeFamily::Boolean | TypeFamily::Integer | TypeFamily::Numeric
+                ))
                 || (source == TypeFamily::Boolean && target == TypeFamily::Timestamp)
             {
                 errors.push(type_issue(
-                    false,
+                    strict && dialect == DialectType::Snowflake,
                     validation_codes::E_INVALID_CAST,
                     validation_codes::W_LOSSY_CAST,
                     format!(

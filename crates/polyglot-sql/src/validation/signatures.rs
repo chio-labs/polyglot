@@ -11,6 +11,27 @@ pub(crate) fn dialect_key(dialect: DialectType) -> &'static str {
     }
 }
 
+pub(super) fn check_builtin_arity(
+    name: &str,
+    arity: usize,
+    dialect: DialectType,
+    strict: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(signature) =
+        polyglot_sql_function_catalogs::types::builtin_arity(dialect_key(dialect), name)
+    {
+        if arity < signature.min_arity || signature.max_arity.is_some_and(|max| arity > max) {
+            errors.push(type_issue(
+                strict,
+                validation_codes::E_INVALID_FUNCTION_ARITY,
+                validation_codes::E_INVALID_FUNCTION_ARITY,
+                format!("Invalid arity for built-in function '{name}': got {arity}"),
+            ));
+        }
+    }
+}
+
 fn call(expr: &Expression) -> Option<(String, Vec<&Expression>)> {
     let args = match expr {
         Expression::Function(f) => {
@@ -104,6 +125,13 @@ pub(super) fn check(
     let Some((name, mut args)) = call(node) else {
         return false;
     };
+    // Parser-wide aliases are not necessarily built-in aliases in this engine
+    // (Snowflake DATEDIFF exists, but DATE_DIFF may be a warehouse UDF).
+    let arity_name = match node {
+        Expression::Function(function) => function.name.to_ascii_lowercase(),
+        _ => name.clone(),
+    };
+    check_builtin_arity(&arity_name, args.len(), dialect, strict, errors);
     let Some(signature) = type_signature(dialect_key(dialect), &name) else {
         return false;
     };
@@ -118,6 +146,19 @@ pub(super) fn check(
         && infer_expression_type_family(args[1], schema, context).is_temporal()
     {
         args.swap(0, 1);
+    }
+    if dialect == DialectType::Snowflake && name == "lag" {
+        if args.get(1).is_some_and(|arg| {
+            arg.dfs()
+                .any(|node| matches!(node, Expression::Column(_) | Expression::Subquery(_)))
+        }) {
+            errors.push(type_issue(
+                strict,
+                validation_codes::E_INVALID_FUNCTION_ARGUMENT_TYPE,
+                validation_codes::W_FUNCTION_ARGUMENT_COERCION,
+                "LAG offset must be a constant expression".to_owned(),
+            ));
+        }
     }
     for (index, (arg, expected)) in args.iter().zip(signature.arguments).enumerate() {
         let family = infer_expression_type_family(arg, schema, context);
@@ -142,17 +183,20 @@ pub(super) fn check(
                 family,
                 TypeFamily::String | TypeFamily::Binary | TypeFamily::Array
             ),
-            ArgumentType::Temporal => coercion::temporal_argument(dialect, arg, family),
+            ArgumentType::Temporal => {
+                coercion::temporal_function_argument(&name, dialect, arg, family)
+            }
             ArgumentType::Boolean => predicate_compatible(family, dialect),
         };
         // Snowflake's string signatures permit scalar implicit conversion.
         let implicit = dialect == DialectType::Snowflake
-            && (*expected == ArgumentType::String
+            && (matches!(expected, ArgumentType::String | ArgumentType::Sequence)
                 || (family == TypeFamily::String
-                    && matches!(
-                        expected,
-                        ArgumentType::Numeric | ArgumentType::Integer | ArgumentType::Temporal
-                    )));
+                    && (matches!(expected, ArgumentType::Numeric | ArgumentType::Integer)
+                        || (*expected == ArgumentType::Temporal
+                            && coercion::temporal_function_argument(
+                                &name, dialect, arg, family,
+                            )))));
         let literal = match expected {
             ArgumentType::Integer | ArgumentType::Numeric => {
                 coercion::literal_coerces(dialect, arg, TypeFamily::Numeric)

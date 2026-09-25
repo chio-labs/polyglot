@@ -2467,7 +2467,7 @@ fn check_types(
     for node in stmt.dfs() {
         for (clause, predicate) in crate::binding::predicates(node) {
             let family = infer_expression_type_family(predicate, schema_map, &context);
-            if !predicate_expression_compatible(predicate, family, dialect) {
+            if !clause_predicate_expression_compatible(predicate, family, dialect) {
                 errors.push(type_issue(
                     strict && dialect != DialectType::DuckDB,
                     validation_codes::E_INVALID_PREDICATE_TYPE,
@@ -2614,6 +2614,7 @@ fn check_types(
                 if left != TypeFamily::Unknown
                     && right != TypeFamily::Unknown
                     && (!is_string_like(left) || !is_string_like(right))
+                    && dialect != DialectType::Snowflake
                 {
                     errors.push(type_issue(
                         strict,
@@ -3087,6 +3088,19 @@ fn predicate_expression_compatible(
     predicate_compatible(family, dialect)
         || (coercion::literal_coerces(dialect, expr, TypeFamily::Boolean)
             && !expressions::invalid_literal_for(expr, TypeFamily::Boolean))
+}
+
+fn clause_predicate_expression_compatible(
+    expr: &Expression,
+    family: TypeFamily,
+    dialect: DialectType,
+) -> bool {
+    // Snowflake coerces logical operands, but WHERE/HAVING/ON and searched
+    // CASE require a Boolean expression. The engine fixture proves this boundary.
+    if dialect == DialectType::Snowflake && coercion::fully_modelled(family) {
+        return family == TypeFamily::Boolean;
+    }
+    predicate_expression_compatible(expr, family, dialect)
 }
 
 mod coercion;
@@ -4197,6 +4211,13 @@ pub fn validate_parsed_with_schema(
                             .iter()
                             .any(|name| name.eq_ignore_ascii_case(&function.name))
                         {
+                            signatures::check_builtin_arity(
+                                &function.name.to_ascii_lowercase(),
+                                function.args.len(),
+                                dialect,
+                                strict,
+                                &mut all_errors,
+                            );
                             check_function_catalog(
                                 function,
                                 dialect,

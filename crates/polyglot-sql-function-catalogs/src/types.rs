@@ -27,6 +27,31 @@ pub struct TypeSignature {
     pub returns: ReturnType,
 }
 
+/// Partial built-in arities. Absence never means an unknown-function error:
+/// Snowflake installations may expose warehouse-defined functions.
+pub fn builtin_arity(dialect: &str, name: &str) -> Option<crate::FunctionSignature> {
+    use crate::FunctionSignature as Signature;
+    if dialect != "snowflake" {
+        return None;
+    }
+    Some(match name {
+        "sum" | "avg" | "min" | "max" | "stddev" | "stddev_pop" | "stddev_samp" | "variance"
+        | "var_pop" | "var_samp" | "abs" | "sqrt" | "upper" | "lower" | "length"
+        | "char_length" | "ntile" | "first_value" | "last_value" => Signature::exact(1),
+        "date_trunc" | "date_part" | "left" | "right" | "nullif" | "ifnull" | "nvl" | "power"
+        | "pow" | "mod" => Signature::exact(2),
+        "datediff" | "dateadd" | "split_part" | "iff" => Signature::exact(3),
+        "substring" | "substr" | "replace" => Signature::range(2, 3),
+        "lag" | "lead" | "round" => Signature::range(1, 3),
+        "floor" | "ceil" | "ceiling" | "trim" | "ltrim" | "rtrim" | "listagg" => {
+            Signature::range(1, 2)
+        }
+        "row_number" | "rank" | "dense_rank" => Signature::exact(0),
+        "coalesce" | "greatest" | "least" | "concat" => Signature::variadic(1),
+        _ => return None,
+    })
+}
+
 /// Type metadata is intentionally partial: absence means unchecked, not invalid.
 pub fn type_signature(dialect: &str, name: &str) -> Option<TypeSignature> {
     use ArgumentType::*;
@@ -89,6 +114,9 @@ mod tests {
 
     #[test]
     fn signatures_do_not_guess_unknown_dialects_or_functions() {
+        assert!(builtin_arity("snowflake", "order_total").is_none());
+        assert!(builtin_arity("snowflake", "date_diff").is_none());
+        assert!(builtin_arity("snowflake", "orders.sum").is_none());
         assert!(type_signature("unknown", "sum").is_none());
         assert!(type_signature("duckdb", "order_total").is_none());
         assert_eq!(

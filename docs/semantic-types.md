@@ -41,8 +41,8 @@ to VARCHAR. NULL and unknown input types are not rejected.
 | String literal to date/time/timestamp | yes | yes | yes | yes |
 | String literal to boolean | yes | yes | yes | no |
 | String/scalar set-operation combination | yes | no | yes | no |
-| Boolean/numeric set-operation combination | yes | no | yes | no |
-| Numeric predicates | yes | no | yes | no |
+| Boolean/numeric set-operation combination | yes | no | no | no |
+| Numeric WHERE/HAVING/ON predicates | yes | no | no | no |
 
 Numeric-family widening and date/timestamp compatibility are shared. Arithmetic
 has directional date/integer and temporal/interval overload tables; an integer
@@ -55,7 +55,12 @@ with implicit-conversion warnings, never blocking errors. DuckDB's ordering and
 IN-subquery binders are stricter: a VARCHAR column ordered against INTEGER, or an
 INTEGER tested against a VARCHAR subquery column, is rejected at binding. These
 are distinct from comparisons involving coercible string literals. Snowflake's
-documented scalar coercions (including numeric/string predicates) are accepted.
+documented scalar coercions are context-dependent: logical operands can be
+coerced, while WHERE/HAVING/ON and searched CASE require Boolean expressions.
+NUMBER/TIMESTAMP comparisons and unification are rejected, even though explicit
+numeric-to-timestamp conversion is available. LIKE and string functions permit
+scalar-to-VARCHAR conversion. DATE_TRUNC/EXTRACT reject VARCHAR inputs, unlike
+DATEDIFF's accepted string-date overloads.
 
 DuckDB combination casting accepts boolean/numeric CASE and COALESCE inputs and
 VARCHAR set-operation outputs, but does not allow arbitrary VARCHAR columns in
@@ -93,6 +98,27 @@ date/time, string, math, and conditional functions. It is intentionally partial:
 functions absent from the type catalogue are unchecked for argument types. An
 arity catalogue entry does not imply complete type knowledge. Dialect-specific
 overloads such as reversed STRFTIME arguments are handled explicitly.
+Snowflake uses a partial built-in arity table, not an allowlist of function names:
+unknown warehouse-defined functions never receive E202 by default.
+
+## Snowflake engine regression fixture
+
+`tests/fixtures/snowflake_semantic_truth.json` contains 211 synthetic cases:
+126 compile failures, 30 execution-only failures, and 55 valid queries. The
+verdicts were obtained with `EXPLAIN USING TEXT`, followed by execution when
+compilation succeeded. `executed_sql` retains the typed inline-CTE inputs and
+synthetic rows. Tests replay `sql` using matching explicit schemas, as native
+consumers do. Only numeric Snowflake error codes are retained, never raw warehouse
+responses, account/host/user identifiers, or connection details.
+
+Tests prohibit errors on every valid or execution-only case and require errors
+on the 119 claimed compile-failure cases. Unknown functions and unrecognized type
+names remain intentionally unchecked. Snowflake accepts duplicate CTE names, but
+requires matching CTE alias counts and selected DISTINCT ordering columns;
+DuckDB's different behavior is covered by controls. WITHIN GROUP ordering belongs
+to the aggregate, rather than being an ungrouped projection. Snowflake rejects the
+documented impossible timestamp/number/boolean casts at compilation; DuckDB defers
+those conversions until execution and continues to receive warnings.
 
 ## Diagnostics
 

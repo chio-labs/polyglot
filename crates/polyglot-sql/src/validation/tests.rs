@@ -3,6 +3,186 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn snowflake_engine_truth_regressions() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        id: String,
+        sql: String,
+        verdict: String,
+        expected_error: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        schema: ValidationSchema,
+        cases: Vec<Case>,
+    }
+    // SQL is replayed with the same typed inputs used by the inline CTEs in
+    // executed_sql. Only synthetic SQL, verdicts and numeric engine codes are
+    // retained; raw warehouse error responses are deliberately excluded.
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../tests/fixtures/snowflake_semantic_truth.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.cases.len(), 211);
+    let options = SchemaValidationOptions {
+        check_types: true,
+        check_references: true,
+        semantic: true,
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    let mut counts = [0; 3];
+    let mut claimed = 0;
+    for case in fixture.cases {
+        let result =
+            validate_with_schema(&case.sql, DialectType::Snowflake, &fixture.schema, &options);
+        let errors: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|e| e.severity == crate::ValidationSeverity::Error)
+            .collect();
+        assert!(
+            !errors.iter().any(|e| e.code == "E202"),
+            "{}: Snowflake UDF names must remain open",
+            case.id
+        );
+        match case.verdict.as_str() {
+            "valid" => counts[0] += 1,
+            "runtime_error" => counts[1] += 1,
+            "compile_error" => counts[2] += 1,
+            other => panic!("Unknown engine verdict {other}"),
+        }
+        if case.expected_error {
+            claimed += 1;
+        }
+        if (case.verdict != "compile_error" && !result.valid)
+            || (case.expected_error && result.valid)
+            || (["f01", "F17", "F18", "F04", "F06", "R03"].contains(&case.id.as_str())
+                && !result.valid)
+        {
+            failures.push(format!(
+                "{} ({}, covered={}): {}: {:?}",
+                case.id, case.verdict, case.expected_error, case.sql, errors
+            ));
+        }
+    }
+    assert_eq!(counts, [55, 30, 126]);
+    assert_eq!(claimed, 119);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn snowflake_ordered_set_aggregates_and_dialect_controls() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        semantic: true,
+        ..Default::default()
+    };
+    for (dialect, sql) in [
+        (
+            DialectType::Snowflake,
+            "SELECT LISTAGG(s, ',') WITHIN GROUP (ORDER BY s) FROM orders",
+        ),
+        (
+            DialectType::Snowflake,
+            "SELECT ARRAY_AGG(i) WITHIN GROUP (ORDER BY i) FROM orders",
+        ),
+        (
+            DialectType::Snowflake,
+            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i) FROM orders",
+        ),
+        (
+            DialectType::PostgreSQL,
+            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i) FROM orders",
+        ),
+        (
+            DialectType::DuckDB,
+            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i) FROM orders",
+        ),
+        (
+            DialectType::Snowflake,
+            "SELECT UPPER(i), LOWER(ts), LEFT(i, 1), SPLIT_PART(ts, '-', 1), LENGTH(i) FROM orders",
+        ),
+        (
+            DialectType::Snowflake,
+            "SELECT COALESCE(i,s), s = TRUE FROM orders",
+        ),
+    ] {
+        let result = validate_with_schema(sql, dialect, &schema, &options);
+        assert!(result.valid, "{dialect:?}: {sql}: {:?}", result.errors);
+    }
+    let result = validate_with_schema(
+        "SELECT i, LISTAGG(s, ',') WITHIN GROUP (ORDER BY s) FROM orders",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    assert!(result.errors.iter().any(|e| e.code == "E230"));
+    for sql in [
+        "SELECT AVG(ts) FROM orders",
+        "SELECT SUM(b) FROM orders",
+        "SELECT i FROM orders WHERE i",
+        "SELECT i FROM orders UNION ALL SELECT b FROM orders",
+        "WITH c(a,b) AS (SELECT i FROM orders) SELECT a FROM c",
+        "WITH c(a) AS (SELECT i,s FROM orders) SELECT a FROM c",
+        "SELECT DISTINCT s FROM orders ORDER BY i",
+        "SELECT LAG(i, i) OVER (ORDER BY i) FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(result.valid, "DuckDB control {sql}: {:?}", result.errors);
+    }
+    for sql in [
+        "WITH c(a) AS (SELECT i,s FROM orders) SELECT a FROM c",
+        "SELECT LAG(i, i) OVER (ORDER BY i) FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(!result.valid, "Snowflake error {sql}: {:?}", result.errors);
+    }
+}
+
+#[test]
+fn snowflake_builtin_arity_does_not_close_function_namespace() {
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            check_types,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT SUM(i, i) FROM orders",
+            "SELECT DATE_TRUNC('day')",
+            "SELECT SUBSTRING(s) FROM orders",
+        ] {
+            let result = validate_with_schema(
+                sql,
+                DialectType::Snowflake,
+                &semantic_type_schema(),
+                &options,
+            );
+            assert!(
+                result.errors.iter().any(|e| e.code == "E203"),
+                "{sql}: {:?}",
+                result.errors
+            );
+        }
+        for sql in [
+            "SELECT order_total(i, s) FROM orders",
+            "SELECT DATE_DIFF('day', s, ts) FROM orders",
+            "SELECT not_a_function(i) FROM orders",
+        ] {
+            let result = validate_with_schema(
+                sql,
+                DialectType::Snowflake,
+                &semantic_type_schema(),
+                &options,
+            );
+            assert!(result.valid, "{sql}: {:?}", result.errors);
+        }
+    }
+}
+
+#[test]
 fn review_bind_time_coercion_controls() {
     use DialectType::{BigQuery, DuckDB, Generic, PostgreSQL, Snowflake};
     let schema: ValidationSchema = serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[{"name":"x","type":"NUMBER(38,0)"},{"name":"i","type":"INTEGER"},{"name":"s","type":"VARCHAR"},{"name":"ts","type":"TIMESTAMP"}]}]})).unwrap();
@@ -305,16 +485,29 @@ fn semantic_type_dialect_boundaries() {
     for sql in [
         "SELECT i = s FROM orders",
         "SELECT COALESCE(i,s) FROM orders",
-        "SELECT i FROM orders WHERE i",
-        "SELECT i FROM orders WHERE s",
         "SELECT UPPER(i) FROM orders",
         "SELECT ABS(s) FROM orders",
-        "SELECT ts > 5 FROM orders",
     ] {
         let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
         assert!(result.valid, "{sql}: {:?}", result.errors);
     }
-    for dialect in [DialectType::PostgreSQL, DialectType::BigQuery] {
+    for sql in [
+        "SELECT i FROM orders WHERE i",
+        "SELECT i FROM orders WHERE s",
+        "SELECT ts > 5 FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(
+            !result.valid,
+            "Snowflake binder rejection {sql}: {:?}",
+            result.errors
+        );
+    }
+    for dialect in [
+        DialectType::PostgreSQL,
+        DialectType::BigQuery,
+        DialectType::Snowflake,
+    ] {
         for sql in [
             "SELECT i FROM orders WHERE i",
             "SELECT i FROM orders UNION ALL SELECT b FROM orders",

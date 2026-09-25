@@ -318,7 +318,11 @@ fn grouping(
         let mut pending = vec![unalias(projection)];
         let mut expanded = HashSet::new();
         while let Some(node) = pending.pop() {
-            if boundary(node) || is_aggregate(node) || groups.iter().any(|group| *group == node) {
+            if boundary(node)
+                || is_aggregate(node)
+                || matches!(node, Expression::WithinGroup(group) if is_aggregate(&group.this))
+                || groups.iter().any(|group| *group == node)
+            {
                 continue;
             }
             if let Expression::Column(column) = node {
@@ -380,7 +384,20 @@ fn check_structure(
     if let Some(with) = &select.with {
         let mut names = HashSet::new();
         for cte in &with.ctes {
-            if !names.insert(key(&cte.alias)) {
+            if dialect == DialectType::Snowflake && !cte.columns.is_empty() {
+                if let Ok(outputs) =
+                    crate::set_operation::query_output_identifiers(&cte.this, Some(dialect))
+                {
+                    if outputs.len() != cte.columns.len() {
+                        errors.push(issue(
+                            &cte.this,
+                            validation_codes::E_CTE_COLUMN_COUNT_MISMATCH,
+                            "CTE column alias count does not match its output column count",
+                        ));
+                    }
+                }
+            }
+            if !names.insert(key(&cte.alias)) && dialect == DialectType::DuckDB {
                 errors.push(issue(
                     node,
                     "E233",
@@ -849,6 +866,35 @@ pub(crate) fn check_semantics(
             errors.push(warning);
         }
         if select.distinct && select.order_by.is_some() {
+            if dialect == DialectType::Snowflake
+                && select
+                    .expressions
+                    .iter()
+                    .all(|expr| matches!(unalias(expr), Expression::Column(_)))
+            {
+                let key =
+                    |name: &Identifier| crate::set_operation::identifier_key(name, Some(dialect));
+                let mut selected = HashSet::new();
+                for expr in &select.expressions {
+                    if let Expression::Alias(alias) = expr {
+                        selected.insert(key(&alias.alias));
+                    }
+                    if let Expression::Column(column) = unalias(expr) {
+                        selected.insert(key(&column.name));
+                    }
+                }
+                for ordered in select.order_by.iter().flat_map(|order| &order.expressions) {
+                    if let Expression::Column(column) = &ordered.this {
+                        if !selected.contains(&key(&column.name)) {
+                            errors.push(issue(
+                                &ordered.this,
+                                validation_codes::E_UNKNOWN_COLUMN,
+                                "DISTINCT ORDER BY references a non-selected column",
+                            ));
+                        }
+                    }
+                }
+            }
             errors.push(ValidationError::warning(
                 "DISTINCT with ORDER BY: ensure ORDER BY columns are in SELECT list",
                 "W003",
