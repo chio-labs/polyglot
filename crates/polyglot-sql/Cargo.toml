@@ -27,7 +27,7 @@ generate = []
 transpile = ["generate"]
 builder = ["generate"]
 ast-tools = []
-semantic = ["ast-tools"]
+semantic = ["ast-tools", "function-catalog-duckdb", "dep:regex"]
 openlineage = ["semantic"]
 diff = ["generate"]
 planner = []
@@ -99,6 +99,7 @@ function-catalog-all-dialects = [
 ]
 
 [dependencies]
+regex = { version = "1", optional = true }
 polyglot-sql-ast-derive = { path = "../polyglot-sql-ast-derive", version = "0.12.3" }
 serde = { workspace = true }
 serde_json = { workspace = true }

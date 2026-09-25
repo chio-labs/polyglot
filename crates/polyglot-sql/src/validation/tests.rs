@@ -2,6 +2,246 @@ use super::*;
 use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFunctionCatalog};
 use std::sync::Arc;
 
+fn semantic_type_schema() -> ValidationSchema {
+    serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[
+        {"name":"i","type":"INTEGER"}, {"name":"s","type":"VARCHAR"},
+        {"name":"ts","type":"TIMESTAMP"}, {"name":"d","type":"DATE"},
+        {"name":"b","type":"BOOLEAN"}
+    ]}]}))
+    .unwrap()
+}
+
+#[test]
+fn semantic_type_literal_coercion_and_controls() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        ..Default::default()
+    };
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::Snowflake,
+        DialectType::BigQuery,
+    ] {
+        for sql in [
+            "SELECT ts > '2026-01-01' FROM orders",
+            "SELECT d = '2026-01-01' FROM orders",
+            "SELECT ts BETWEEN '2026-01-01' AND '2026-12-31' FROM orders",
+            "SELECT d IN ('2026-01-01') FROM orders",
+            "SELECT COALESCE(ts, '2026-01-01') FROM orders",
+            "SELECT CASE WHEN b THEN ts ELSE '2026-01-01' END FROM orders",
+        ] {
+            let result = validate_with_schema(sql, dialect, &schema, &options);
+            assert!(result.valid, "{dialect:?}: {sql}: {:?}", result.errors);
+        }
+    }
+    for sql in [
+        "SELECT i = '5' FROM orders",
+        "SELECT ts FROM orders UNION ALL SELECT s FROM orders",
+        "SELECT i FROM orders UNION ALL SELECT b FROM orders",
+        "SELECT i FROM orders WHERE i",
+        "SELECT NOT i FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for (sql, code) in [
+        ("SELECT ts > 5 FROM orders", "E217"),
+        ("SELECT i * s FROM orders", "E212"),
+        ("SELECT i - ts FROM orders", "E212"),
+        ("SELECT SUM(s) FROM orders", "E213"),
+        ("SELECT SUM(s) OVER () FROM orders", "E213"),
+        ("SELECT COALESCE(i, ts) FROM orders", "E213"),
+        ("SELECT CASE WHEN s THEN i ELSE 0 END FROM orders", "E211"),
+        ("SELECT -s FROM orders", "E212"),
+        ("SELECT CAST(ts AS BOOLEAN) FROM orders", "E218"),
+        ("SELECT i IN (SELECT i, s FROM orders) FROM orders", "E216"),
+        ("SELECT not_a_function(i) FROM orders", "E202"),
+        ("SELECT COALESCE() FROM orders", "E203"),
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(
+            result.errors.iter().any(|e| e.code == code),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+}
+
+#[test]
+fn semantic_type_registered_functions_are_allowed() {
+    let options: SchemaValidationOptions = serde_json::from_value(
+        serde_json::json!({"check_types":true,"known_functions":["order_total"]}),
+    )
+    .unwrap();
+    let result = validate_with_schema(
+        "SELECT order_total(i) FROM orders",
+        DialectType::DuckDB,
+        &semantic_type_schema(),
+        &options,
+    );
+    assert!(result.valid, "{:?}", result.errors);
+    let result = validate_with_schema(
+        "SELECT order_total(s) + 1 FROM orders",
+        DialectType::DuckDB,
+        &semantic_type_schema(),
+        &options,
+    );
+    assert!(result.valid, "{:?}", result.errors);
+    let options: SchemaValidationOptions = serde_json::from_value(
+        serde_json::json!({"check_types":true,"known_types":["order_state"]}),
+    )
+    .unwrap();
+    assert!(
+        validate_with_schema(
+            "SELECT CAST(s AS order_state) FROM orders",
+            DialectType::DuckDB,
+            &semantic_type_schema(),
+            &options
+        )
+        .valid
+    );
+}
+
+#[test]
+fn semantic_type_dialect_boundaries() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        ..Default::default()
+    };
+    for sql in [
+        "SELECT i = s FROM orders",
+        "SELECT COALESCE(i,s) FROM orders",
+        "SELECT i FROM orders WHERE i",
+        "SELECT i FROM orders WHERE s",
+        "SELECT UPPER(i) FROM orders",
+        "SELECT ABS(s) FROM orders",
+        "SELECT ts > 5 FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for dialect in [DialectType::PostgreSQL, DialectType::BigQuery] {
+        for sql in [
+            "SELECT i FROM orders WHERE i",
+            "SELECT i FROM orders UNION ALL SELECT b FROM orders",
+        ] {
+            assert!(
+                !validate_with_schema(sql, dialect, &schema, &options).valid,
+                "{dialect}: {sql}"
+            );
+        }
+    }
+    assert!(
+        !validate_with_schema(
+            "SELECT i = '5' FROM orders",
+            DialectType::BigQuery,
+            &schema,
+            &options
+        )
+        .valid
+    );
+    assert!(
+        validate_with_schema(
+            "SELECT i = '5' FROM orders",
+            DialectType::PostgreSQL,
+            &schema,
+            &options
+        )
+        .valid
+    );
+    for sql in [
+        "SELECT NOT 'true'",
+        "SELECT i FROM orders WHERE 'false'",
+        "SELECT CASE WHEN 'true' THEN 1 ELSE 0 END",
+        "SELECT AVG(ts) > TIMESTAMP '2026-01-01' FROM orders",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+}
+
+#[test]
+fn semantic_type_structure_and_negative_controls() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    for (sql, code) in [
+        ("WITH q AS (SELECT * FROM orders) SELECT missing FROM q", "E201"),
+        ("SELECT missing FROM (SELECT * FROM orders) q", "E201"),
+        ("SELECT * EXCLUDE (missing) FROM orders", "E201"),
+        ("SELECT missing.* FROM orders", "E200"),
+        ("SELECT a.i FROM orders a JOIN orders a ON true", "E233"),
+        ("WITH q AS (SELECT 1), q AS (SELECT 2) SELECT * FROM q", "E233"),
+        ("SELECT a.i FROM orders a JOIN orders b ON a.i = c.i JOIN orders c ON true", "E200"),
+        ("SELECT ROW_NUMBER() FROM orders", "E232"),
+        ("SELECT SUM(i) OVER absent FROM orders", "E232"),
+        ("SELECT i FROM orders QUALIFY i > 0", "E232"),
+        ("SELECT i FROM orders LIMIT -1", "E234"),
+        ("SELECT i FROM orders LIMIT i", "E234"),
+        ("SELECT (SELECT i, s FROM orders) FROM orders", "E216"),
+        ("SELECT (SELECT i, s FROM orders) AS total FROM orders", "E216"),
+        ("SELECT DATE '2026-02-30'", "E218"),
+        ("SELECT TIMESTAMP 'invalid'", "E218"),
+        ("SELECT TIMESTAMP '2026-01-01 99:99:99'", "E218"),
+        ("SELECT INTERVAL 'invalid'", "E218"),
+        ("SELECT SUBSTRING(s) FROM orders", "E203"),
+        ("SELECT DATE_TRUNC('day') FROM orders", "E203"),
+        ("SELECT SUM(i, i) FROM orders", "E203"),
+        ("SELECT DATE_TRUNC('day', s) FROM orders", "E213"),
+        ("SELECT LAG(i, s) OVER () FROM orders", "E213"),
+        ("SELECT NTILE(s) OVER () FROM orders", "E213"),
+        ("SELECT i FROM orders ORDER BY 9", "E201"),
+        ("SELECT i FROM orders UNION ALL SELECT i FROM orders ORDER BY s", "E201"),
+        ("SELECT COLUMNS('missing') FROM orders", "E201"),
+        ("SELECT a.i FROM orders a JOIN orders b USING (missing)", "E201"),
+        ("SELECT CAST(i AS unknown_type) FROM orders", "E218"),
+        ("SELECT * FROM (SELECT i FROM orders) a JOIN (SELECT s AS i FROM orders) b USING (i)", "E217"),
+        ("SELECT STRING_AGG(i, 5) FROM orders", "E213"),
+        ("SELECT i IN ('invalid') FROM orders", "E218"),
+        ("SELECT ts = 'invalid' FROM orders", "E218"),
+        ("SELECT i BETWEEN 'invalid' AND 'other' FROM orders", "E218"),
+        ("WITH RECURSIVE q(n) AS (SELECT 1 UNION ALL SELECT 'invalid' FROM q WHERE n < 3) SELECT n FROM q", "E215"),
+        ("SELECT SUM(i) OVER (ORDER BY s RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM orders", "E232"),
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(result.errors.iter().any(|e| e.code == code), "{sql}: {:?}", result.errors);
+    }
+    for sql in [
+        "WITH q AS (SELECT * FROM orders) SELECT i FROM q",
+        "SELECT i FROM (SELECT * FROM orders) q",
+        "SELECT a.i FROM orders a JOIN orders b ON a.i=b.i",
+        "SELECT ROW_NUMBER() OVER w FROM orders WINDOW w AS (ORDER BY i)",
+        "SELECT i FROM orders QUALIFY ROW_NUMBER() OVER () = 1",
+        "SELECT i FROM orders LIMIT 1.5", "SELECT i FROM orders LIMIT '2'",
+        "SELECT EXISTS (SELECT i, s FROM orders) FROM orders",
+        "SELECT * FROM (SELECT i, s FROM orders) q",
+        "SELECT q.i FROM orders o, LATERAL (SELECT i, s FROM orders) q",
+        "SELECT SUM(b) FROM orders", "SELECT AVG(ts) FROM orders",
+        "SELECT COALESCE(i,b) FROM orders", "SELECT GREATEST(i,b) FROM orders",
+        "SELECT DATE '2024-02-29'", "SELECT DATE 'infinity'",
+        "SELECT TIMESTAMP '2026-01-01 24:00:00'",
+        "SELECT COLUMNS('^[is]$') FROM orders",
+        "SELECT a.i FROM orders a JOIN orders b USING (i)",
+        "SELECT * FROM (SELECT i FROM orders) a JOIN (SELECT i FROM orders) b USING (i)",
+        "SELECT STRING_AGG(i, ',') FROM orders",
+        "SELECT i FROM orders UNION ALL SELECT i FROM orders ORDER BY i",
+        "SELECT SUM(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM orders",
+        "SELECT SUM(i) OVER (ORDER BY s RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM orders",
+        "SELECT STRFTIME('%Y', ts) FROM orders",
+        "SELECT STRFTIME(ts, '%Y') FROM orders",
+        "SELECT CASE WHEN true THEN 1 ELSE 'unused' END",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+}
+
 #[test]
 fn cte_resolution_views_preserve_alias_types_and_union_error_locations() {
     let schema = review_schema();
@@ -159,7 +399,7 @@ fn review_name_aligned_set_operation_validation() {
         assert!(result.valid, "{sql}: {:?}", result.errors);
     }
     assert!(
-        !validate_with_schema(
+        validate_with_schema(
             "SELECT * FROM items UNION ALL BY NAME SELECT * FROM other",
             DialectType::DuckDB,
             &schema,

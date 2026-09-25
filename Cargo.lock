@@ -612,6 +612,7 @@ dependencies = [
  "polyglot-sql-ast-derive",
  "polyglot-sql-function-catalogs",
  "pretty_assertions",
+ "regex",
  "serde",
  "serde_json",
  "stacker",

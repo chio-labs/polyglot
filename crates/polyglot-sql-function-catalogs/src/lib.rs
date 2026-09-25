@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod types;
+
 #[cfg(feature = "dialect-clickhouse")]
 mod clickhouse;
 #[cfg(feature = "dialect-duckdb")]
@@ -81,7 +83,23 @@ pub fn register_enabled_catalogs<S: CatalogSink>(sink: &mut S) {
     #[cfg(feature = "dialect-clickhouse")]
     clickhouse::register(sink);
     #[cfg(feature = "dialect-duckdb")]
-    duckdb::register(sink);
+    {
+        duckdb::register(sink);
+        // Binder syntax, absent from duckdb_functions() introspection.
+        sink.register("duckdb", "columns", vec![FunctionSignature::exact(1)]);
+        for name in ["row_number", "rank", "dense_rank"] {
+            sink.register("duckdb", name, vec![FunctionSignature::exact(0)]);
+        }
+        for name in ["ntile", "first_value", "last_value"] {
+            sink.register("duckdb", name, vec![FunctionSignature::exact(1)]);
+        }
+        for name in ["lag", "lead"] {
+            sink.register("duckdb", name, vec![FunctionSignature::range(1, 3)]);
+        }
+        sink.register("duckdb", "coalesce", vec![FunctionSignature::variadic(1)]);
+        sink.register("duckdb", "ifnull", vec![FunctionSignature::exact(2)]);
+        sink.register("duckdb", "nullif", vec![FunctionSignature::exact(2)]);
+    }
 }
 
 #[cfg(test)]
