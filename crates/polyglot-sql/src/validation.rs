@@ -3500,12 +3500,39 @@ enum OutputNameResolution {
     InputFirst,
 }
 
+/// Recognize the select-list ordering keyword only in its supported clause form.
+fn is_order_by_all(order_by: &crate::expressions::OrderBy, dialect: DialectType) -> bool {
+    if !matches!(dialect, DialectType::DuckDB | DialectType::Snowflake) || order_by.siblings {
+        return false;
+    }
+    let [ordered] = order_by.expressions.as_slice() else {
+        return false;
+    };
+    if ordered.with_fill.is_some() {
+        return false;
+    }
+    // The parser represents ORDER BY ALL as an unqualified Column (unlike
+    // GROUP BY ALL's dedicated flag). Keep the public AST unchanged. Direction
+    // and NULLS modifiers live on Ordered and apply to the entire select list.
+    // Quoted/qualified names, parenthesized expressions, and mixed sort lists
+    // remain ordinary references; Expression::All is a quantified expression.
+    let name = match &ordered.this {
+        Expression::Column(column) if column.table.is_none() && !column.join_mark => &column.name,
+        Expression::Identifier(identifier) => identifier,
+        _ => return false,
+    };
+    !name.quoted && name.name.eq_ignore_ascii_case("all")
+}
+
 /// Collect ordering references together with whether they can resolve to the
 /// current SELECT's outputs. Other clauses use the ordinary input-source walk.
 fn order_by_validation_columns(
     order_by: &crate::expressions::OrderBy,
     dialect: DialectType,
 ) -> Vec<(&Column, OutputNameResolution)> {
+    if is_order_by_all(order_by, dialect) {
+        return Vec::new();
+    }
     // Only enable aliases inside scalar expressions for dialects whose rules
     // support them. In particular, PostgreSQL and T-SQL require standalone
     // output names; `ORDER BY alias + 1` must resolve against input columns.

@@ -312,6 +312,7 @@ fn grouping(
             select
                 .order_by
                 .iter()
+                .filter(|order| !is_order_by_all(order, dialect))
                 .flat_map(|order| order.expressions.iter().map(|e| (&e.this, true))),
         );
     for (projection, allow_aliases) in expressions {
@@ -566,7 +567,7 @@ pub(crate) fn check_semantics(
             Expression::Except(query) => query.order_by.as_ref(),
             _ => None,
         };
-        if let Some(order) = set_order {
+        if let Some(order) = set_order.filter(|order| !is_order_by_all(order, dialect)) {
             if let Ok(outputs) = crate::set_operation::query_output_identifiers(node, Some(dialect))
             {
                 for ordered in &order.expressions {
@@ -594,7 +595,7 @@ pub(crate) fn check_semantics(
             .iter()
             .any(|expr| expr.dfs().any(|node| matches!(node, Expression::Star(_) | Expression::BracedWildcard(_)) || matches!(node, Expression::Function(f) if f.name.eq_ignore_ascii_case("columns"))))
         {
-            for ordered in select.order_by.iter().flat_map(|order| &order.expressions) {
+            for ordered in select.order_by.iter().filter(|order| !is_order_by_all(order, dialect)).flat_map(|order| &order.expressions) {
                 if let Expression::Literal(literal) = &ordered.this {
                     if let crate::expressions::Literal::Number(number) = literal.as_ref() {
                         if number.parse::<usize>().is_ok_and(|position| {
@@ -832,7 +833,11 @@ pub(crate) fn check_semantics(
                 &mut errors,
             );
         }
-        if let Some(order) = &select.order_by {
+        if let Some(order) = select
+            .order_by
+            .as_ref()
+            .filter(|order| !is_order_by_all(order, dialect))
+        {
             for e in &order.expressions {
                 placement(&e.this, true, true, placement_aliases, dialect, &mut errors);
             }
@@ -865,7 +870,12 @@ pub(crate) fn check_semantics(
             warning.severity = crate::ValidationSeverity::Warning;
             errors.push(warning);
         }
-        if select.distinct && select.order_by.is_some() {
+        if select.distinct
+            && select
+                .order_by
+                .as_ref()
+                .is_some_and(|order| !is_order_by_all(order, dialect))
+        {
             if dialect == DialectType::Snowflake
                 && select
                     .expressions

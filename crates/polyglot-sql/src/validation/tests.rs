@@ -3,6 +3,125 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn order_by_all_expands_selected_columns_in_supported_dialects() {
+    let schema = semantic_type_schema();
+    for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
+        for check_types in [false, true] {
+            let options = SchemaValidationOptions {
+                check_types,
+                semantic: true,
+                check_references: true,
+                ..Default::default()
+            };
+            for distinct in ["", "DISTINCT "] {
+                for ordering in ["ALL", "all ASC", "ALL DESC NULLS FIRST", "ALL NULLS LAST"] {
+                    let sql = format!(
+                        "SELECT {distinct}a, b FROM (SELECT 1 AS a, 2 AS b) t ORDER BY {ordering}"
+                    );
+                    let result = validate_with_schema(&sql, dialect, &schema, &options);
+                    assert!(
+                        result.valid,
+                        "{dialect:?}, types={check_types}, {sql}: {:?}",
+                        result.errors
+                    );
+                    for operation in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+                        let sql = format!("SELECT {distinct}a FROM (SELECT 1 AS a) t {operation} SELECT 2 AS a ORDER BY {ordering}");
+                        let result = validate_with_schema(&sql, dialect, &schema, &options);
+                        assert!(
+                            result.valid,
+                            "{dialect:?}, types={check_types}, {sql}: {:?}",
+                            result.errors
+                        );
+                    }
+                }
+            }
+            for sql in [
+                "WITH q AS (SELECT a FROM (SELECT 1 a) t ORDER BY ALL DESC) SELECT a FROM q ORDER BY ALL",
+                "SELECT a FROM (SELECT 1 a) t GROUP BY ALL ORDER BY ALL",
+                "SELECT a FROM (SELECT 1 a, 2 AS \"all\") t ORDER BY ALL",
+                "SELECT 1 AS all ORDER BY ALL",
+            ] {
+                let result = validate_with_schema(sql, dialect, &schema, &options);
+                assert!(result.valid, "{dialect:?}, types={check_types}, {sql}: {:?}", result.errors);
+            }
+        }
+    }
+    let result = validate_with_schema(
+        "SELECT a, COUNT(*) FROM (VALUES (1), (2)) t(a) GROUP BY ALL ORDER BY ALL DESC",
+        DialectType::DuckDB,
+        &schema,
+        &SchemaValidationOptions {
+            check_types: true,
+            semantic: true,
+            ..Default::default()
+        },
+    );
+    assert!(result.valid, "{:?}", result.errors);
+}
+
+#[test]
+fn order_by_all_preserves_real_column_resolution() {
+    let schema = semantic_type_schema();
+    for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
+        for check_types in [false, true] {
+            let options = SchemaValidationOptions {
+                check_types,
+                semantic: true,
+                check_references: true,
+                ..Default::default()
+            };
+            for sql in [
+                "SELECT DISTINCT \"all\" FROM (SELECT 1 AS \"all\") t ORDER BY \"all\" DESC NULLS LAST",
+                "SELECT DISTINCT t.\"all\" FROM (SELECT 1 AS \"all\") t ORDER BY t.\"all\"",
+                "SELECT a FROM (SELECT 1 AS a, 2 AS \"ALL\") t ORDER BY t.all",
+                "SELECT a FROM (SELECT 1 AS a, 2 AS \"ALL\") t ORDER BY t.all + 1",
+                "SELECT 1 AS \"all\" UNION ALL SELECT 2 AS \"all\" ORDER BY \"all\"",
+            ] {
+                let result = validate_with_schema(sql, dialect, &schema, &options);
+                assert!(result.valid, "{dialect:?}, types={check_types}, {sql}: {:?}", result.errors);
+            }
+            for sql in [
+                "SELECT a FROM (SELECT 1 AS a) t ORDER BY \"all\"",
+                "SELECT DISTINCT a FROM (SELECT 1 AS a) t ORDER BY \"all\"",
+                "SELECT a FROM (SELECT 1 AS a) t ORDER BY t.all",
+                "SELECT a FROM (SELECT 1 AS a) t ORDER BY ALL, missing",
+                "SELECT 1 AS a UNION ALL SELECT 2 AS a ORDER BY \"all\"",
+            ] {
+                let result = validate_with_schema(sql, dialect, &schema, &options);
+                assert!(
+                    !result.valid && result.errors.iter().any(|e| e.code == "E201"),
+                    "{dialect:?}, types={check_types}, {sql}: {:?}",
+                    result.errors
+                );
+            }
+        }
+    }
+    let options = SchemaValidationOptions {
+        semantic: true,
+        ..Default::default()
+    };
+    assert!(
+        !validate_with_schema(
+            "SELECT a FROM (SELECT 1 a) t ORDER BY ALL",
+            DialectType::Generic,
+            &schema,
+            &options
+        )
+        .valid
+    );
+    // A real, non-selected column must still trigger Snowflake DISTINCT's rule.
+    assert!(
+        !validate_with_schema(
+            "SELECT DISTINCT a FROM (SELECT 1 a, 2 AS \"all\") t ORDER BY \"all\"",
+            DialectType::Snowflake,
+            &schema,
+            &options
+        )
+        .valid
+    );
+}
+
+#[test]
 fn snowflake_engine_truth_regressions() {
     #[derive(serde::Deserialize)]
     struct Case {
