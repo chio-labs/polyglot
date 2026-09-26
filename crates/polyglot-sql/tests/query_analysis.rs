@@ -360,7 +360,7 @@ complexity_guard: None,
 fn analyze_query_infers_the_selected_expression_not_an_arbitrary_upstream_cast() {
     for (sql, expected) in [
         ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT CAST(n AS VARCHAR) AS n FROM a) SELECT n FROM b", "TEXT"),
-        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n + 0.5 AS n FROM a) SELECT n FROM b", "DOUBLE"),
+        ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n + 0.5 AS n FROM a) SELECT n FROM b", "DECIMAL(12, 1)"),
         ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (WITH a AS (SELECT CAST('2024-01-01' AS DATE) AS n) SELECT n FROM a) SELECT n FROM b", "DATE"),
         ("WITH a AS (SELECT CAST('1' AS INT) AS n), b AS (SELECT n FROM a UNION ALL SELECT n FROM a) SELECT n FROM b", "INT"),
     ] {

@@ -19,6 +19,8 @@ use crate::expressions::{
 use crate::schema::{normalize_name, Schema, SchemaError, SchemaResult, TABLE_PARTS};
 use crate::traversal::ExpressionWalk;
 
+mod engine;
+
 /// Type coercion class for determining result types in binary operations.
 /// Higher-priority classes win during coercion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -403,6 +405,15 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Annotate types for an expression tree
     pub fn annotate(&mut self, expr: &Expression) -> Option<DataType> {
+        if let Some(engine) = engine::Engine::of(self._dialect) {
+            if let Some(result) = self.annotate_engine(engine, expr) {
+                return result;
+            }
+        }
+        self.annotate_default(expr)
+    }
+
+    fn annotate_default(&mut self, expr: &Expression) -> Option<DataType> {
         if self._dialect == Some(DialectType::Snowflake) {
             match expr {
                 Expression::CurrentTimestamp(_) | Expression::CurrentTimestampLTZ(_) => {
@@ -1345,6 +1356,17 @@ impl<'a> TypeAnnotator<'a> {
         self.annotate(&lv.this)
     }
 
+    /// Annotate a literal as bound by `dialect`.
+    pub(super) fn annotate_literal_for(
+        lit: &Literal,
+        dialect: Option<DialectType>,
+    ) -> Option<DataType> {
+        match engine::Engine::of(dialect) {
+            Some(engine) => engine::literal_type(engine, lit),
+            None => Self::annotate_literal(lit),
+        }
+    }
+
     /// Annotate a literal value
     pub(super) fn annotate_literal(lit: &Literal) -> Option<DataType> {
         match lit {
@@ -1445,6 +1467,11 @@ impl<'a> TypeAnnotator<'a> {
             || func.name.eq_ignore_ascii_case("ARRAY_FILTER")
         {
             return func.args.first().and_then(|arg| self.annotate(arg));
+        }
+        if let Some(engine) = engine::Engine::of(self._dialect) {
+            if let Some(result) = self.annotate_engine_function(engine, func) {
+                return result;
+            }
         }
         let func_name = func.name.to_uppercase();
 
@@ -1589,7 +1616,10 @@ impl<'a> TypeAnnotator<'a> {
                     };
                 }
                 self.used_unknown_function_fallback = true;
-                if self._dialect == Some(DialectType::Snowflake) {
+                if engine::Engine::of(self._dialect).is_some() {
+                    // An unmodelled function's result is not its first argument's type.
+                    None
+                } else if self._dialect == Some(DialectType::Snowflake) {
                     Some(DataType::Unknown)
                 } else {
                     func.args.first().and_then(|arg| self.annotate(arg))
@@ -2410,9 +2440,9 @@ fn projection_name(expression: &Expression) -> Option<String> {
     }
 }
 
-fn projection_type(expression: &Expression) -> DataType {
+fn projection_type(expression: &Expression, dialect: Option<DialectType>) -> DataType {
     if let Expression::Literal(literal) = expression {
-        return TypeAnnotator::annotate_literal(literal).unwrap_or(DataType::Unknown);
+        return TypeAnnotator::annotate_literal_for(literal, dialect).unwrap_or(DataType::Unknown);
     }
     if matches!(expression, Expression::Boolean(_)) {
         return DataType::Boolean;
@@ -2449,7 +2479,7 @@ fn query_outputs(expressions: &[Expression], dialect: Option<DialectType>) -> Ou
                 if unknown_function {
                     DataType::Unknown
                 } else {
-                    projection_type(expression)
+                    projection_type(expression, dialect)
                 },
             )
         })
@@ -3596,10 +3626,18 @@ mod tests {
             TypeAnnotator::new(None, Some(DialectType::DuckDB)).annotate(&expr),
             None
         );
+        // PostgreSQL widens SUM(BIGINT) to NUMERIC.
+        let expr = parse_one("SUM(CAST(1 AS BIGINT))", DialectType::PostgreSQL).unwrap();
+        assert_eq!(
+            TypeAnnotator::new(None, Some(DialectType::PostgreSQL)).annotate(&expr),
+            Some(DataType::Decimal {
+                precision: None,
+                scale: None
+            })
+        );
         // The dialect-specific override must not change the generic/default rule.
         for dialect in [
             DialectType::Generic,
-            DialectType::PostgreSQL,
             DialectType::MySQL,
             DialectType::BigQuery,
         ] {
@@ -3687,14 +3725,20 @@ mod tests {
             let mut restored: Expression = serde_json::from_value(unannotated).unwrap();
             assert_eq!(restored, expression);
             annotate_types(&mut restored, None, Some(dialect));
-            assert_eq!(restored.inferred_type(), Some(&varchar), "{dialect:?}");
+            // PostgreSQL string functions return TEXT.
+            let (expected, tag) = if dialect == DialectType::PostgreSQL {
+                (DataType::Text, "text")
+            } else {
+                (varchar.clone(), "var_char")
+            };
+            assert_eq!(restored.inferred_type(), Some(&expected), "{dialect:?}");
             assert_eq!(restored.sql_for(dialect), expression.sql_for(dialect));
 
             let annotated = serde_json::to_value(&restored).unwrap();
-            assert_eq!(annotated["trim"]["inferred_type"]["data_type"], "var_char");
+            assert_eq!(annotated["trim"]["inferred_type"]["data_type"], tag);
             let roundtripped: Expression = serde_json::from_value(annotated).unwrap();
             assert_eq!(roundtripped, restored);
-            assert_eq!(roundtripped.inferred_type(), Some(&varchar));
+            assert_eq!(roundtripped.inferred_type(), Some(&expected));
         }
     }
 
@@ -4062,10 +4106,15 @@ mod tests {
                 Some(DialectType::Snowflake),
                 Some(DialectType::DuckDB),
             ] {
-                let expected = if dialect == Some(DialectType::DuckDB) {
-                    duckdb_type
-                } else {
-                    &int
+                let numeric = DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                };
+                let expected = match dialect {
+                    Some(DialectType::DuckDB) => duckdb_type,
+                    // PostgreSQL 14+ EXTRACT returns NUMERIC for every field.
+                    Some(DialectType::PostgreSQL) => &numeric,
+                    _ => &int,
                 };
                 assert_eq!(
                     TypeAnnotator::new(None, dialect)
@@ -4585,12 +4634,13 @@ mod tests {
         let Expression::Alias(alias) = &select.expressions[0] else {
             panic!("expected alias");
         };
+        // DuckDB binds 2.5 as DECIMAL(2,1); INTEGER widens to DECIMAL(11,1).
         assert_eq!(
             alias.this.inferred_type(),
             Some(&DataType::Array {
-                element_type: Box::new(DataType::Double {
-                    precision: None,
-                    scale: None,
+                element_type: Box::new(DataType::Decimal {
+                    precision: Some(11),
+                    scale: Some(1),
                 }),
                 dimension: None,
             })

@@ -286,6 +286,15 @@ pub(super) fn arithmetic(
     if (add && ADD.contains(&(left, right))) || (sub && SUB.contains(&(left, right))) {
         return true;
     }
+    // Engine-verified DuckDB/PostgreSQL overloads: DATE + TIME builds a
+    // timestamp and mixed DATE/TIMESTAMP subtraction yields an interval.
+    if matches!(dialect, DialectType::DuckDB | DialectType::PostgreSQL)
+        && ((add && matches!((left, right), (Date, Time) | (Time, Date)))
+            || (sub && matches!((left, right), (Date, Timestamp) | (Timestamp, Date)))
+            || (sub && dialect == DialectType::PostgreSQL && (left, right) == (Time, Time)))
+    {
+        return true;
+    }
     // Snowflake permits numeric VARCHAR arithmetic; do not reject uncertain
     // overloads on other engines based on DuckDB's binder.
     dialect == DialectType::Snowflake
