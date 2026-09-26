@@ -19,7 +19,10 @@ pub type BindingScopeId = usize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputSlotIdentity {
     pub scope_id: BindingScopeId,
+    /// Position in the interface, where each unknown-width expansion is one entry.
     pub ordinal: usize,
+    /// Physical result position, absent after an unknown-width expansion.
+    pub physical_ordinal: Option<usize>,
     pub name: String,
 }
 
@@ -40,12 +43,32 @@ pub struct BindingScopeFact {
     pub kind: String,
     pub name: Option<String>,
     pub outputs: Vec<BindingOutput>,
+    /// At least one output expansion has unknown width. Named outputs remain checked.
+    pub partially_checked: bool,
 }
 
 /// The binding chosen by the validator for a reference occurrence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OccurrenceBinding {
+    /// Some grammar nodes use Column syntax to spell a relation, not a value.
+    RelationName {
+        name: String,
+    },
+    /// An option-assignment key represented by Column syntax in the parser AST.
+    OptionName {
+        name: String,
+    },
+    /// Incomplete interfaces leave several possible inputs; no unique binding is asserted.
+    Partial {
+        candidates: Vec<OccurrenceBinding>,
+    },
+    /// A named read from a relation whose complete column interface is unknown.
+    OpenSourceColumn {
+        scope_id: BindingScopeId,
+        source: String,
+        column: String,
+    },
     OutputSlot {
         slot: OutputSlotIdentity,
     },
@@ -132,7 +155,7 @@ impl BindingObserver {
         self.statement_root = self.scopes.len();
         self.query_roots = 0;
         self.occurrence_indexes.clear();
-        let scope = crate::scope::build_scope(statement);
+        let scope = crate::scope::build_scope_for_binding_facts(statement);
         self.register(&scope, schema);
         for node in statement.dfs() {
             if let Expression::Column(column) = node {
@@ -162,8 +185,7 @@ impl BindingObserver {
 
     fn collect_occurrences(&mut self, scope: &Scope) {
         let scope_id = self.identities[&(scope as *const Scope as usize)];
-        for node in crate::scope::walk_in_scope(crate::scope::scope_query(&scope.expression), false)
-        {
+        for node in complete_scope_nodes(crate::scope::scope_query(&scope.expression)) {
             if let Expression::Identifier(identifier) = node {
                 if let Some(index) = identifier
                     .span
@@ -252,7 +274,12 @@ impl BindingObserver {
                             "group_by" => "group_by",
                             "having" => "having",
                             "qualify" => "qualify",
-                            "order_by" if matches!(node, Expression::WindowFunction(_)) => {
+                            "windows" => "window",
+                            "filter" => "aggregate_filter",
+                            "order_by"
+                                if next.starts_with("window")
+                                    || matches!(node, Expression::WindowFunction(_)) =>
+                            {
                                 "window_order"
                             }
                             "order_by" => "order_by",
@@ -357,7 +384,9 @@ impl BindingObserver {
         };
         self.query_roots += 1;
         self.register_tree(scope, schema, None, path);
-        self.source_interfaces.clear();
+        if self.query_roots == 1 {
+            self.source_interfaces.clear();
+        }
         self.compute_interfaces(scope, schema);
         self.register_sources(scope, schema);
         self.collect_occurrences(scope);
@@ -376,6 +405,10 @@ impl BindingObserver {
             let child_id = self.identities[&(child as *const Scope as usize)];
             for source in scope.sources.values().chain(scope.cte_sources.values()) {
                 let matches = match (source.expression.as_ref(), &child.expression) {
+                    (Expression::Subquery(source), Expression::Subquery(target)) => {
+                        source == target
+                            && span_signature(&source.this) == span_signature(&target.this)
+                    }
                     (Expression::Cte(source), Expression::Cte(target)) => {
                         source.alias.span == target.alias.span && source.alias == target.alias
                     }
@@ -394,6 +427,7 @@ impl BindingObserver {
                 }
                 let mut columns = self.raw_outputs[&child_id].clone();
                 let aliases = match source.expression.as_ref() {
+                    Expression::Cte(cte) => cte.columns.as_slice(),
                     Expression::Subquery(query) => query.column_aliases.as_slice(),
                     Expression::Alias(alias) => alias.column_aliases.as_slice(),
                     _ => &[],
@@ -405,7 +439,7 @@ impl BindingObserver {
                     std::sync::Arc::as_ptr(&source.expression) as usize,
                     columns.clone(),
                 );
-                if !aliases.is_empty() {
+                if !aliases.is_empty() && source.kind != SourceKind::Cte {
                     self.set_outputs(child_id, &columns, &source.expression, schema);
                 }
             }
@@ -440,7 +474,7 @@ impl BindingObserver {
                 outputs.push(BindingOutput::Open {
                     start_ordinal: ordinal,
                 });
-                break;
+                continue;
             }
             let identifier = identifiers
                 .iter()
@@ -452,6 +486,14 @@ impl BindingObserver {
                 slot: OutputSlotIdentity {
                     scope_id: id,
                     ordinal,
+                    physical_ordinal: if outputs
+                        .iter()
+                        .any(|output| matches!(output, BindingOutput::Open { .. }))
+                    {
+                        None
+                    } else {
+                        Some(ordinal)
+                    },
                     name: crate::optimizer::normalize_identifiers::normalize_identifier(
                         identifier, strategy,
                     )
@@ -463,6 +505,10 @@ impl BindingObserver {
             outputs.push(BindingOutput::Open { start_ordinal: 0 });
         }
         self.scopes[id].outputs = outputs;
+        self.scopes[id].partially_checked = self.scopes[id]
+            .outputs
+            .iter()
+            .any(|output| matches!(output, BindingOutput::Open { .. }));
     }
 
     fn register_tree(
@@ -493,12 +539,20 @@ impl BindingObserver {
                 outputs.push(BindingOutput::Open {
                     start_ordinal: ordinal,
                 });
-                break;
+                continue;
             }
             outputs.push(BindingOutput::Slot {
                 slot: OutputSlotIdentity {
                     scope_id: id,
                     ordinal,
+                    physical_ordinal: if outputs
+                        .iter()
+                        .any(|output| matches!(output, BindingOutput::Open { .. }))
+                    {
+                        None
+                    } else {
+                        Some(ordinal)
+                    },
                     name: crate::optimizer::normalize_identifiers::normalize_identifier(
                         identifiers
                             .iter()
@@ -525,6 +579,9 @@ impl BindingObserver {
             path: path.clone(),
             kind: format!("{:?}", scope.scope_type),
             name,
+            partially_checked: outputs
+                .iter()
+                .any(|output| matches!(output, BindingOutput::Open { .. })),
             outputs,
         };
         if id == self.scopes.len() {
@@ -550,14 +607,19 @@ impl BindingObserver {
         let mut resolver =
             Resolver::new(scope, schema, true).with_source_interfaces(&self.source_interfaces);
         for (name, source) in &scope.sources {
-            let matches: Vec<_> = self
+            let mut matches: Vec<_> = self
                 .declarations
                 .iter()
                 .filter(|(_, target)| *target >= self.statement_root)
                 .filter(
                     |(expression, target_id)| match (source.expression.as_ref(), expression) {
+                        (Expression::Subquery(source), Expression::Subquery(target)) => {
+                            source == target
+                                && span_signature(&source.this) == span_signature(&target.this)
+                                && self.scopes[*target_id].parent == Some(id)
+                        }
                         (Expression::Cte(source), Expression::Cte(target)) => {
-                            source.alias.span == target.alias.span && source == target
+                            source.alias.span == target.alias.span && source.alias == target.alias
                         }
                         (Expression::Subquery(source), target) => {
                             source.this == *target
@@ -572,8 +634,11 @@ impl BindingObserver {
                         (source, target) => source == target,
                     },
                 )
+                .map(|(_, target)| *target)
                 .collect();
-            if let [(_, target)] = matches.as_slice() {
+            matches.sort_unstable();
+            matches.dedup();
+            if let [target] = matches.as_slice() {
                 self.sources.insert((id, name.clone()), *target);
                 if source.kind == SourceKind::DerivedTable {
                     let identifiers = super::source_output_identifiers(&source.expression);
@@ -588,7 +653,7 @@ impl BindingObserver {
                             outputs.push(BindingOutput::Open {
                                 start_ordinal: ordinal,
                             });
-                            break;
+                            continue;
                         }
                         let identifier = identifiers
                             .iter()
@@ -600,6 +665,14 @@ impl BindingObserver {
                             slot: OutputSlotIdentity {
                                 scope_id: *target,
                                 ordinal,
+                                physical_ordinal: if outputs
+                                    .iter()
+                                    .any(|output| matches!(output, BindingOutput::Open { .. }))
+                                {
+                                    None
+                                } else {
+                                    Some(ordinal)
+                                },
                                 name:
                                     crate::optimizer::normalize_identifiers::normalize_identifier(
                                         identifier, strategy,
@@ -611,6 +684,9 @@ impl BindingObserver {
                     if outputs.is_empty() {
                         outputs.push(BindingOutput::Open { start_ordinal: 0 });
                     }
+                    self.scopes[*target].partially_checked = outputs
+                        .iter()
+                        .any(|output| matches!(output, BindingOutput::Open { .. }));
                     self.scopes[*target].outputs = outputs;
                 }
             }
@@ -673,36 +749,70 @@ impl BindingObserver {
                 strategy,
             )
             .name;
-            let identifiers = scope
-                .sources
-                .get(source)
-                .map(|source| super::source_output_identifiers(&source.expression))
-                .unwrap_or_default();
             let matches: Vec<_> = self.scopes[*target]
                 .outputs
                 .iter()
                 .filter_map(|output| match output {
-                    BindingOutput::Slot { slot }
-                        if crate::optimizer::normalize_identifiers::normalize_identifier(
-                            identifiers
-                                .iter()
-                                .find(|identifier| identifier.name == slot.name)
-                                .copied()
-                                .cloned()
-                                .unwrap_or_else(|| crate::binding::schema_identifier(&slot.name)),
-                            strategy,
-                        )
-                        .name
-                            == name =>
-                    {
-                        Some(slot)
-                    }
+                    BindingOutput::Slot { slot } if slot.name == name => Some(slot),
                     _ => None,
                 })
                 .collect();
+            if let Some(source_info) = scope.sources.get(source) {
+                if let Expression::Cte(cte) = source_info.expression.as_ref() {
+                    let alias_ordinals: Vec<_> = cte
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, alias)| {
+                            crate::optimizer::normalize_identifiers::normalize_identifier(
+                                (*alias).clone(),
+                                strategy,
+                            )
+                            .name
+                                == name
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    if let [ordinal] = alias_ordinals.as_slice() {
+                        if let Some(slot) =
+                            self.scopes[*target]
+                                .outputs
+                                .iter()
+                                .find_map(|output| match output {
+                                    BindingOutput::Slot { slot }
+                                        if slot.physical_ordinal == Some(*ordinal) =>
+                                    {
+                                        Some(slot)
+                                    }
+                                    _ => None,
+                                })
+                        {
+                            return OccurrenceBinding::OutputSlot { slot: slot.clone() };
+                        }
+                        if self.scopes[*target].partially_checked {
+                            return OccurrenceBinding::OpenSourceColumn {
+                                scope_id: id.unwrap_or(0),
+                                source: source.to_owned(),
+                                column: column.name.name.clone(),
+                            };
+                        }
+                    } else if alias_ordinals.len() > 1 {
+                        return OccurrenceBinding::Unresolved {
+                            reason: "ambiguous relation column alias".to_owned(),
+                        };
+                    }
+                }
+            }
             if let [slot] = matches.as_slice() {
                 return OccurrenceBinding::OutputSlot {
                     slot: (*slot).clone(),
+                };
+            }
+            if matches.is_empty() && self.scopes[*target].partially_checked {
+                return OccurrenceBinding::OpenSourceColumn {
+                    scope_id: id.unwrap_or(0),
+                    source: source.to_owned(),
+                    column: column.name.name.clone(),
                 };
             }
             return OccurrenceBinding::Unresolved {
@@ -744,6 +854,28 @@ impl BindingObserver {
                 .sources
                 .get(source)
                 .map_or(SourceKind::Unknown, |source| source.kind),
+        }
+    }
+
+    pub fn open_source_binding(
+        &self,
+        scope: &Scope,
+        source: &str,
+        column: &Column,
+        dialect: DialectType,
+    ) -> OccurrenceBinding {
+        match self.source_binding(scope, source, column, dialect) {
+            OccurrenceBinding::SourceColumn {
+                scope_id,
+                source,
+                column,
+                ..
+            } => OccurrenceBinding::OpenSourceColumn {
+                scope_id,
+                source,
+                column,
+            },
+            binding => binding,
         }
     }
 
@@ -834,11 +966,13 @@ impl BindingObserver {
                     inputs.push(OccurrenceBinding::Open {
                         sources: vec![source.clone()],
                     });
-                    continue;
                 }
                 let identifiers =
                     super::source_output_identifiers(&scope.sources[source].expression);
                 for name in columns {
+                    if name == "*" {
+                        continue;
+                    }
                     let identifier = identifiers
                         .iter()
                         .find(|identifier| identifier.name == name)
@@ -995,6 +1129,9 @@ impl BindingObserver {
             });
         if let Some(index) = index {
             self.occurrences[index].binding = binding;
+            if let Some(id) = self.identities.get(&(scope as *const Scope as usize)) {
+                self.occurrences[index].scope_id = *id;
+            }
             return;
         }
         let scope_id = self
@@ -1049,4 +1186,73 @@ pub(super) fn complete_scope_nodes(expression: &Expression) -> Vec<&Expression> 
         });
     }
     nodes
+}
+
+pub(super) fn output_orders(mut expression: &Expression) -> Vec<crate::expressions::OrderBy> {
+    let mut orders = Vec::new();
+    loop {
+        let (order, columns) = match expression {
+            Expression::Subquery(query) => {
+                if let Some(order) = &query.order_by {
+                    orders.push(order.clone());
+                }
+                expression = &query.this;
+                continue;
+            }
+            Expression::Cte(cte) => {
+                expression = &cte.this;
+                continue;
+            }
+            Expression::Paren(paren) => {
+                expression = &paren.this;
+                continue;
+            }
+            Expression::Alias(alias) => {
+                expression = &alias.this;
+                continue;
+            }
+            Expression::Annotated(annotated) => {
+                expression = &annotated.this;
+                continue;
+            }
+            Expression::Union(query) => (&query.order_by, &query.on_columns),
+            Expression::Intersect(query) => (&query.order_by, &query.on_columns),
+            Expression::Except(query) => (&query.order_by, &query.on_columns),
+            _ => break,
+        };
+        if let Some(order) = order {
+            orders.push(order.clone());
+        }
+        if !columns.is_empty() {
+            orders.push(crate::expressions::OrderBy {
+                expressions: columns
+                    .iter()
+                    .cloned()
+                    .map(crate::expressions::Ordered::asc)
+                    .collect(),
+                comments: Vec::new(),
+                siblings: false,
+            });
+        }
+        break;
+    }
+    orders
+}
+
+pub(super) fn ddl_option_keys(expression: &Expression) -> Vec<&Column> {
+    let mut keys = Vec::new();
+    let mut pending = vec![expression];
+    while let Some(node) = pending.pop() {
+        crate::ast_children::for_each_child(node, |path, child| {
+            if path.contains(&crate::ast_children::ChildPathSegment::Field("options")) {
+                if let Expression::Eq(assignment) = child {
+                    if let Expression::Column(key) = &assignment.left {
+                        keys.push(key.as_ref());
+                    }
+                }
+            }
+            pending.push(child);
+        });
+    }
+    keys
 }

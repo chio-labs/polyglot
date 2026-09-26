@@ -370,21 +370,27 @@ pub(crate) fn bind_lambdas_observed(
     }
 
     struct Bindings {
-        id: usize,
         parameters: HashMap<String, Option<DataType>>,
-        declarations: Option<HashMap<String, crate::expressions::Identifier>>,
         parent: Option<Arc<Bindings>>,
     }
+    struct LambdaDeclaration {
+        id: usize,
+        parameters: HashMap<String, crate::expressions::Identifier>,
+    }
     impl Bindings {
-        fn declaration(&self, name: &str) -> Option<(usize, &crate::expressions::Identifier)> {
+        fn declaration<'a>(
+            &self,
+            name: &str,
+            declarations: &'a HashMap<usize, LambdaDeclaration>,
+        ) -> Option<(usize, &'a crate::expressions::Identifier)> {
             let mut frame = Some(self);
             while let Some(current) = frame {
                 if current.parameters.contains_key(name) {
-                    return current
-                        .declarations
-                        .as_ref()
-                        .and_then(|declarations| declarations.get(name))
-                        .map(|identifier| (current.id, identifier));
+                    let declaration = declarations.get(&(current as *const Bindings as usize))?;
+                    return declaration
+                        .parameters
+                        .get(name)
+                        .map(|identifier| (declaration.id, identifier));
                 }
                 frame = current.parent.as_deref();
             }
@@ -413,6 +419,8 @@ pub(crate) fn bind_lambdas_observed(
 
     let strategy = get_normalization_strategy(Some(dialect));
     let mut next_lambda_id = 0;
+    let mut declarations: Option<HashMap<usize, LambdaDeclaration>> =
+        observer.as_ref().map(|_| HashMap::new());
     let mut pending = vec![Task::Visit(expression, None, Arc::default())];
     let mut results = Vec::new();
     while let Some(task) = pending.pop() {
@@ -443,7 +451,11 @@ pub(crate) fn bind_lambdas_observed(
                     bindings = None;
                 }
                 let input_scope = if matches!(expression, Expression::Select(_)) {
-                    Some(build_scope(&expression))
+                    Some(if observer.is_some() {
+                        crate::scope::build_scope_for_binding_facts(&expression)
+                    } else {
+                        build_scope(&expression)
+                    })
                 } else {
                     dml_scope(&expression)
                         .map(|select| build_scope(&Expression::Select(Box::new(select))))
@@ -469,26 +481,31 @@ pub(crate) fn bind_lambdas_observed(
                             )
                         })
                         .collect();
-                    bindings = Some(Arc::new(Bindings {
-                        id: next_lambda_id,
+                    let frame = Arc::new(Bindings {
                         parameters,
-                        declarations: observer.as_ref().map(|_| {
-                            lambda
-                                .parameters
-                                .iter()
-                                .map(|identifier| {
-                                    (
-                                        normalize_identifier(identifier.clone(), strategy).name,
-                                        identifier.clone(),
-                                    )
-                                })
-                                .collect()
-                        }),
                         parent: bindings,
-                    }));
-                    if observer.is_some() {
+                    });
+                    if let Some(declarations) = &mut declarations {
+                        let parameters = lambda
+                            .parameters
+                            .iter()
+                            .map(|identifier| {
+                                (
+                                    normalize_identifier(identifier.clone(), strategy).name,
+                                    identifier.clone(),
+                                )
+                            })
+                            .collect();
+                        declarations.insert(
+                            Arc::as_ptr(&frame) as usize,
+                            LambdaDeclaration {
+                                id: next_lambda_id,
+                                parameters,
+                            },
+                        );
                         next_lambda_id += 1;
                     }
+                    bindings = Some(frame);
                 }
                 if let (Expression::Column(column), Some(bindings)) = (&expression, &bindings) {
                     let root = column.table.as_ref().unwrap_or(&column.name);
@@ -499,8 +516,12 @@ pub(crate) fn bind_lambdas_observed(
                         && sources.visible.contains(&root.name.to_lowercase());
                     if !qualified_source {
                         if let Some(data_type) = bindings.get(&name) {
-                            if let Some(observer) = observer.as_mut() {
-                                if let Some((id, declaration)) = bindings.declaration(&name) {
+                            if let (Some(observer), Some(declarations)) =
+                                (observer.as_mut(), declarations.as_ref())
+                            {
+                                if let Some((id, declaration)) =
+                                    bindings.declaration(&name, declarations)
+                                {
                                     observer(column, id, declaration);
                                 }
                             }

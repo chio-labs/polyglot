@@ -3579,6 +3579,7 @@ struct ReferenceValidationOptions<'a> {
     check_references: bool,
     check_types: bool,
     observer: Option<&'a std::cell::RefCell<binding_facts::BindingObserver>>,
+    pseudocolumns: &'a [&'a str],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3866,6 +3867,34 @@ fn validate_scope_columns(
             }
         }
         if let Expression::Pivot(pivot) = node {
+            if let Some(observer) = options.observer {
+                let mut input = crate::expressions::Select::new();
+                input.expressions = pivot
+                    .expressions
+                    .iter()
+                    .chain(&pivot.fields)
+                    .chain(&pivot.using)
+                    .chain(pivot.group.as_deref())
+                    .cloned()
+                    .collect();
+                input.from = Some(crate::expressions::From {
+                    expressions: vec![crate::scope::pivot_relation(&pivot.this)],
+                });
+                let input_scope = crate::scope::build_binding_scope_with_ctes(
+                    &Expression::Select(Box::new(input)),
+                    &scope.cte_sources,
+                );
+                observer
+                    .borrow_mut()
+                    .register(&input_scope, resolver_schema);
+                errors.extend(validate_scope_columns(
+                    &input_scope,
+                    ancestors,
+                    schema_map,
+                    resolver_schema,
+                    options,
+                ));
+            }
             for operand in pivot
                 .expressions
                 .iter()
@@ -3948,14 +3977,19 @@ fn validate_scope_columns(
         }
     }
     for (column, resolution) in input_columns.chain(order_columns) {
-        if dialect == DialectType::Snowflake
-            && select.connect.is_some()
-            && column.table.is_none()
-            && !column.name.quoted
-            && matches!(
-                column.name.name.to_ascii_uppercase().as_str(),
-                "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
-            )
+        if column.table.is_none()
+            && options
+                .pseudocolumns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name.name))
+            || dialect == DialectType::Snowflake
+                && select.connect.is_some()
+                && column.table.is_none()
+                && !column.name.quoted
+                && matches!(
+                    column.name.name.to_ascii_uppercase().as_str(),
+                    "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
+                )
         {
             if let Some(observer) = options.observer {
                 observer.borrow_mut().record(
@@ -4013,9 +4047,7 @@ fn validate_scope_columns(
                 if let Some(observer) = options.observer {
                     let mut observer = observer.borrow_mut();
                     let binding = if columns.empty || columns.wildcard {
-                        binding_facts::OccurrenceBinding::Open {
-                            sources: vec![source.clone()],
-                        }
+                        observer.open_source_binding(source_scope, &source, column, dialect)
                     } else if !columns.names.contains(&normalized_name) {
                         binding_facts::OccurrenceBinding::Unresolved {
                             reason: "unknown source column".to_owned(),
@@ -4093,8 +4125,19 @@ fn validate_scope_columns(
                     let mut observer = observer.borrow_mut();
                     let sources = matched_sources.as_deref().unwrap_or_default();
                     let binding = if open {
-                        binding_facts::OccurrenceBinding::Open {
-                            sources: open_sources.unwrap_or_default(),
+                        let mut candidates: Vec<_> = sources
+                            .iter()
+                            .map(|source| {
+                                observer.source_binding(source_scope, source, column, dialect)
+                            })
+                            .collect();
+                        candidates.extend(open_sources.unwrap_or_default().iter().map(|source| {
+                            observer.open_source_binding(source_scope, source, column, dialect)
+                        }));
+                        if candidates.len() == 1 {
+                            candidates.remove(0)
+                        } else {
+                            binding_facts::OccurrenceBinding::Partial { candidates }
                         }
                     } else if sources.len() == 1 {
                         observer.source_binding(source_scope, sources[0], column, dialect)
@@ -4210,13 +4253,7 @@ fn validate_scope_tree(
     bindings: &mut ProjectionAliasBindings,
 ) {
     if let Some(observer) = options.observer {
-        let order = match scope_query(&scope.expression) {
-            Expression::Union(query) => query.order_by.as_ref(),
-            Expression::Intersect(query) => query.order_by.as_ref(),
-            Expression::Except(query) => query.order_by.as_ref(),
-            _ => None,
-        };
-        if let Some(order) = order {
+        for order in binding_facts::output_orders(&scope.expression) {
             let names = observer.borrow().output_projection_names(scope);
             let mut output = crate::expressions::Select::new();
             output.expressions = names
@@ -4228,8 +4265,17 @@ fn validate_scope_tree(
                     )))
                 })
                 .collect();
-            output.order_by = Some(order.clone());
-            let output_scope = crate::scope::Scope::new(Expression::Select(Box::new(output)));
+            let interface = Expression::Select(Box::new(output.clone()));
+            output.order_by = Some(order);
+            let mut output_scope = crate::scope::Scope::new(Expression::Select(Box::new(output)));
+            output_scope.add_source_info(
+                "output".to_owned(),
+                crate::scope::SourceInfo::new(
+                    interface,
+                    false,
+                    crate::scope::SourceKind::DerivedTable,
+                ),
+            );
             observer.borrow_mut().alias_scope(scope, &output_scope);
             errors.extend(validate_scope_columns(
                 &output_scope,
@@ -4267,8 +4313,37 @@ fn validate_scope_tree(
         return;
     }
     let mut selected = selected_validation_scope(scope);
+    if options.observer.is_some() {
+        if let Expression::Pivot(pivot) = scope_query(&scope.expression) {
+            let mut query = crate::expressions::Select::new();
+            query.expressions = pivot
+                .expressions
+                .iter()
+                .chain(&pivot.fields)
+                .chain(&pivot.using)
+                .cloned()
+                .chain(pivot.group.iter().map(|group| group.as_ref().clone()))
+                .collect();
+            query.from = Some(crate::expressions::From {
+                expressions: vec![crate::scope::pivot_relation(&pivot.this)],
+            });
+            selected.expression = Expression::Select(Box::new(query));
+            selected.sources = scope.sources.clone();
+        }
+    }
     if let Some(observer) = options.observer {
         observer.borrow_mut().alias_scope(scope, &selected);
+        if let Expression::Pivot(pivot) = scope_query(&scope.expression) {
+            if let Expression::Column(column) = &pivot.this {
+                observer.borrow_mut().record(
+                    &selected,
+                    column,
+                    binding_facts::OccurrenceBinding::RelationName {
+                        name: column.name.name.clone(),
+                    },
+                );
+            }
+        }
     }
     // Bind children before consumers, but retain the existing parent-first
     // diagnostic order. Only physical sources are inherited, never output aliases.
@@ -4308,7 +4383,9 @@ fn validate_scope_tree(
                     .flat_map(|from| &from.expressions)
                     .chain(select.joins.iter().map(|join| &join.this))
                 {
-                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.expression)
+                    if matches!(relation, Expression::Subquery(query) if query.lateral && scope_query(&query.this) == scope_query(&child.expression))
+                        || options.observer.is_some()
+                            && relation.dfs().any(|node| node == &child.expression)
                     {
                         let mut visible = selected.clone();
                         visible.sources.retain(|name, _| preceding.contains(name));
@@ -4340,6 +4417,9 @@ fn validate_scope_tree(
                     }
                 }
             }
+        }
+        if let (Some(observer), Some(visible)) = (options.observer, lateral_outer.as_ref()) {
+            observer.borrow_mut().alias_scope(&selected, visible);
         }
         let restricted: Vec<_> = lateral_outer
             .as_ref()
@@ -4425,7 +4505,11 @@ fn validate_statement_with_schema(
     while let Some(expression) = pending.pop() {
         if let Some(select) = crate::binding::dml_scope(expression) {
             let query = Expression::Select(Box::new(select));
-            let scope = build_scope(&query);
+            let scope = if options.observer.is_some() {
+                crate::scope::build_scope_for_binding_facts(&query)
+            } else {
+                build_scope(&query)
+            };
             if let Some(observer) = options.observer {
                 observer.borrow_mut().register(&scope, resolver_schema);
             }
@@ -4492,7 +4576,11 @@ fn validate_statement_with_schema(
                     // ordinary source validation.
                     let mut source = query.clone();
                     attach_query_with_clause(&mut source, insert.with.as_ref());
-                    let scope = build_scope(&source);
+                    let scope = if options.observer.is_some() {
+                        crate::scope::build_scope_for_binding_facts(&source)
+                    } else {
+                        build_scope(&source)
+                    };
                     if let Some(observer) = options.observer {
                         observer.borrow_mut().register(&scope, resolver_schema);
                     }
@@ -4579,7 +4667,11 @@ fn validate_statement_with_schema(
                 | Expression::Intersect(_)
                 | Expression::Except(_)
         ) {
-            let scope = build_scope(expression);
+            let scope = if options.observer.is_some() {
+                crate::scope::build_scope_for_binding_facts(expression)
+            } else {
+                build_scope(expression)
+            };
             if let Some(observer) = options.observer {
                 observer.borrow_mut().register(&scope, resolver_schema);
             }
@@ -4595,6 +4687,66 @@ fn validate_statement_with_schema(
         } else {
             // DDL may declare a new table; only its query inputs are references.
             if let Expression::CreateTable(create) = expression {
+                if let Some(observer) = options.observer {
+                    let mut query = crate::expressions::Select::new();
+                    let option_keys = binding_facts::ddl_option_keys(expression);
+                    query.expressions = binding_facts::complete_scope_nodes(expression).into_iter().filter(|node| matches!(node, Expression::Column(column) if !option_keys.iter().any(|key| std::ptr::eq(*key, column.as_ref())))).cloned().collect();
+                    let root_scope = crate::scope::Scope::new(expression.clone());
+                    for key in option_keys {
+                        observer.borrow_mut().record(
+                            &root_scope,
+                            key,
+                            binding_facts::OccurrenceBinding::OptionName {
+                                name: key.name.name.clone(),
+                            },
+                        );
+                    }
+                    if !query.expressions.is_empty() {
+                        let mut declared = crate::expressions::Select::new();
+                        declared.expressions = create
+                            .columns
+                            .iter()
+                            .chain(&create.with_partition_columns)
+                            .map(|column| {
+                                Expression::Alias(Box::new(crate::expressions::Alias::new(
+                                    Expression::Null(crate::expressions::Null),
+                                    column.name.clone(),
+                                )))
+                            })
+                            .collect();
+                        let mut scope =
+                            crate::scope::Scope::new(Expression::Select(Box::new(query)));
+                        scope.add_source_info(
+                            create.name.name.name.clone(),
+                            crate::scope::SourceInfo::new(
+                                Expression::Select(Box::new(declared)),
+                                false,
+                                crate::scope::SourceKind::Table,
+                            ),
+                        );
+                        observer.borrow_mut().register(&scope, resolver_schema);
+                        let pseudocolumns: &[&str] = if options.dialect == DialectType::Snowflake
+                            && create
+                                .table_modifier
+                                .as_deref()
+                                .is_some_and(|modifier| modifier.eq_ignore_ascii_case("external"))
+                        {
+                            &["METADATA$EXTERNAL_TABLE_PARTITION"]
+                        } else {
+                            &[]
+                        };
+                        errors.extend(validate_scope_columns(
+                            &scope,
+                            &[],
+                            schema_map,
+                            resolver_schema,
+                            ReferenceValidationOptions {
+                                pseudocolumns,
+                                ..options
+                            },
+                        ));
+                    }
+                }
                 if let Some(query) = &create.as_select {
                     pending.push(query);
                 }
@@ -4777,6 +4929,7 @@ fn validate_parsed_observed(
                 check_references: options.check_references,
                 check_types: options.check_types,
                 observer,
+                pseudocolumns: &[],
             },
             &mut bindings,
         ));
@@ -4856,6 +5009,7 @@ pub(crate) fn validate_project_query_scope(
             check_references: options.check_references,
             check_types: false,
             observer: None,
+            pseudocolumns: &[],
         },
         &mut errors,
         &mut bindings,

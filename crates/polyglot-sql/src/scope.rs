@@ -705,6 +705,22 @@ pub fn build_scope(expression: &Expression) -> Scope {
     build_scope_with_ctes(expression, &HashMap::new())
 }
 
+/// Build the same lexical scope tree with exhaustive scalar-query traversal.
+/// Binding observations opt in; legacy callers retain their existing traversal.
+pub fn build_scope_for_binding_facts(expression: &Expression) -> Scope {
+    build_binding_scope_with_ctes(expression, &HashMap::new())
+}
+
+pub(crate) fn build_binding_scope_with_ctes(
+    expression: &Expression,
+    ctes: &HashMap<String, SourceInfo>,
+) -> Scope {
+    let mut root = Scope::new(expression.clone());
+    root.cte_sources = std::sync::Arc::new(ctes.clone());
+    build_scope_impl(expression, &mut root, true);
+    root
+}
+
 /// Build a query scope with CTE definitions inherited from its lexical parent.
 pub(crate) fn build_scope_with_ctes(
     expression: &Expression,
@@ -712,31 +728,37 @@ pub(crate) fn build_scope_with_ctes(
 ) -> Scope {
     let mut root = Scope::new(expression.clone());
     root.cte_sources = std::sync::Arc::new(ctes.clone());
-    build_scope_impl(expression, &mut root);
+    build_scope_impl(expression, &mut root, false);
     root
 }
 
-fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
+fn build_scope_impl(expression: &Expression, current_scope: &mut Scope, complete: bool) {
     match expression {
+        Expression::Pivot(pivot) if complete => {
+            if let Some(with) = &pivot.with {
+                process_ctes(with, current_scope, true);
+            }
+            add_table_to_scope(&pivot_relation(&pivot.this), current_scope, true);
+        }
         Expression::Prepare(prepare) => {
-            build_scope_impl(&prepare.statement, current_scope);
+            build_scope_impl(&prepare.statement, current_scope, complete);
         }
         Expression::Select(select) => {
             // Process CTEs first
             if let Some(with) = &select.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, complete);
             }
 
             // Process FROM clause
             if let Some(from) = &select.from {
                 for table in &from.expressions {
-                    add_table_to_scope(table, current_scope);
+                    add_table_to_scope(table, current_scope, complete);
                 }
             }
 
             // Process JOINs
             for join in &select.joins {
-                add_table_to_scope(&join.this, current_scope);
+                add_table_to_scope(&join.this, current_scope, complete);
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
@@ -745,50 +767,50 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             }
 
             // Process subqueries in WHERE, SELECT expressions, etc.
-            collect_subqueries(expression, current_scope);
+            collect_subqueries(expression, current_scope, complete);
         }
         Expression::Union(union) => {
             if let Some(with) = &union.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, complete);
             }
 
             let mut left_scope = current_scope.branch(union.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&union.left, &mut left_scope);
+            build_scope_impl(&union.left, &mut left_scope, complete);
 
             let mut right_scope =
                 current_scope.branch(union.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&union.right, &mut right_scope);
+            build_scope_impl(&union.right, &mut right_scope, complete);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Intersect(intersect) => {
             if let Some(with) = &intersect.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, complete);
             }
 
             let mut left_scope =
                 current_scope.branch(intersect.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&intersect.left, &mut left_scope);
+            build_scope_impl(&intersect.left, &mut left_scope, complete);
 
             let mut right_scope =
                 current_scope.branch(intersect.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&intersect.right, &mut right_scope);
+            build_scope_impl(&intersect.right, &mut right_scope, complete);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Except(except) => {
             if let Some(with) = &except.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, complete);
             }
 
             let mut left_scope = current_scope.branch(except.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&except.left, &mut left_scope);
+            build_scope_impl(&except.left, &mut left_scope, complete);
 
             let mut right_scope =
                 current_scope.branch(except.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&except.right, &mut right_scope);
+            build_scope_impl(&except.right, &mut right_scope, complete);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
@@ -797,27 +819,38 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Handle CREATE TABLE ... AS [WITH ...] SELECT ...
             // Process CTEs if present
             if let Some(with) = &create.with_cte {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, complete);
             }
             // Traverse the AS SELECT body
             if let Some(as_select) = &create.as_select {
-                build_scope_impl(as_select, current_scope);
+                build_scope_impl(as_select, current_scope, complete);
             }
         }
         Expression::Subquery(subquery) => {
-            build_scope_impl(&subquery.this, current_scope);
+            build_scope_impl(&subquery.this, current_scope, complete);
         }
         Expression::Paren(paren) => {
-            build_scope_impl(&paren.this, current_scope);
+            build_scope_impl(&paren.this, current_scope, complete);
         }
         Expression::Annotated(annotated) => {
-            build_scope_impl(&annotated.this, current_scope);
+            build_scope_impl(&annotated.this, current_scope, complete);
         }
         _ => {}
     }
 }
 
-fn process_ctes(with: &crate::expressions::With, current_scope: &mut Scope) {
+pub(crate) fn pivot_relation(expression: &Expression) -> Expression {
+    if let Expression::Column(column) = expression {
+        let mut table = crate::expressions::TableRef::new(column.name.name.clone());
+        table.name = column.name.clone();
+        table.schema = column.table.clone();
+        Expression::Table(Box::new(table))
+    } else {
+        expression.clone()
+    }
+}
+
+fn process_ctes(with: &crate::expressions::With, current_scope: &mut Scope, complete: bool) {
     for cte in &with.ctes {
         let cte_name = cte.alias.name.clone();
         let cte_expr = Expression::Cte(Box::new(cte.clone()));
@@ -827,7 +860,7 @@ fn process_ctes(with: &crate::expressions::With, current_scope: &mut Scope) {
             cte_scope.add_cte_source(cte_name.clone(), cte_expr.clone());
         }
 
-        build_scope_impl(&cte.this, &mut cte_scope);
+        build_scope_impl(&cte.this, &mut cte_scope, complete);
         current_scope.add_cte_source(cte_name, cte_expr);
         current_scope.cte_scopes.push(cte_scope);
     }
@@ -845,7 +878,7 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
         .is_empty()
 }
 
-fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
+fn add_table_to_scope(expr: &Expression, scope: &mut Scope, complete: bool) {
     match expr {
         Expression::Table(table) => {
             let name = table
@@ -866,7 +899,15 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             };
 
             if let Some(source) = cte_source {
-                scope.add_source_info(name, source.clone());
+                let mut source = source.clone();
+                if complete && !table.column_aliases.is_empty() {
+                    if let Expression::Cte(cte) = source.expression.as_ref() {
+                        let mut renamed = cte.clone();
+                        renamed.columns = table.column_aliases.clone();
+                        source.expression = std::sync::Arc::new(Expression::Cte(renamed));
+                    }
+                }
+                scope.add_source_info(name, source);
             } else {
                 let mut source = SourceInfo::new(expr.clone(), false, SourceKind::Table);
                 if let Some(alias) = &table.alias {
@@ -887,8 +928,15 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             } else {
                 ScopeType::DerivedTable
             };
-            let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            let mut derived_scope = scope.branch(
+                if complete {
+                    expr.clone()
+                } else {
+                    subquery.this.clone()
+                },
+                scope_type,
+            );
+            build_scope_impl(&subquery.this, &mut derived_scope, complete);
 
             if subquery.lateral {
                 scope.add_lateral_source(name, expr.clone(), true);
@@ -927,7 +975,7 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 None,
                 Some(outer_columns),
             );
-            build_scope_impl(&alias.this, &mut derived_scope);
+            build_scope_impl(&alias.this, &mut derived_scope, complete);
 
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
             scope.derived_table_scopes.push(derived_scope);
@@ -938,6 +986,17 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 .clone()
                 .unwrap_or_else(|| scope.next_virtual_source_name());
             scope.add_virtual_source(name, expr.clone());
+            if complete {
+                collect_source_subqueries(expr, scope);
+            }
+        }
+        Expression::Function(function) if complete => {
+            scope.add_virtual_source(function.name.clone(), expr.clone());
+            collect_source_subqueries(expr, scope);
+        }
+        Expression::Alias(alias) if complete => {
+            scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
+            collect_source_subqueries(&alias.this, scope);
         }
         Expression::LateralView(lateral_view) => {
             add_lateral_view_to_scope(lateral_view, scope);
@@ -949,7 +1008,7 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&pivot.this, scope);
+            add_pivot_inner_scope(&pivot.this, scope, complete);
         }
         Expression::Unpivot(unpivot) => {
             let name = pivot_source_name(
@@ -960,10 +1019,15 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&unpivot.this, scope);
+            add_pivot_inner_scope(&unpivot.this, scope, complete);
         }
         Expression::Paren(paren) => {
-            add_table_to_scope(&paren.this, scope);
+            add_table_to_scope(&paren.this, scope, complete);
+        }
+        Expression::TableSample(sample) if complete => {
+            if let Some(source) = &sample.this {
+                add_table_to_scope(source, scope, complete);
+            }
         }
         _ => {}
     }
@@ -1002,14 +1066,14 @@ fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> Strin
     }
 }
 
-fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope) {
+fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope, complete: bool) {
     match source {
         Expression::Subquery(subquery) => {
             let mut derived_scope = scope.branch(subquery.this.clone(), ScopeType::DerivedTable);
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            build_scope_impl(&subquery.this, &mut derived_scope, complete);
             scope.derived_table_scopes.push(derived_scope);
         }
-        Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope),
+        Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope, complete),
         _ => {}
     }
 }
@@ -1029,7 +1093,7 @@ fn add_lateral_view_to_scope(lateral_view: &crate::expressions::LateralView, sco
     }
 }
 
-fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
+fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope, complete: bool) {
     if matches!(expr, Expression::Select(_)) {
         use crate::ast_children::ChildPathSegment::{Field, Index};
 
@@ -1042,13 +1106,34 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
                 [Field("from" | "with" | "lateral_views"), ..]
                     | [Field("joins"), Index(_), Field("this"), ..]
             ) {
-                collect_subqueries_in_expr(child, parent_scope);
+                collect_subqueries_in_expr(child, parent_scope, complete);
             }
         });
     }
 }
 
-fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
+fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope, complete: bool) {
+    if complete {
+        let mut pending = vec![expr];
+        while let Some(node) = pending.pop() {
+            let query = match node {
+                Expression::Subquery(subquery) => Some(&subquery.this),
+                Expression::Select(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_) => Some(node),
+                _ => None,
+            };
+            if let Some(query) = query {
+                let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
+                build_scope_impl(query, &mut sub_scope, true);
+                parent_scope.subquery_scopes.push(sub_scope);
+            } else {
+                crate::ast_children::for_each_child(node, |_, child| pending.push(child));
+            }
+        }
+        return;
+    }
     let mut seen = HashSet::new();
     for node in walk_in_scope(expr, false) {
         let query = match node {
@@ -1069,8 +1154,16 @@ fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
         }
 
         let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
-        build_scope_impl(query, &mut sub_scope);
+        build_scope_impl(query, &mut sub_scope, false);
         parent_scope.subquery_scopes.push(sub_scope);
+    }
+}
+
+fn collect_source_subqueries(expression: &Expression, scope: &mut Scope) {
+    let start = scope.subquery_scopes.len();
+    collect_subqueries_in_expr(expression, scope, true);
+    for child in &mut scope.subquery_scopes[start..] {
+        child.scope_type = ScopeType::Udtf;
     }
 }
 

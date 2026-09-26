@@ -41,6 +41,12 @@ Each output interface distinguishes concrete slots from an open expansion.
 An open expansion means the supplied schema does not establish all output
 positions. Consumers must not interpret it as an empty output list.
 
+`partially_checked` marks scopes with an open expansion. Named slots before and
+after that expansion remain available. `ordinal` identifies an interface entry;
+`physical_ordinal` is absent after an expansion of unknown width. Named reads
+from open relations use `OpenSourceColumn`, while genuinely ambiguous partial
+interfaces retain candidate bindings without claiming a unique resolution.
+
 Occurrences carry their authored span when available, clause, lexical scope,
 and binding. Bindings distinguish output slots, source columns, merged inputs,
 lambda parameters, pseudocolumns, open namespaces, and unresolved references.
@@ -56,5 +62,8 @@ completeness together.
 
 Observation requires additional indexing and output storage. It is opt-in.
 The default-validation regression guard verifies that ordinary validation
-constructs no binding observer, and that requesting observations preserves the
-validation result for the covered corpus.
+constructs no binding observer. The fixture corpus checks that extraction does
+not panic and that accepted statements have no unresolved occurrences. Opt-in
+coverage includes clauses and query wrappers previously skipped by reference
+traversal; validation diagnostics can therefore be more complete when requesting
+observations.
