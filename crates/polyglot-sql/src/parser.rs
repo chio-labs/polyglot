@@ -29271,21 +29271,11 @@ impl Parser {
         }
         let _scope = self.enter_parser_depth(starts.len())?;
         let mut expr = self.parse_comparison()?;
-        for raw_start in starts.into_iter().rev() {
-            let preserve_typed_not_like = matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::TSQL)
-                    | Some(crate::dialects::DialectType::Fabric)
-            );
-            if matches!(expr, Expression::Like(_) | Expression::ILike(_))
-                && !preserve_typed_not_like
-            {
-                expr = Expression::Raw(Raw {
-                    sql: self.tokens_to_sql(raw_start, self.current),
-                });
-            } else {
-                expr = Expression::Not(Box::new(UnaryOp::new(expr)));
-            }
+        for _ in starts {
+            // Comparisons (including quantified LIKE and ESCAPE) bind before
+            // prefix NOT. Keep their typed AST rather than hiding the predicate
+            // from validation, lineage and downstream expression visitors.
+            expr = Expression::Not(Box::new(UnaryOp::new(expr)));
         }
         Ok(expr)
     }
