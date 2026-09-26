@@ -335,6 +335,7 @@ pub(super) fn rewrite(
             Action::SimilarToToTsqlLike => match e {
                 Expression::SimilarTo(f) => {
                     let like = Expression::Like(Box::new(LikeOp {
+                        negated: false,
                         left: f.this,
                         right: f.pattern,
                         escape: f.escape,

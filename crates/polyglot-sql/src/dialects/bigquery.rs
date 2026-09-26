@@ -172,8 +172,9 @@ impl DialectImpl for BigQueryDialect {
             // ILIKE -> LOWER() LIKE LOWER() in BigQuery (no ILIKE support)
             Expression::ILike(op) => {
                 let lower_left = Expression::Lower(Box::new(UnaryFunc::new(op.left)));
-                let lower_right = Expression::Lower(Box::new(UnaryFunc::new(op.right)));
+                let lower_right = super::lower_like_pattern(op.right, op.quantifier.is_some());
                 Ok(Expression::Like(Box::new(LikeOp {
+                    negated: op.negated,
                     left: lower_left,
                     right: lower_right,
                     escape: op.escape,

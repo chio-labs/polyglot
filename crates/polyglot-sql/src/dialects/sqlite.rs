@@ -82,8 +82,10 @@ impl DialectImpl for SQLiteDialect {
             // ILike -> LOWER() LIKE LOWER() (SQLite doesn't support ILIKE)
             Expression::ILike(op) => {
                 let lower_left = Expression::Lower(Box::new(UnaryFunc::new(op.left.clone())));
-                let lower_right = Expression::Lower(Box::new(UnaryFunc::new(op.right.clone())));
+                let lower_right =
+                    super::lower_like_pattern(op.right.clone(), op.quantifier.is_some());
                 Ok(Expression::Like(Box::new(LikeOp {
+                    negated: op.negated,
                     left: lower_left,
                     right: lower_right,
                     escape: op.escape,
@@ -375,6 +377,7 @@ impl SQLiteDialect {
                 let escape = args.remove(0);
                 Ok(Expression::Like(Box::new(LikeOp {
                     left: string,
+                    negated: false,
                     right: pattern,
                     escape: Some(escape),
                     quantifier: None,

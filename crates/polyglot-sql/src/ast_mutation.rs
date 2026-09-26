@@ -77,6 +77,7 @@ pub(crate) fn binary(kind: BinaryKind, left: Expression, right: Expression) -> E
         BinaryKind::Div => Expression::Div(Box::new(operation)),
         BinaryKind::Mod => Expression::Mod(Box::new(operation)),
         BinaryKind::Like => Expression::Like(Box::new(LikeOp {
+            negated: false,
             left: operation.left,
             right: operation.right,
             escape: None,
@@ -84,6 +85,7 @@ pub(crate) fn binary(kind: BinaryKind, left: Expression, right: Expression) -> E
             inferred_type: None,
         })),
         BinaryKind::ILike => Expression::ILike(Box::new(LikeOp {
+            negated: false,
             left: operation.left,
             right: operation.right,
             escape: None,

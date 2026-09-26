@@ -4727,6 +4727,10 @@ impl BinaryOp {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct LikeOp {
+    /// Infix NOT LIKE negates each comparison, before ANY/ALL reduction.
+    /// Prefix NOT is represented separately as Expression::Not(Like(...)).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub negated: bool,
     pub left: Expression,
     pub right: Expression,
     /// ESCAPE character/expression
@@ -4744,6 +4748,7 @@ pub struct LikeOp {
 impl LikeOp {
     pub fn new(left: Expression, right: Expression) -> Self {
         Self {
+            negated: false,
             left,
             right,
             escape: None,
@@ -4754,6 +4759,7 @@ impl LikeOp {
 
     pub fn with_escape(left: Expression, right: Expression, escape: Expression) -> Self {
         Self {
+            negated: false,
             left,
             right,
             escape: Some(escape),

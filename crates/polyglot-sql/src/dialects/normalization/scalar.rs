@@ -3080,6 +3080,7 @@ pub(super) fn rewrite(
                                 None
                             };
                             Ok(Expression::Like(Box::new(crate::expressions::LikeOp {
+                                negated: false,
                                 left: this,
                                 right: pattern,
                                 escape,
@@ -3097,6 +3098,7 @@ pub(super) fn rewrite(
                                 None
                             };
                             Ok(Expression::ILike(Box::new(crate::expressions::LikeOp {
+                                negated: false,
                                 left: this,
                                 right: pattern,
                                 escape,

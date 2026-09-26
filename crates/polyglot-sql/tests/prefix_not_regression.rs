@@ -182,10 +182,10 @@ fn prefix_not_other_predicates_remain_structured() {
 }
 
 #[test]
-fn clickhouse_retains_its_high_precedence_not() {
+fn clickhouse_prefix_not_encloses_the_predicate() {
     let parsed = stable("SELECT 1 WHERE NOT x LIKE 'b%'", DialectType::ClickHouse);
     assert!(
-        matches!(predicate(&parsed), Expression::Like(like) if matches!(&like.left, Expression::Not(_)))
+        matches!(predicate(&parsed), Expression::Not(not) if matches!(&not.this, Expression::Like(_)))
     );
     let parsed = stable("SELECT 1 WHERE NOT (x LIKE 'b%')", DialectType::ClickHouse);
     assert!(matches!(predicate(&parsed), Expression::Not(_)));
@@ -210,4 +210,157 @@ fn prefix_not_like_exposes_columns_to_schema_validation() {
             }
         }
     }
+}
+
+#[test]
+fn quantified_prefix_and_infix_negation_are_distinct() {
+    for dialect in [
+        DialectType::Generic,
+        DialectType::Snowflake,
+        DialectType::PostgreSQL,
+        DialectType::ClickHouse,
+        DialectType::TSQL,
+    ] {
+        for operator in ["LIKE", "ILIKE"] {
+            for quantifier in ["", " ANY", " ALL", " SOME"] {
+                let rhs = if quantifier.is_empty() {
+                    "'a%'"
+                } else {
+                    "('a%', 'x%')"
+                };
+                let prefix = format!("SELECT 1 WHERE NOT 'abc' {operator}{quantifier} {rhs}");
+                let infix = format!("SELECT 1 WHERE 'abc' NOT {operator}{quantifier} {rhs}");
+                let a = stable(&prefix, dialect);
+                let b = stable(&infix, dialect);
+                assert!(matches!(predicate(&a), Expression::Not(_)));
+                assert!(
+                    matches!(predicate(&b), Expression::Like(op) | Expression::ILike(op) if op.negated)
+                );
+                assert_ne!(
+                    generate(&a, dialect).unwrap(),
+                    generate(&b, dialect).unwrap()
+                );
+                let b = parse_one(&generate(&b, dialect).unwrap(), dialect).unwrap();
+                assert!(
+                    matches!(predicate(&b), Expression::Like(op) | Expression::ILike(op) if op.negated)
+                );
+            }
+        }
+    }
+    let sql = "SELECT NOT 'testa 1' LIKE ALL (ARRAY['testa%', 'testb%'])";
+    assert_eq!(
+        generate(
+            &parse_one(sql, DialectType::PostgreSQL).unwrap(),
+            DialectType::PostgreSQL
+        )
+        .unwrap(),
+        sql
+    );
+}
+
+#[test]
+fn quantified_negation_duckdb_execution() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut cases = Vec::new();
+    for operator in ["LIKE", "ILIKE"] {
+        for quantifier in ["ANY", "ALL", "SOME"] {
+            let all = quantifier == "ALL";
+            for prefix in [false, true] {
+                for array in [false, true] {
+                    let rhs = if array {
+                        "(ARRAY['a%', 'x%'])"
+                    } else {
+                        "('a%', 'x%')"
+                    };
+                    let source = if array {
+                        DialectType::PostgreSQL
+                    } else {
+                        DialectType::Snowflake
+                    };
+                    let sql = if prefix {
+                        format!("SELECT NOT 'abc' {operator} {quantifier} {rhs}")
+                    } else {
+                        format!("SELECT 'abc' NOT {operator} {quantifier} {rhs}")
+                    };
+                    let reference = format!(
+                        "SELECT {}('abc' {}{operator} 'a%' {} 'abc' {}{operator} 'x%')",
+                        if prefix { "NOT " } else { "" },
+                        if prefix { "" } else { "NOT " },
+                        if all { "AND" } else { "OR" },
+                        if prefix { "" } else { "NOT " }
+                    );
+                    let generated = polyglot_sql::transpile(&sql, source, DialectType::DuckDB)
+                        .unwrap()
+                        .remove(0);
+                    let pretty = format(&generated, DialectType::DuckDB).unwrap().remove(0);
+                    stable(&generated, DialectType::DuckDB);
+                    let ast = parse_one(&generated, DialectType::DuckDB).unwrap();
+                    assert_typed(&ast);
+                    // A prefix reduction must not become per-pattern negation.
+                    let Expression::Select(select) = &ast else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        matches!(&select.expressions[0], Expression::Not(_)),
+                        prefix,
+                        "{sql} -> {generated}"
+                    );
+                    cases.push(serde_json::json!({"source":sql,"reference":reference,"generated":generated,"pretty":pretty,"expected":if prefix { all } else { !all }}));
+                    for intermediate in [
+                        DialectType::PostgreSQL,
+                        DialectType::Snowflake,
+                        DialectType::MySQL,
+                    ] {
+                        let intermediate_sql = polyglot_sql::transpile(&sql, source, intermediate)
+                            .unwrap()
+                            .remove(0);
+                        let generated = polyglot_sql::transpile(
+                            &intermediate_sql,
+                            intermediate,
+                            DialectType::DuckDB,
+                        )
+                        .unwrap()
+                        .remove(0);
+                        let pretty = format(&generated, DialectType::DuckDB).unwrap().remove(0);
+                        cases.push(serde_json::json!({"source":sql,"reference":reference,"generated":generated,"pretty":pretty,"expected":if prefix { all } else { !all }}));
+                    }
+                }
+            }
+        }
+    }
+    // CI always exercises lowering and precedence above; opt into real engine
+    // execution with an interpreter containing DuckDB (no warehouse required).
+    let Ok(python) = std::env::var("POLYGLOT_DUCKDB_PYTHON") else {
+        return;
+    };
+    let script = r#"
+import json, sys, duckdb
+cases = json.load(sys.stdin)
+unsupported = 0
+with duckdb.connect() as con:
+    for case in cases:
+        try:
+            original = con.execute(case['source']).fetchone()[0]
+        except duckdb.ParserException:
+            unsupported += 1
+        else:
+            assert original == case['expected'], (case['source'], original)
+        for field in ['reference', 'generated', 'pretty']:
+            actual = con.execute(case[field]).fetchone()[0]
+            assert actual == case['expected'], (case['source'], field, case[field], actual, case['expected'])
+print('DuckDB', duckdb.__version__, len(cases), 'differing-meaning cases passed;', unsupported, 'native quantified forms unsupported')
+"#;
+    let mut child = Command::new(python)
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&cases).unwrap().as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
 }

@@ -80,8 +80,10 @@ impl DialectImpl for TrinoDialect {
             // ILike -> LOWER() LIKE LOWER() (Trino doesn't support ILIKE)
             Expression::ILike(op) => {
                 let lower_left = Expression::Lower(Box::new(UnaryFunc::new(op.left.clone())));
-                let lower_right = Expression::Lower(Box::new(UnaryFunc::new(op.right.clone())));
+                let lower_right =
+                    super::lower_like_pattern(op.right.clone(), op.quantifier.is_some());
                 Ok(Expression::Like(Box::new(LikeOp {
+                    negated: op.negated,
                     left: lower_left,
                     right: lower_right,
                     escape: op.escape,

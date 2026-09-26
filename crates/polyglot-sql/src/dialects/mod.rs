@@ -631,6 +631,45 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
     fmt == "%Y-%m-%d" || fmt == "%F"
 }
 
+/// Lower each literal quantified pattern, not its containing tuple/array.
+#[cfg(feature = "transpile")]
+pub(crate) fn lower_like_pattern(pattern: Expression, quantified: bool) -> Expression {
+    if quantified {
+        match pattern {
+            Expression::Paren(mut paren) => {
+                paren.this = lower_like_pattern(paren.this, true);
+                return Expression::Paren(paren);
+            }
+            Expression::Tuple(mut tuple) => {
+                tuple.expressions = tuple
+                    .expressions
+                    .into_iter()
+                    .map(|value| lower_like_pattern(value, false))
+                    .collect();
+                return Expression::Tuple(tuple);
+            }
+            Expression::Array(mut array) => {
+                array.expressions = array
+                    .expressions
+                    .into_iter()
+                    .map(|value| lower_like_pattern(value, false))
+                    .collect();
+                return Expression::Array(array);
+            }
+            Expression::ArrayFunc(mut array) => {
+                array.expressions = array
+                    .expressions
+                    .into_iter()
+                    .map(|value| lower_like_pattern(value, false))
+                    .collect();
+                return Expression::ArrayFunc(array);
+            }
+            other => return lower_like_pattern(other, false),
+        }
+    }
+    Expression::Lower(Box::new(crate::expressions::UnaryFunc::new(pattern)))
+}
+
 /// Applies a transform function bottom-up through an entire expression tree.
 ///
 /// The public entrypoint uses an explicit task stack for the recursion-heavy shapes

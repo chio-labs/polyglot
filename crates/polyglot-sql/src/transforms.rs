@@ -3760,19 +3760,24 @@ pub fn no_ilike_sql(expr: Expression) -> Result<Expression> {
                 inferred_type: None,
             }));
 
-            let lower_right = Expression::Function(Box::new(crate::expressions::Function {
-                name: "LOWER".to_string(),
-                args: vec![ilike.right],
-                distinct: false,
-                trailing_comments: vec![],
-                use_bracket_syntax: false,
-                no_parens: false,
-                quoted: false,
-                span: None,
-                inferred_type: None,
-            }));
+            let lower_right = if ilike.quantifier.is_some() {
+                crate::dialects::lower_like_pattern(ilike.right, true)
+            } else {
+                Expression::Function(Box::new(crate::expressions::Function {
+                    name: "LOWER".to_string(),
+                    args: vec![ilike.right],
+                    distinct: false,
+                    trailing_comments: vec![],
+                    use_bracket_syntax: false,
+                    no_parens: false,
+                    quoted: false,
+                    span: None,
+                    inferred_type: None,
+                }))
+            };
 
             Ok(Expression::Like(Box::new(crate::expressions::LikeOp {
+                negated: ilike.negated,
                 left: lower_left,
                 right: lower_right,
                 escape: ilike.escape,
@@ -6030,6 +6035,8 @@ pub fn expand_like_any(expr: Expression) -> Result<Expression> {
         let inner = unwrap_parens(e);
         match inner {
             Expression::Tuple(t) => Some(t.expressions.clone()),
+            Expression::Array(a) => Some(a.expressions.clone()),
+            Expression::ArrayFunc(a) => Some(a.expressions.clone()),
             // Single value in parens: treat as single-element list
             _ if !matches!(e, Expression::Tuple(_)) => Some(vec![inner.clone()]),
             _ => None,
@@ -6049,6 +6056,7 @@ pub fn expand_like_any(expr: Expression) -> Result<Expression> {
         for val in values {
             let like = if is_ilike {
                 Expression::ILike(Box::new(LikeOp {
+                    negated: op.negated,
                     left: op.left.clone(),
                     right: val,
                     escape: op.escape.clone(),
@@ -6057,6 +6065,7 @@ pub fn expand_like_any(expr: Expression) -> Result<Expression> {
                 }))
             } else {
                 Expression::Like(Box::new(LikeOp {
+                    negated: op.negated,
                     left: op.left.clone(),
                     right: val,
                     escape: op.escape.clone(),
@@ -6105,7 +6114,9 @@ pub fn expand_like_any(expr: Expression) -> Result<Expression> {
     let result = transform_recursive(expr, &|e| {
         match e {
             // LIKE ANY -> OR chain (bare)
-            Expression::Like(ref op) if op.quantifier.as_deref() == Some("ANY") => {
+            Expression::Like(ref op)
+                if matches!(op.quantifier.as_deref(), Some("ANY" | "SOME")) =>
+            {
                 if let Some(values) = extract_tuple_values(&op.right) {
                     if values.is_empty() {
                         return Ok(e);
@@ -6139,7 +6150,9 @@ pub fn expand_like_any(expr: Expression) -> Result<Expression> {
                 }
             }
             // ILIKE ANY -> OR chain (bare)
-            Expression::ILike(ref op) if op.quantifier.as_deref() == Some("ANY") => {
+            Expression::ILike(ref op)
+                if matches!(op.quantifier.as_deref(), Some("ANY" | "SOME")) =>
+            {
                 if let Some(values) = extract_tuple_values(&op.right) {
                     if values.is_empty() {
                         return Ok(e);
@@ -6806,6 +6819,7 @@ mod tests {
 
         // Test ILIKE conversion to LOWER+LIKE
         let ilike_expr = Expression::ILike(Box::new(LikeOp {
+            negated: false,
             left: Expression::boxed_column(Column {
                 name: Identifier::new("name".to_string()),
                 table: None,
