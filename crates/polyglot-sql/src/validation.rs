@@ -4607,9 +4607,17 @@ pub fn validate_parsed_with_schema(
 fn has_projection_star(statement: &Expression) -> bool {
     statement.dfs().any(|node| {
         matches!(node, Expression::Select(select) if select.expressions.iter().any(|projection| {
-            crate::query_analysis::projection_is_star(
-                crate::query_analysis::unwrap_projection_alias(projection),
-            )
+            let mut projection = projection;
+            loop {
+                match projection {
+                    Expression::Alias(alias) => projection = &alias.this,
+                    Expression::Annotated(annotated) => projection = &annotated.this,
+                    Expression::Paren(paren) => projection = &paren.this,
+                    _ => break,
+                }
+            }
+            matches!(projection, Expression::Star(_))
+                || matches!(projection, Expression::Column(column) if column.name.name == "*")
         }))
     })
 }
