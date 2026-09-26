@@ -2432,6 +2432,7 @@ impl SnowflakeDialect {
                 let right = args.next().unwrap();
                 let escape = args.next();
                 Ok(Expression::Like(Box::new(crate::expressions::LikeOp {
+                    negated: false,
                     left,
                     right,
                     escape,
@@ -2447,6 +2448,7 @@ impl SnowflakeDialect {
                 let right = args.next().unwrap();
                 let escape = args.next();
                 Ok(Expression::ILike(Box::new(crate::expressions::LikeOp {
+                    negated: false,
                     left,
                     right,
                     escape,

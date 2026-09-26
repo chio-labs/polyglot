@@ -467,6 +467,7 @@ fn transform_recursive_rewrites_nested_cast_data_types() {
 #[test]
 fn transform_recursive_visits_generated_child_metadata() {
     let expression = Expression::Like(Box::new(LikeOp {
+        negated: false,
         left: Expression::column("name"),
         right: Expression::Literal(Box::new(Literal::String("x%".to_string()))),
         escape: Some(Expression::Literal(Box::new(Literal::String(

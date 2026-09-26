@@ -1307,6 +1307,7 @@ mod tests {
     #[test]
     fn test_traversal_covers_previously_omitted_expression_fields() {
         let like = Expression::Like(Box::new(LikeOp {
+            negated: false,
             left: make_column("name"),
             right: Expression::Literal(Box::new(Literal::String("x%".to_string()))),
             escape: Some(Expression::Literal(Box::new(Literal::String(

@@ -416,7 +416,7 @@ fn postgres_bytea_hex_literals_map_to_fabric_binary_literals() {
 #[test]
 fn issue_388_fabric_negated_like_preserves_typed_operands_on_roundtrip() {
     let source = r"SELECT '\x616263'::bytea NOT LIKE '\x5f625f'::bytea";
-    let expected = "SELECT CAST(CASE WHEN NOT 0x616263 LIKE 0x5f625f THEN 1 WHEN NOT NOT 0x616263 LIKE 0x5f625f THEN 0 ELSE NULL END AS BIT)";
+    let expected = "SELECT CAST(CASE WHEN 0x616263 NOT LIKE 0x5f625f THEN 1 WHEN NOT 0x616263 NOT LIKE 0x5f625f THEN 0 ELSE NULL END AS BIT)";
     let first_pass = pg_to_fabric_strict(source);
 
     assert_eq!(first_pass, expected);

@@ -152,10 +152,18 @@ pub(super) fn normalize(
 
         if matches!(source, DialectType::Generic) && matches!(target, DialectType::Drill) {
             if let Expression::ILike(ref like) = e {
-                return Ok(Expression::Function(Box::new(Function::new(
+                if like.quantifier.is_some() {
+                    return Ok(e);
+                }
+                let function = Expression::Function(Box::new(Function::new(
                     "ILIKE".to_string(),
                     vec![like.left.clone(), like.right.clone()],
-                ))));
+                )));
+                return Ok(if like.negated {
+                    Expression::Not(Box::new(crate::expressions::UnaryOp::new(function)))
+                } else {
+                    function
+                });
             }
         }
 
@@ -3977,11 +3985,16 @@ pub(super) fn normalize(
                                 "LOWER".to_string(),
                                 vec![like.left],
                             )));
-                            let lower_right = Expression::Function(Box::new(Function::new(
-                                "LOWER".to_string(),
-                                vec![like.right],
-                            )));
+                            let lower_right = if like.quantifier.is_some() {
+                                super::lower_like_pattern(like.right, true)
+                            } else {
+                                Expression::Function(Box::new(Function::new(
+                                    "LOWER".to_string(),
+                                    vec![like.right],
+                                )))
+                            };
                             return Ok(Expression::Like(Box::new(crate::expressions::LikeOp {
+                                negated: like.negated,
                                 left: lower_left,
                                 right: lower_right,
                                 escape: like.escape,

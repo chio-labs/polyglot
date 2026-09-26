@@ -29249,12 +29249,7 @@ impl Parser {
 
     /// Parse NOT expressions
     fn parse_not(&mut self) -> Result<Expression> {
-        if !self.check(TokenType::Not)
-            || matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::ClickHouse)
-            )
-        {
+        if !self.check(TokenType::Not) {
             return self.parse_comparison();
         }
 
@@ -29271,21 +29266,11 @@ impl Parser {
         }
         let _scope = self.enter_parser_depth(starts.len())?;
         let mut expr = self.parse_comparison()?;
-        for raw_start in starts.into_iter().rev() {
-            let preserve_typed_not_like = matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::TSQL)
-                    | Some(crate::dialects::DialectType::Fabric)
-            );
-            if matches!(expr, Expression::Like(_) | Expression::ILike(_))
-                && !preserve_typed_not_like
-            {
-                expr = Expression::Raw(Raw {
-                    sql: self.tokens_to_sql(raw_start, self.current),
-                });
-            } else {
-                expr = Expression::Not(Box::new(UnaryOp::new(expr)));
-            }
+        for _ in starts {
+            // Comparisons (including quantified LIKE and ESCAPE) bind before
+            // prefix NOT. Keep their typed AST rather than hiding the predicate
+            // from validation, lineage and downstream expression visitors.
+            expr = Expression::Not(Box::new(UnaryOp::new(expr)));
         }
         Ok(expr)
     }
@@ -29645,6 +29630,7 @@ impl Parser {
                     None
                 };
                 Expression::Like(Box::new(LikeOp {
+                    negated: false,
                     left,
                     right,
                     escape,
@@ -29669,6 +29655,7 @@ impl Parser {
                     None
                 };
                 Expression::ILike(Box::new(LikeOp {
+                    negated: false,
                     left,
                     right,
                     escape,
@@ -29736,13 +29723,14 @@ impl Parser {
                     None
                 };
                 let like_expr = Expression::Like(Box::new(LikeOp {
+                    negated: true,
                     left,
                     right,
                     escape,
                     quantifier: None,
                     inferred_type: None,
                 }));
-                Expression::Not(Box::new(UnaryOp::new(like_expr)))
+                like_expr
             } else if self.match_token(TokenType::NotILike) {
                 // PostgreSQL !~~* (NOT ILIKE) operator
                 let right = self.parse_bitwise_or()?;
@@ -29752,13 +29740,14 @@ impl Parser {
                     None
                 };
                 let ilike_expr = Expression::ILike(Box::new(LikeOp {
+                    negated: true,
                     left,
                     right,
                     escape,
                     quantifier: None,
                     inferred_type: None,
                 }));
-                Expression::Not(Box::new(UnaryOp::new(ilike_expr)))
+                ilike_expr
             } else if self.match_token(TokenType::NotRLike) {
                 // PostgreSQL !~ (NOT regexp match) operator
                 let right = self.parse_bitwise_or()?;
@@ -29998,13 +29987,14 @@ impl Parser {
                         None
                     };
                     let like_expr = Expression::Like(Box::new(LikeOp {
+                        negated: true,
                         left,
                         right,
                         escape,
                         quantifier,
                         inferred_type: None,
                     }));
-                    Expression::Not(Box::new(UnaryOp::new(like_expr)))
+                    like_expr
                 } else if self.match_token(TokenType::ILike) {
                     let quantifier = if self.match_token(TokenType::Any) {
                         Some("ANY".to_string())
@@ -30022,13 +30012,14 @@ impl Parser {
                         None
                     };
                     let ilike_expr = Expression::ILike(Box::new(LikeOp {
+                        negated: true,
                         left,
                         right,
                         escape,
                         quantifier,
                         inferred_type: None,
                     }));
-                    Expression::Not(Box::new(UnaryOp::new(ilike_expr)))
+                    ilike_expr
                 } else if self.check_identifier("SIMILAR") && self.check_next(TokenType::To) {
                     // NOT SIMILAR TO
                     self.skip(); // consume SIMILAR
@@ -33196,6 +33187,7 @@ impl Parser {
                         let pattern = self.parse_expression()?;
                         // Create an ILike expression with Star as left side
                         Expression::ILike(Box::new(LikeOp {
+                            negated: false,
                             left: Expression::Star(Star {
                                 table: None,
                                 except: None,
@@ -58693,20 +58685,14 @@ impl Parser {
                 .ok_or_else(|| self.parse_error("Expected expression after LIKE"))?;
             let escape = self.parse_escape()?;
             let like = Expression::Like(Box::new(LikeOp {
+                negated: negate,
                 left,
                 right,
                 escape,
                 quantifier: None,
                 inferred_type: None,
             }));
-            this = if negate {
-                Some(Expression::Not(Box::new(UnaryOp {
-                    this: like,
-                    inferred_type: None,
-                })))
-            } else {
-                Some(like)
-            };
+            this = Some(like);
             return Ok(this);
         }
 
@@ -58718,20 +58704,14 @@ impl Parser {
                 .ok_or_else(|| self.parse_error("Expected expression after ILIKE"))?;
             let escape = self.parse_escape()?;
             let ilike = Expression::ILike(Box::new(LikeOp {
+                negated: negate,
                 left,
                 right,
                 escape,
                 quantifier: None,
                 inferred_type: None,
             }));
-            this = if negate {
-                Some(Expression::Not(Box::new(UnaryOp {
-                    this: ilike,
-                    inferred_type: None,
-                })))
-            } else {
-                Some(ilike)
-            };
+            this = Some(ilike);
             return Ok(this);
         }
 
@@ -60437,6 +60417,7 @@ impl Parser {
             span: None,
         });
         let like = LikeOp {
+            negated: false,
             left,
             right: pattern,
             escape: None,
