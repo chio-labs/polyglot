@@ -4558,23 +4558,23 @@ pub fn validate_parsed_with_schema(
         ));
         let mut statement = apply_projection_alias_bindings(statement, &bindings);
         if options.check_types {
-            // Expand known stars using the same qualification path as lineage.
-            // Open/partial schemas remain conservative if qualification fails.
-            if statement.dfs().any(|node| {
-                matches!(
-                    node,
-                    Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-                )
-            }) && statement
-                .dfs()
-                .any(|node| matches!(node, Expression::Star(_)))
-            {
-                if let Ok(qualified) = crate::optimizer::qualify_schema_aware_expression(
-                    statement.clone(),
-                    &resolver_schema,
-                    Some(dialect),
-                ) {
-                    statement = qualified;
+            // Give the type checker star-sourced column types for every query.
+            // Ordered CTE/source star expansion is the cheap lineage path; full
+            // qualification is only needed for stars it cannot resolve, such as
+            // stars over derived tables. Open/partial schemas remain conservative.
+            if has_projection_star(&statement) {
+                crate::lineage::expand_cte_stars(
+                    &mut statement,
+                    Some(&resolver_schema as &dyn crate::schema::Schema),
+                );
+                if has_projection_star(&statement) {
+                    if let Ok(qualified) = crate::optimizer::qualify_schema_aware_expression(
+                        statement.clone(),
+                        &resolver_schema,
+                        Some(dialect),
+                    ) {
+                        statement = qualified;
+                    }
                 }
             }
             annotate_types(&mut statement, Some(&resolver_schema), Some(dialect));
@@ -4602,6 +4602,16 @@ pub fn validate_parsed_with_schema(
     }
 
     ValidationResult::with_errors(all_errors)
+}
+
+fn has_projection_star(statement: &Expression) -> bool {
+    statement.dfs().any(|node| {
+        matches!(node, Expression::Select(select) if select.expressions.iter().any(|projection| {
+            crate::query_analysis::projection_is_star(
+                crate::query_analysis::unwrap_projection_alias(projection),
+            )
+        }))
+    })
 }
 
 /// Validate an already bound project-query scope without rebuilding its tree.

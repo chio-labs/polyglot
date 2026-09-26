@@ -2575,7 +2575,7 @@ fn datetime_field_name(field: &crate::expressions::DateTimeField) -> String {
     }
 }
 
-fn unwrap_projection_alias(expression: &Expression) -> &Expression {
+pub(crate) fn unwrap_projection_alias(expression: &Expression) -> &Expression {
     match expression {
         Expression::Alias(alias) => unwrap_projection_alias(&alias.this),
         Expression::Annotated(annotated) => unwrap_projection_alias(&annotated.this),
@@ -2595,7 +2595,7 @@ fn projection_name(expression: &Expression) -> Option<String> {
     }
 }
 
-fn projection_is_star(expression: &Expression) -> bool {
+pub(crate) fn projection_is_star(expression: &Expression) -> bool {
     matches!(expression, Expression::Star(_))
         || matches!(expression, Expression::Column(column) if column.name.name == "*")
 }
