@@ -23865,7 +23865,8 @@ impl Generator {
     ) -> Result<()> {
         let wrap_left = infix_operator.is_some_and(|parent| {
             Self::infix_operand_needs_parentheses(parent, &op.left, OperandSide::Left)
-        });
+        }) || (matches!(&op.left, Expression::Not(_))
+            && !matches!(operator, "AND" | "OR" | "XOR"));
         if wrap_left {
             self.write("(");
         }
@@ -23943,7 +23944,8 @@ impl Generator {
         self.write_space();
         let wrap_right = infix_operator.is_some_and(|parent| {
             Self::infix_operand_needs_parentheses(parent, &op.right, OperandSide::Right)
-        });
+        }) || (matches!(&op.right, Expression::Not(_))
+            && !matches!(operator, "AND" | "OR" | "XOR"));
         if wrap_right {
             self.write("(");
         }
@@ -24165,6 +24167,37 @@ impl Generator {
     }
 
     fn generate_like_op_inner(&mut self, op: &LikeOp, operator: &str, negated: bool) -> Result<()> {
+        // DataFusion's established unquantified spelling is prefix NOT. This
+        // equivalence must never be applied before an ANY/ALL reduction.
+        if negated
+            && op.quantifier.is_none()
+            && self.config.dialect == Some(DialectType::DataFusion)
+        {
+            self.write_keyword("NOT");
+            self.write_space();
+            return self.generate_like_op_inner(op, operator, false);
+        }
+        // Snowflake does not accept infix NOT LIKE ANY/ALL. Negating every
+        // comparison is equivalent to negating the dual positive quantifier.
+        if negated && self.config.dialect == Some(DialectType::Snowflake) {
+            let dual = match op.quantifier.as_deref() {
+                Some(q) if q.eq_ignore_ascii_case("ALL") => Some("ANY"),
+                Some(q) if q.eq_ignore_ascii_case("ANY") || q.eq_ignore_ascii_case("SOME") => {
+                    Some("ALL")
+                }
+                _ => None,
+            };
+            if let Some(dual) = dual {
+                let mut positive = op.clone();
+                positive.negated = false;
+                positive.quantifier = Some(dual.into());
+                self.write_keyword("NOT");
+                self.write(" (");
+                self.generate_like_op_inner(&positive, operator, false)?;
+                self.write(")");
+                return Ok(());
+            }
+        }
         if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
             if let Expression::Star(star) = &op.left {
                 if star
@@ -24282,7 +24315,8 @@ impl Generator {
     ) -> Result<()> {
         let wrap_left = infix_operator.is_some_and(|parent| {
             Self::infix_operand_needs_parentheses(parent, &op.left, OperandSide::Left)
-        });
+        }) || (matches!(&op.left, Expression::Not(_))
+            && !matches!(operator, "AND" | "OR" | "XOR"));
         if wrap_left {
             self.write("(");
         }
@@ -24339,7 +24373,8 @@ impl Generator {
         self.write_space();
         let wrap_right = infix_operator.is_some_and(|parent| {
             Self::infix_operand_needs_parentheses(parent, &op.right, OperandSide::Right)
-        });
+        }) || (matches!(&op.right, Expression::Not(_))
+            && !matches!(operator, "AND" | "OR" | "XOR"));
         if wrap_right {
             self.write("(");
         }
@@ -24380,10 +24415,11 @@ impl Generator {
             }
         }
         let wrap = operator == "NOT"
-            && matches!(
+            && (matches!(
                 &op.this,
                 Expression::And(_) | Expression::Or(_) | Expression::Xor(_)
-            );
+            ) || (self.config.dialect == Some(DialectType::ClickHouse)
+                && matches!(&op.this, Expression::Like(like) | Expression::ILike(like) if like.quantifier.is_some())));
         if wrap {
             self.write("(");
         }

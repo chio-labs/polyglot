@@ -119,8 +119,6 @@ impl DialectImpl for ClickHouseDialect {
                 | Expression::IsTrue(_)
                 | Expression::IsFalse(_)
                 | Expression::IsJson(_)
-                | Expression::Like(_)
-                | Expression::ILike(_)
                 | Expression::SimilarTo(_)
                 | Expression::Glob(_)
                 | Expression::RegexpLike(_)

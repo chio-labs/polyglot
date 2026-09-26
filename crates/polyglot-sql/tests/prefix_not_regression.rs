@@ -189,6 +189,38 @@ fn clickhouse_prefix_not_encloses_the_predicate() {
     );
     let parsed = stable("SELECT 1 WHERE NOT (x LIKE 'b%')", DialectType::ClickHouse);
     assert!(matches!(predicate(&parsed), Expression::Not(_)));
+    // ClickHouse's operator table gives NOT priority 5 and comparisons 9.
+    // Engine control: NOT 2 = 1 -> 1, while (NOT 2) = 1 -> 0.
+    let parsed = stable("SELECT 1 WHERE NOT 2 = 1", DialectType::ClickHouse);
+    assert!(
+        matches!(predicate(&parsed), Expression::Not(not) if matches!(&not.this, Expression::Eq(_)))
+    );
+}
+
+#[test]
+fn clickhouse_not_like_function_normalization_is_idempotent() {
+    for sql in [
+        "SELECT notLike(status, 'a%') FROM orders",
+        "SELECT sum(notLike(status, 'a%') != notLike(upper(status), 'a%')) FROM orders",
+        "SELECT throwIf(notLike(status, 'a%'), 'invalid status') FROM orders",
+        "SELECT sum(throwIf(notLike(status, 'a%'), 'invalid status')) FROM orders",
+    ] {
+        let first =
+            polyglot_sql::transpile(sql, DialectType::ClickHouse, DialectType::ClickHouse).unwrap();
+        let second =
+            polyglot_sql::transpile(&first[0], DialectType::ClickHouse, DialectType::ClickHouse)
+                .unwrap();
+        assert_eq!(first, second, "{sql}");
+        stable(&first[0], DialectType::ClickHouse);
+    }
+    let sql = "SELECT notLike(status, 'a%') != notLike(upper(status), 'a%') FROM orders";
+    let generated = polyglot_sql::transpile(sql, DialectType::ClickHouse, DialectType::ClickHouse)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        generated,
+        "SELECT (NOT status LIKE 'a%') <> (NOT UPPER(status) LIKE 'a%') FROM orders"
+    );
 }
 
 #[test]
@@ -216,7 +248,6 @@ fn prefix_not_like_exposes_columns_to_schema_validation() {
 fn quantified_prefix_and_infix_negation_are_distinct() {
     for dialect in [
         DialectType::Generic,
-        DialectType::Snowflake,
         DialectType::PostgreSQL,
         DialectType::ClickHouse,
         DialectType::TSQL,
@@ -228,7 +259,11 @@ fn quantified_prefix_and_infix_negation_are_distinct() {
                 } else {
                     "('a%', 'x%')"
                 };
-                let prefix = format!("SELECT 1 WHERE NOT 'abc' {operator}{quantifier} {rhs}");
+                let prefix = if dialect == DialectType::ClickHouse {
+                    format!("SELECT 1 WHERE NOT ('abc' {operator}{quantifier} {rhs})")
+                } else {
+                    format!("SELECT 1 WHERE NOT 'abc' {operator}{quantifier} {rhs}")
+                };
                 let infix = format!("SELECT 1 WHERE 'abc' NOT {operator}{quantifier} {rhs}");
                 let a = stable(&prefix, dialect);
                 let b = stable(&infix, dialect);
@@ -259,6 +294,72 @@ fn quantified_prefix_and_infix_negation_are_distinct() {
 }
 
 #[test]
+fn datafusion_only_canonicalizes_unquantified_infix_not_like() {
+    for operator in ["LIKE", "ILIKE"] {
+        let sql = format!("SELECT * FROM orders WHERE status NOT {operator} '%foo%'");
+        let parsed = parse_one(&sql, DialectType::DataFusion).unwrap();
+        assert_eq!(
+            generate(&parsed, DialectType::DataFusion).unwrap(),
+            format!("SELECT * FROM orders WHERE NOT status {operator} '%foo%'")
+        );
+        for quantifier in ["ANY", "ALL", "SOME"] {
+            let sql = format!("SELECT 1 WHERE status NOT {operator} {quantifier} ('a%', 'x%')");
+            let parsed = stable(&sql, DialectType::DataFusion);
+            assert!(generate(&parsed, DialectType::DataFusion)
+                .unwrap()
+                .contains(&format!("status NOT {operator} {quantifier}")));
+        }
+    }
+}
+
+#[test]
+fn snowflake_quantified_infix_negation_uses_the_dual_prefix() {
+    for operator in ["LIKE", "ILIKE"] {
+        for (quantifier, dual) in [("ALL", "ANY"), ("ANY", "ALL"), ("SOME", "ALL")] {
+            let sql = format!("SELECT 'abc' NOT {operator} {quantifier} ('a%', 'x%') ESCAPE '#'");
+            let parsed = parse_one(&sql, DialectType::Generic).unwrap();
+            let expected = format!("SELECT NOT ('abc' {operator} {dual} ('a%', 'x%') ESCAPE '#')");
+            assert_eq!(generate(&parsed, DialectType::Snowflake).unwrap(), expected);
+            assert_eq!(
+                polyglot_sql::transpile(&sql, DialectType::Generic, DialectType::Snowflake)
+                    .unwrap(),
+                vec![expected.clone()]
+            );
+            stable(&expected, DialectType::Snowflake);
+        }
+    }
+    for quantifier in ["ALL", "ANY"] {
+        let sql = format!("SELECT NOT 'abc' LIKE {quantifier} ('a%', 'x%')");
+        assert_eq!(
+            generate(
+                &parse_one(&sql, DialectType::Snowflake).unwrap(),
+                DialectType::Snowflake
+            )
+            .unwrap(),
+            sql
+        );
+    }
+}
+
+#[test]
+fn clickhouse_quantified_prefix_not_requires_parentheses() {
+    for operator in ["LIKE", "ILIKE"] {
+        for quantifier in ["ANY", "ALL", "SOME"] {
+            let sql = format!("SELECT 1 WHERE NOT 'abc' {operator} {quantifier} ('a%', 'x%')");
+            let parsed = parse_one(&sql, DialectType::Generic).unwrap();
+            let expected =
+                format!("SELECT 1 WHERE NOT ('abc' {operator} {quantifier} ('a%', 'x%'))");
+            assert_eq!(
+                generate(&parsed, DialectType::ClickHouse).unwrap(),
+                expected
+            );
+            let reparsed = stable(&expected, DialectType::ClickHouse);
+            assert!(matches!(predicate(&reparsed), Expression::Not(_)));
+        }
+    }
+}
+
+#[test]
 fn quantified_negation_duckdb_execution() {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -275,6 +376,8 @@ fn quantified_negation_duckdb_execution() {
                     };
                     let source = if array {
                         DialectType::PostgreSQL
+                    } else if !prefix {
+                        DialectType::Generic
                     } else {
                         DialectType::Snowflake
                     };
