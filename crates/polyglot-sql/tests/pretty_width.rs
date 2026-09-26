@@ -199,6 +199,83 @@ fn single_keyword_parser_fallbacks_do_not_disable_layout() {
     assert_eq!(output, generator.generate(&reparsed[0]).unwrap());
 }
 
+/// Dialects may canonicalize prefix/infix NOT and quantified LIKE differently.
+/// Compare layout against the dialect's compact output while requiring a typed
+/// predicate, exact AST equality after rendering, and formatting idempotence.
+fn assert_negation_layout(sql: &str, kind: DialectType) {
+    use polyglot_sql::{traversal::ExpressionWalk, Expression};
+    let dialect = Dialect::get(kind);
+    let ast = dialect.parse(sql).unwrap();
+    assert!(!ast[0]
+        .dfs()
+        .any(|node| matches!(node, Expression::Raw(_) | Expression::Command(_))));
+    let compact = dialect.generate(&ast[0]).unwrap();
+    let expected = dialect.parse(&compact).unwrap();
+    for width in [40, 80, 100, 120] {
+        let mut config = dialect.generator_config().clone();
+        config.pretty = true;
+        config.max_text_width = width;
+        let mut generator = Generator::with_config(config);
+        let output = generator.generate(&ast[0]).unwrap();
+        fits(&output, width);
+        let reparsed = dialect.parse(&output).unwrap();
+        assert_eq!(reparsed, expected, "{kind} width {width}:\n{sql}\n{output}");
+        assert_eq!(
+            generator.generate(&reparsed[0]).unwrap(),
+            output,
+            "{kind} width {width}: {sql}"
+        );
+    }
+}
+
+#[test]
+fn quantified_not_like_preserves_negation_when_wrapped() {
+    for kind in [
+        DialectType::Generic,
+        DialectType::Snowflake,
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::DataFusion,
+    ] {
+        for operator in ["LIKE", "ILIKE"] {
+            for quantifier in ["ANY", "ALL", "SOME"] {
+                let comparison = format!("UPPER(customer_reference) {operator} {quantifier} ('customer_pending%', 'customer_complete%', 'shipment_pending%', 'shipment_complete%', 'order_pending%', 'order_complete%', 'customer_returned%', 'shipment_returned%')");
+                for predicate in [
+                    format!("NOT ({comparison})"),
+                    format!("NOT {comparison}"),
+                    comparison.replacen(operator, &format!("NOT {operator}"), 1),
+                ] {
+                    assert_negation_layout(
+                        &format!("SELECT * FROM orders WHERE {predicate} AND shipment_id > 0"),
+                        kind,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn clickhouse_negated_comparisons_keep_grouping_when_wrapped() {
+    for sql in [
+        "SELECT (NOT (customer_total + shipment_total > order_total)) <> (NOT (customer_total * shipment_total = order_total)) FROM orders",
+        "SELECT * FROM orders WHERE NOT customer_quantity + shipment_quantity >= order_quantity AND NOT customer_total * shipment_total = order_total",
+        "SELECT notLike(customer_reference, 'customer_pending%') != notLike(upper(shipment_reference), 'shipment_pending%') FROM orders",
+    ] {
+        let canonical = polyglot_sql::transpile(sql, DialectType::ClickHouse, DialectType::ClickHouse).unwrap().remove(0);
+        assert_negation_layout(&canonical, DialectType::ClickHouse);
+        let dialect = Dialect::get(DialectType::ClickHouse);
+        let formatted = dialect.transpile_with(sql, DialectType::ClickHouse,
+            polyglot_sql::TranspileOptions::pretty()).unwrap().remove(0);
+        fits(&formatted, 80);
+        let formatted_ast = dialect.parse(&formatted).unwrap();
+        assert_eq!(dialect.generate_pretty(&formatted_ast[0]).unwrap(), formatted);
+        if sql.contains("!=") {
+            assert!(canonical.contains(") <> ("), "{canonical}");
+        }
+    }
+}
+
 #[test]
 fn wide_deep_generation_scales() {
     use std::time::{Duration, Instant};

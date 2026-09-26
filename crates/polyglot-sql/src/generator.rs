@@ -24206,7 +24206,19 @@ impl Generator {
                 positive.quantifier = Some(dual.into());
                 self.write_keyword("NOT");
                 self.write(" (");
+                // Match an explicit Paren node's pretty layout: reparsing this
+                // generated prefix form produces exactly that node.
+                if self.config.pretty {
+                    self.write_newline();
+                    self.indent_level += 1;
+                    self.write_indent();
+                }
                 self.generate_like_op_inner(&positive, operator, false)?;
+                if self.config.pretty {
+                    self.write_newline();
+                    self.indent_level -= 1;
+                    self.write_indent();
+                }
                 self.write(")");
                 return Ok(());
             }
