@@ -63,6 +63,8 @@ pub struct Resolver<'a> {
     /// Actual correlated parents, nearest first. Physical schema entries alone
     /// do not make a relation visible in a query.
     outer_scopes: Vec<&'a Scope>,
+    /// Optional interfaces already computed in lexical declaration order.
+    source_interfaces: Option<&'a HashMap<usize, Vec<String>>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -77,11 +79,20 @@ impl<'a> Resolver<'a> {
             unambiguous_columns_cache: None,
             all_columns_cache: None,
             outer_scopes: Vec::new(),
+            source_interfaces: None,
         }
     }
 
     pub(crate) fn with_outer_scopes(mut self, scopes: &'a [Scope]) -> Self {
         self.outer_scopes = scopes.iter().rev().collect();
+        self
+    }
+
+    pub(crate) fn with_source_interfaces(
+        mut self,
+        interfaces: &'a HashMap<usize, Vec<String>>,
+    ) -> Self {
+        self.source_interfaces = Some(interfaces);
         self
     }
 
@@ -219,6 +230,11 @@ impl<'a> Resolver<'a> {
 
     /// Extract column names from a source expression
     fn extract_columns_from_source(&self, source_info: &SourceInfo) -> ResolverResult<Vec<String>> {
+        if let Some(columns) = self.source_interfaces.and_then(|interfaces| {
+            interfaces.get(&(std::sync::Arc::as_ptr(&source_info.expression) as usize))
+        }) {
+            return Ok(columns.clone());
+        }
         self.get_source_columns_for_expression(&source_info.expression)
     }
 
@@ -226,6 +242,25 @@ impl<'a> Resolver<'a> {
         &self,
         expression: &Expression,
     ) -> ResolverResult<Vec<String>> {
+        if let Some(interfaces) = self.source_interfaces {
+            let name = match expression {
+                Expression::Table(table) => {
+                    Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                }
+                Expression::Subquery(query) => {
+                    query.alias.as_ref().map(|alias| alias.name.as_str())
+                }
+                Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+                _ => None,
+            };
+            if let Some(source) = name.and_then(|name| self.scope.sources.get(name)) {
+                if let Some(columns) =
+                    interfaces.get(&(std::sync::Arc::as_ptr(&source.expression) as usize))
+                {
+                    return Ok(columns.clone());
+                }
+            }
+        }
         let columns = match expression {
             Expression::Table(table) => {
                 // For tables, try to get columns from schema.

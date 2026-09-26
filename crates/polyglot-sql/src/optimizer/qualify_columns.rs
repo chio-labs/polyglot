@@ -518,7 +518,7 @@ fn make_coalesce(column_name: &str, tables: &[String]) -> Expression {
 ///
 /// Returns a mapping from column name → ordered list of table names that
 /// participate in USING for that column.
-fn expand_using(
+pub(crate) fn expand_using(
     select: &mut Select,
     _scope: &Scope,
     resolver: &mut Resolver,

@@ -352,6 +352,16 @@ pub(crate) fn bound_identifier(
 }
 
 pub(crate) fn bind_lambdas(expression: Expression, dialect: DialectType) -> Expression {
+    bind_lambdas_observed(expression, dialect, None)
+}
+
+pub(crate) fn bind_lambdas_observed(
+    expression: Expression,
+    dialect: DialectType,
+    mut observer: Option<
+        &mut dyn FnMut(&crate::expressions::Column, usize, &crate::expressions::Identifier),
+    >,
+) -> Expression {
     if !expression
         .dfs()
         .any(|node| matches!(node, Expression::Lambda(_)))
@@ -360,10 +370,26 @@ pub(crate) fn bind_lambdas(expression: Expression, dialect: DialectType) -> Expr
     }
 
     struct Bindings {
+        id: usize,
         parameters: HashMap<String, Option<DataType>>,
+        declarations: Option<HashMap<String, crate::expressions::Identifier>>,
         parent: Option<Arc<Bindings>>,
     }
     impl Bindings {
+        fn declaration(&self, name: &str) -> Option<(usize, &crate::expressions::Identifier)> {
+            let mut frame = Some(self);
+            while let Some(current) = frame {
+                if current.parameters.contains_key(name) {
+                    return current
+                        .declarations
+                        .as_ref()
+                        .and_then(|declarations| declarations.get(name))
+                        .map(|identifier| (current.id, identifier));
+                }
+                frame = current.parent.as_deref();
+            }
+            None
+        }
         fn get(&self, name: &str) -> Option<&Option<DataType>> {
             let mut frame = Some(self);
             while let Some(current) = frame {
@@ -386,6 +412,7 @@ pub(crate) fn bind_lambdas(expression: Expression, dialect: DialectType) -> Expr
     }
 
     let strategy = get_normalization_strategy(Some(dialect));
+    let mut next_lambda_id = 0;
     let mut pending = vec![Task::Visit(expression, None, Arc::default())];
     let mut results = Vec::new();
     while let Some(task) = pending.pop() {
@@ -443,9 +470,25 @@ pub(crate) fn bind_lambdas(expression: Expression, dialect: DialectType) -> Expr
                         })
                         .collect();
                     bindings = Some(Arc::new(Bindings {
+                        id: next_lambda_id,
                         parameters,
+                        declarations: observer.as_ref().map(|_| {
+                            lambda
+                                .parameters
+                                .iter()
+                                .map(|identifier| {
+                                    (
+                                        normalize_identifier(identifier.clone(), strategy).name,
+                                        identifier.clone(),
+                                    )
+                                })
+                                .collect()
+                        }),
                         parent: bindings,
                     }));
+                    if observer.is_some() {
+                        next_lambda_id += 1;
+                    }
                 }
                 if let (Expression::Column(column), Some(bindings)) = (&expression, &bindings) {
                     let root = column.table.as_ref().unwrap_or(&column.name);
@@ -456,6 +499,11 @@ pub(crate) fn bind_lambdas(expression: Expression, dialect: DialectType) -> Expr
                         && sources.visible.contains(&root.name.to_lowercase());
                     if !qualified_source {
                         if let Some(data_type) = bindings.get(&name) {
+                            if let Some(observer) = observer.as_mut() {
+                                if let Some((id, declaration)) = bindings.declaration(&name) {
+                                    observer(column, id, declaration);
+                                }
+                            }
                             let mut bound = bound_identifier(
                                 root.clone(),
                                 data_type.as_ref().unwrap_or(&DataType::Unknown),

@@ -3328,6 +3328,7 @@ fn bind_scope_projection_aliases(
     dialect: DialectType,
     check_types: bool,
     bindings: &mut ProjectionAliasBindings,
+    observer: Option<&std::cell::RefCell<binding_facts::BindingObserver>>,
 ) {
     let Expression::Select(select) = &scope.expression else {
         return;
@@ -3347,7 +3348,11 @@ fn bind_scope_projection_aliases(
     let mut inputs = HashSet::new();
     let mut open = false;
     for source_scope in std::iter::once(&*scope).chain(ancestors.iter().copied()) {
+        let observed = observer.map(std::cell::RefCell::borrow);
         let mut resolver = Resolver::new(source_scope, resolver_schema, true);
+        if let Some(observed) = &observed {
+            resolver = resolver.with_source_interfaces(&observed.source_interfaces);
+        }
         for source in source_scope.sources.keys() {
             let columns = resolver.get_source_columns(source).unwrap_or_default();
             open |= columns.is_empty() || columns.iter().any(|name| name == "*");
@@ -3433,6 +3438,9 @@ fn bind_scope_projection_aliases(
                 continue;
             }
             if let Some(Some(data_type)) = aliases.get(&name) {
+                if let Some(observer) = observer {
+                    observer.borrow_mut().record_alias(column, dialect);
+                }
                 references.insert(key, data_type.clone());
             }
         }
@@ -3509,6 +3517,9 @@ fn bind_scope_projection_aliases(
             let name = normalize_identifier(column.name.clone(), strategy).name;
             if !inputs.contains(&name) {
                 if let Some(Some(data_type)) = aliases.get(&name) {
+                    if let Some(observer) = observer {
+                        observer.borrow_mut().record_alias(column, dialect);
+                    }
                     references.insert(key, data_type.clone());
                 }
             }
@@ -3562,11 +3573,12 @@ fn source_output_identifiers(expression: &Expression) -> Vec<&crate::expressions
 use crate::binding::bind_lambdas as bind_validation_lambdas;
 
 #[derive(Clone, Copy)]
-struct ReferenceValidationOptions {
+struct ReferenceValidationOptions<'a> {
     dialect: DialectType,
     strict: bool,
     check_references: bool,
     check_types: bool,
+    observer: Option<&'a std::cell::RefCell<binding_facts::BindingObserver>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3755,7 +3767,11 @@ fn validate_scope_columns(
     let sources_by_scope: Vec<_> = std::iter::once(scope)
         .chain(ancestors.iter().copied())
         .map(|scope| {
+            let observed = options.observer.map(std::cell::RefCell::borrow);
             let mut resolver = Resolver::new(scope, resolver_schema, true);
+            if let Some(observed) = &observed {
+                resolver = resolver.with_source_interfaces(&observed.source_interfaces);
+            }
             let columns: HashMap<_, _> = scope
                 .sources
                 .keys()
@@ -3770,6 +3786,11 @@ fn validate_scope_columns(
             (scope, columns)
         })
         .collect();
+    if let Some(observer) = options.observer {
+        let mut observer = observer.borrow_mut();
+        observer.observe_stars(scope, resolver_schema, dialect);
+        observer.observe_using(scope, resolver_schema, dialect);
+    }
     let using_columns: HashSet<String> = select
         .joins
         .iter()
@@ -3860,7 +3881,20 @@ fn validate_scope_columns(
             }
         }
     }
-    let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
+    let observed_nodes = options
+        .observer
+        .map(|_| binding_facts::complete_scope_nodes(&expression));
+    let input_nodes = observed_nodes
+        .iter()
+        .flat_map(|nodes| nodes.iter().copied())
+        .chain(
+            observed_nodes
+                .is_none()
+                .then(|| walk_in_scope(&expression, false))
+                .into_iter()
+                .flatten(),
+        );
+    let input_columns = input_nodes.filter_map(|node| match node {
         Expression::Column(column) if !pivot_inputs.contains(&(column.as_ref() as *const _)) => {
             Some((column.as_ref(), OutputNameResolution::InputOnly))
         }
@@ -3923,6 +3957,15 @@ fn validate_scope_columns(
                 "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
             )
         {
+            if let Some(observer) = options.observer {
+                observer.borrow_mut().record(
+                    scope,
+                    column,
+                    binding_facts::OccurrenceBinding::Pseudocolumn {
+                        name: column.name.name.clone(),
+                    },
+                );
+            }
             continue;
         }
         let visible_sources = lateral_inputs.get(&(column as *const _));
@@ -3936,6 +3979,11 @@ fn validate_scope_columns(
                 false
             };
         if output_matches && resolution == OutputNameResolution::OutputFirst {
+            if let Some(observer) = options.observer {
+                let mut observer = observer.borrow_mut();
+                let binding = observer.output_binding(scope, column, dialect);
+                observer.record(scope, column, binding);
+            }
             continue;
         }
         let name = lower(&column.name.name);
@@ -3962,6 +4010,21 @@ fn validate_scope_columns(
                     })
             });
             if let Some((source_scope, columns, source)) = resolved {
+                if let Some(observer) = options.observer {
+                    let mut observer = observer.borrow_mut();
+                    let binding = if columns.empty || columns.wildcard {
+                        binding_facts::OccurrenceBinding::Open {
+                            sources: vec![source.clone()],
+                        }
+                    } else if !columns.names.contains(&normalized_name) {
+                        binding_facts::OccurrenceBinding::Unresolved {
+                            reason: "unknown source column".to_owned(),
+                        }
+                    } else {
+                        observer.source_binding(source_scope, &source, column, dialect)
+                    };
+                    observer.record(scope, column, binding);
+                }
                 if !columns.empty && !columns.wildcard && !columns.names.contains(&normalized_name)
                 {
                     errors.push(reference_diagnostic(
@@ -3976,6 +4039,15 @@ fn validate_scope_columns(
                     ));
                 }
             } else {
+                if let Some(observer) = options.observer {
+                    observer.borrow_mut().record(
+                        scope,
+                        column,
+                        binding_facts::OccurrenceBinding::Unresolved {
+                            reason: "unknown relation qualifier".to_owned(),
+                        },
+                    );
+                }
                 errors.push(reference_diagnostic(
                     format!(
                         "Unknown table or alias '{}' referenced by column '{}'",
@@ -3993,6 +4065,8 @@ fn validate_scope_columns(
         for (source_scope, source_columns) in &sources_by_scope {
             let mut matches = 0;
             let mut open = false;
+            let mut matched_sources = options.observer.map(|_| Vec::new());
+            let mut open_sources = options.observer.map(|_| Vec::new());
             for (source, columns) in source_columns {
                 if std::ptr::eq(*source_scope, scope)
                     && visible_sources.is_some_and(|visible| !visible.contains(*source))
@@ -4000,11 +4074,50 @@ fn validate_scope_columns(
                     continue;
                 }
                 open |= columns.empty || columns.wildcard;
+                if columns.empty || columns.wildcard {
+                    if let Some(sources) = &mut open_sources {
+                        sources.push((*source).to_owned());
+                    }
+                }
+                if !columns.wildcard && columns.names.contains(&normalized_name) {
+                    if let Some(sources) = &mut matched_sources {
+                        sources.push(*source);
+                    }
+                }
                 // Wildcards are not evidence of a definite ambiguity.
                 matches +=
                     usize::from(!columns.wildcard && columns.names.contains(&normalized_name));
             }
             if matches > 0 || open {
+                if let Some(observer) = options.observer {
+                    let mut observer = observer.borrow_mut();
+                    let sources = matched_sources.as_deref().unwrap_or_default();
+                    let binding = if open {
+                        binding_facts::OccurrenceBinding::Open {
+                            sources: open_sources.unwrap_or_default(),
+                        }
+                    } else if sources.len() == 1 {
+                        observer.source_binding(source_scope, sources[0], column, dialect)
+                    } else if let Some(binding) =
+                        observer.merged_binding(source_scope, column, dialect)
+                    {
+                        binding
+                    } else if using_columns.contains(&name) {
+                        binding_facts::OccurrenceBinding::Merged {
+                            inputs: sources
+                                .iter()
+                                .map(|source| {
+                                    observer.source_binding(source_scope, source, column, dialect)
+                                })
+                                .collect(),
+                        }
+                    } else {
+                        binding_facts::OccurrenceBinding::Unresolved {
+                            reason: "ambiguous input column".to_owned(),
+                        }
+                    };
+                    observer.record(scope, column, binding);
+                }
                 if matches > 1 && check_references && !using_columns.contains(&name) {
                     errors.push(reference_diagnostic(
                         format!(
@@ -4026,6 +4139,11 @@ fn validate_scope_columns(
         }
         if !found {
             if output_matches && resolution == OutputNameResolution::InputFirst {
+                if let Some(observer) = options.observer {
+                    let mut observer = observer.borrow_mut();
+                    let binding = observer.output_binding(scope, column, dialect);
+                    observer.record(scope, column, binding);
+                }
                 continue;
             }
             // Preserve the existing schema-only lookup for standalone column
@@ -4038,6 +4156,15 @@ fn validate_scope_columns(
                         .values()
                         .any(|table| table.columns.contains_key(&name)))
             {
+                if let Some(observer) = options.observer {
+                    observer.borrow_mut().record(
+                        scope,
+                        column,
+                        binding_facts::OccurrenceBinding::Open {
+                            sources: Vec::new(),
+                        },
+                    );
+                }
                 continue;
             }
             let message = if scope.sources.len() == 1 {
@@ -4059,6 +4186,15 @@ fn validate_scope_columns(
                 strict,
                 span,
             ));
+            if let Some(observer) = options.observer {
+                observer.borrow_mut().record(
+                    scope,
+                    column,
+                    binding_facts::OccurrenceBinding::Unresolved {
+                        reason: "unknown column".to_owned(),
+                    },
+                );
+            }
         }
     }
     errors
@@ -4073,6 +4209,37 @@ fn validate_scope_tree(
     errors: &mut Vec<ValidationError>,
     bindings: &mut ProjectionAliasBindings,
 ) {
+    if let Some(observer) = options.observer {
+        let order = match scope_query(&scope.expression) {
+            Expression::Union(query) => query.order_by.as_ref(),
+            Expression::Intersect(query) => query.order_by.as_ref(),
+            Expression::Except(query) => query.order_by.as_ref(),
+            _ => None,
+        };
+        if let Some(order) = order {
+            let names = observer.borrow().output_projection_names(scope);
+            let mut output = crate::expressions::Select::new();
+            output.expressions = names
+                .into_iter()
+                .map(|name| {
+                    Expression::Alias(Box::new(crate::expressions::Alias::new(
+                        Expression::Null(crate::expressions::Null),
+                        name,
+                    )))
+                })
+                .collect();
+            output.order_by = Some(order.clone());
+            let output_scope = crate::scope::Scope::new(Expression::Select(Box::new(output)));
+            observer.borrow_mut().alias_scope(scope, &output_scope);
+            errors.extend(validate_scope_columns(
+                &output_scope,
+                ancestors,
+                schema_map,
+                resolver_schema,
+                options,
+            ));
+        }
+    }
     if matches!(
         scope_query(&scope.expression),
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
@@ -4100,6 +4267,9 @@ fn validate_scope_tree(
         return;
     }
     let mut selected = selected_validation_scope(scope);
+    if let Some(observer) = options.observer {
+        observer.borrow_mut().alias_scope(scope, &selected);
+    }
     // Bind children before consumers, but retain the existing parent-first
     // diagnostic order. Only physical sources are inherited, never output aliases.
     let mut child_errors = Vec::new();
@@ -4197,6 +4367,7 @@ fn validate_scope_tree(
         options.dialect,
         options.check_types,
         bindings,
+        options.observer,
     );
     for node in walk_in_scope(&selected.expression, false) {
         let Expression::Table(table) = node else {
@@ -4255,6 +4426,9 @@ fn validate_statement_with_schema(
         if let Some(select) = crate::binding::dml_scope(expression) {
             let query = Expression::Select(Box::new(select));
             let scope = build_scope(&query);
+            if let Some(observer) = options.observer {
+                observer.borrow_mut().register(&scope, resolver_schema);
+            }
             validate_scope_tree(
                 &scope,
                 &[],
@@ -4319,6 +4493,9 @@ fn validate_statement_with_schema(
                     let mut source = query.clone();
                     attach_query_with_clause(&mut source, insert.with.as_ref());
                     let scope = build_scope(&source);
+                    if let Some(observer) = options.observer {
+                        observer.borrow_mut().register(&scope, resolver_schema);
+                    }
                     validate_scope_tree(
                         &scope,
                         &[],
@@ -4403,6 +4580,9 @@ fn validate_statement_with_schema(
                 | Expression::Except(_)
         ) {
             let scope = build_scope(expression);
+            if let Some(observer) = options.observer {
+                observer.borrow_mut().register(&scope, resolver_schema);
+            }
             validate_scope_tree(
                 &scope,
                 &[],
@@ -4425,6 +4605,9 @@ fn validate_statement_with_schema(
             }
             if let Expression::Table(table) = expression {
                 validate_schema_table(table, schema_map, options.strict, &mut errors);
+            }
+            if let (Expression::Column(column), Some(observer)) = (expression, options.observer) {
+                observer.borrow_mut().record_standalone(column);
             }
             pending.extend(expression.children().into_iter().rev());
         }
@@ -4477,6 +4660,35 @@ pub fn validate_parsed_with_schema(
     dialect: DialectType,
     schema: &ValidationSchema,
     options: &SchemaValidationOptions,
+) -> ValidationResult {
+    validate_parsed_observed(statements, dialect, schema, options, None)
+}
+
+/// Validate using the ordinary binding pass and additionally retain its binding facts.
+/// Existing validation entry points do not allocate or populate an observer.
+pub fn validate_parsed_with_binding_facts(
+    statements: Vec<Expression>,
+    dialect: DialectType,
+    schema: &ValidationSchema,
+    options: &SchemaValidationOptions,
+) -> binding_facts::ValidationBindingFacts {
+    let observer = std::cell::RefCell::new(binding_facts::BindingObserver::new());
+    let validation =
+        validate_parsed_observed(statements, dialect, schema, options, Some(&observer));
+    let observer = observer.into_inner();
+    binding_facts::ValidationBindingFacts {
+        validation,
+        scopes: observer.scopes,
+        occurrences: observer.occurrences,
+    }
+}
+
+fn validate_parsed_observed(
+    statements: Vec<Expression>,
+    dialect: DialectType,
+    schema: &ValidationSchema,
+    options: &SchemaValidationOptions,
+    observer: Option<&std::cell::RefCell<binding_facts::BindingObserver>>,
 ) -> ValidationResult {
     let strict = options.strict.unwrap_or(schema.strict.unwrap_or(true));
 
@@ -4542,7 +4754,18 @@ pub fn validate_parsed_with_schema(
             }
         }
         crate::binding::bind_dml_pseudoreferences(&mut statement);
-        let statement = bind_validation_lambdas(statement, dialect);
+        let statement = if let Some(observer) = observer {
+            observer.borrow_mut().prepare(&statement, &resolver_schema);
+            crate::binding::bind_lambdas_observed(
+                statement,
+                dialect,
+                Some(&mut |column, id, declaration| {
+                    observer.borrow_mut().record_lambda(column, id, declaration);
+                }),
+            )
+        } else {
+            bind_validation_lambdas(statement, dialect)
+        };
         let mut bindings = ProjectionAliasBindings::new();
         all_errors.extend(validate_statement_with_schema(
             &statement,
@@ -4553,6 +4776,7 @@ pub fn validate_parsed_with_schema(
                 strict,
                 check_references: options.check_references,
                 check_types: options.check_types,
+                observer,
             },
             &mut bindings,
         ));
@@ -4631,6 +4855,7 @@ pub(crate) fn validate_project_query_scope(
             strict,
             check_references: options.check_references,
             check_types: false,
+            observer: None,
         },
         &mut errors,
         &mut bindings,
@@ -4649,3 +4874,8 @@ pub(crate) fn validate_project_query_scope(
 
 #[cfg(test)]
 mod tests;
+
+pub mod binding_facts;
+
+#[cfg(test)]
+mod binding_facts_tests;

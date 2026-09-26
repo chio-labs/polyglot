@@ -2114,6 +2114,7 @@ fn test_schema_validation_projection_alias_chains_are_bounded() {
         DialectType::Snowflake,
         true,
         &mut bindings,
+        None,
     );
     assert_eq!(bindings.len(), 254);
     let bound = apply_projection_alias_bindings(original.clone(), &bindings);
