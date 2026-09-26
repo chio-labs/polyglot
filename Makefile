@@ -2,7 +2,7 @@
         setup-sqlglot setup-clickhouse-tests setup-external \
         extract-fixtures extract-clickhouse-fixtures extract-all-fixtures \
         test-rust test-rust-all test-rust-identity test-rust-dialect \
-        test-rust-transpile test-rust-pretty test-rust-roundtrip test-rust-matrix \
+        test-rust-transpile test-rust-pretty test-rust-width test-rust-roundtrip test-rust-matrix \
         test-rust-compat test-rust-errors test-rust-functions test-rust-custom test-rust-lib test-rust-feature-gates test-rust-verify \
         test-rust-verify-core test-rust-verify-release \
         test-rust-ci-core test-rust-ci-release-fixtures test-rust-ci-bindings test-rust-ci-feature-gates \
@@ -65,6 +65,7 @@ help:
 	@echo "  make test-rust-dialect          - Dialect identity tests"
 	@echo "  make test-rust-transpile        - Transpilation tests"
 	@echo "  make test-rust-pretty           - Pretty-printing tests"
+	@echo "  make test-rust-width            - Width formatting and extracted-corpus properties"
 	@echo "  make test-rust-transpile-generic - Normalization/transpile tests (test_transpile.py)"
 	@echo "  make test-rust-parser           - Parser round-trip/error tests (test_parser.py)"
 	@echo ""
@@ -232,6 +233,12 @@ test-rust-transpile:
 test-rust-pretty:
 	cargo test -p polyglot-sql sqlglot_pretty -- --nocapture
 
+# Explicit because the corpus property requires external extracted fixtures;
+# ordinary lib-only release checks must not depend on an external checkout.
+test-rust-width:
+	cargo test -p polyglot-sql --test pretty_width -- --nocapture
+	cargo test -p polyglot-sql --lib sqlglot_corpus_width_properties -- --ignored --nocapture
+
 # Run lib unit tests
 test-rust-lib:
 	cargo test --lib -p polyglot-sql
@@ -297,6 +304,7 @@ test-rust-verify-core:
 	@echo ""
 	@echo "=== Parser tests ==="
 	@cargo test --test sqlglot_parser test_sqlglot_parser_all -p polyglot-sql -- --nocapture
+	@$(MAKE) test-rust-width
 	@echo ""
 	@echo "=== Custom dialect tests ==="
 	@cargo test --test custom_dialect_tests -p polyglot-sql -- --nocapture

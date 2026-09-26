@@ -51,6 +51,8 @@ pub mod optimizer;
 pub mod parser;
 #[cfg(feature = "planner")]
 pub mod planner;
+#[cfg(feature = "generate")]
+mod pretty_width;
 #[cfg(all(feature = "semantic", feature = "generate"))]
 pub mod query_analysis;
 #[cfg(feature = "semantic")]

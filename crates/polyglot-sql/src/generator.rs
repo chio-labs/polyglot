@@ -238,7 +238,7 @@ impl IdentifierQuoteStyle {
 /// | `dialect` | `None` | Target SQL dialect (e.g. PostgreSQL, MySQL, BigQuery) |
 /// | `pretty` | `false` | Enable multi-line, indented output |
 /// | `indent` | `"  "` | Indentation string used when `pretty` is true |
-/// | `max_text_width` | `80` | Soft line-width limit for pretty-printing |
+/// | `max_text_width` | `80` | Pretty line width in Unicode scalar values, including indentation; indivisible tokens may exceed it |
 /// | `normalize_functions` | `Upper` | Function name casing (`Upper`, `Lower`, `None`) |
 /// | `identifier_quote_style` | `"…"` | Quote characters for identifiers |
 /// | `uppercase_keywords` | `true` | Whether SQL keywords are upper-cased |
@@ -2441,6 +2441,18 @@ impl Generator {
     /// The generator can be reused across multiple calls; each call to `generate`
     /// resets the internal buffer.
     pub fn generate(&mut self, expr: &Expression) -> Result<String> {
+        let output = self.generate_unwrapped(expr)?;
+        if self.config.pretty && !crate::pretty_width::has_opaque_sql(expr) {
+            crate::pretty_width::wrap(output, &self.config)
+        } else {
+            Ok(output)
+        }
+    }
+
+    /// Render syntax before the final width layout. Keeping this separate also
+    /// lets differential tests distinguish existing dialect normalization from
+    /// whitespace layout changes.
+    pub(crate) fn generate_unwrapped(&mut self, expr: &Expression) -> Result<String> {
         self.output.clear();
         self.unsupported_messages.clear();
         enforce_generate_ast(expr, &self.config.complexity_guard)?;
@@ -17494,8 +17506,8 @@ impl Generator {
                 let args: Vec<&str> = args_str.split_whitespace().collect();
 
                 // Calculate total width of arguments
-                let total_args_width: usize =
-                    args.iter().map(|s| s.len()).sum::<usize>() + args.len().saturating_sub(1); // spaces between args
+                let total_args_width: usize = args.iter().map(|s| s.chars().count()).sum::<usize>()
+                    + args.len().saturating_sub(1); // spaces between args
 
                 // If too wide, format on multiple lines
                 if total_args_width > self.config.max_text_width && !args.is_empty() {
@@ -17529,8 +17541,9 @@ impl Generator {
                     .collect::<Result<Vec<_>>>()?;
 
                 // Oracle hints use space-separated arguments, not comma-separated
-                let total_args_width: usize = arg_strings.iter().map(|s| s.len()).sum::<usize>()
-                    + arg_strings.len().saturating_sub(1); // spaces between args
+                let total_args_width: usize =
+                    arg_strings.iter().map(|s| s.chars().count()).sum::<usize>()
+                        + arg_strings.len().saturating_sub(1); // spaces between args
 
                 // Check if function args need multiline formatting
                 // Use too_wide check for argument formatting
@@ -28014,7 +28027,7 @@ impl Generator {
     /// Check if the total length of arguments exceeds max_text_width.
     /// Used for dynamic line breaking in expressions() formatting.
     fn too_wide(&self, args: &[String]) -> bool {
-        args.iter().map(|s| s.len()).sum::<usize>() > self.config.max_text_width
+        args.iter().map(|s| s.chars().count()).sum::<usize>() > self.config.max_text_width
     }
 
     /// Generate an expression to a string using a temporary non-pretty generator.

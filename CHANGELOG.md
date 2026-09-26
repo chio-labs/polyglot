@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.14.0] - 2026-09-26 (Python fork)
+
+### Changed
+
+- Pretty SQL generation now applies `GeneratorConfig.max_text_width` to rendered
+  lines, counting Unicode scalar values and indentation. Long calls, windows,
+  lists, boolean conditions, and arithmetic expressions wrap from the outside
+  inward. Token text, comments, parentheses, and compact output are preserved;
+  existing pretty lines within the configured width retain their layout.
+- Statements containing opaque SQL payloads (raw parser fallbacks, trigger bodies,
+  and unparsed DDL fragments) retain their original layout, since whitespace is
+  part of their AST representation. Comments and their attachment may also exceed
+  the width.
+
 ## [0.12.2] - 2026-09-22 (Python fork)
 
 ### Fixed

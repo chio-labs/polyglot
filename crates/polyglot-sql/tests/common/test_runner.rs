@@ -4,6 +4,39 @@
 use polyglot_sql::dialects::{Dialect, DialectType};
 use polyglot_sql::generator::{Generator, GeneratorConfig};
 use polyglot_sql::parser::Parser;
+use std::borrow::Cow;
+
+/// Whitespace-only updates to pinned upstream snapshots. Store edits rather
+/// than duplicating third-party SQL corpora. The stable FNV-1a fingerprint and
+/// byte length identify the exact old snapshot; every other fixture stays exact.
+fn width_snapshot(expected: &str) -> Cow<'_, str> {
+    #[derive(serde::Deserialize)]
+    struct Snapshot {
+        bytes: usize,
+        reason: String,
+        edits: Vec<(usize, usize, String)>,
+    }
+    static SNAPSHOTS: once_cell::sync::Lazy<std::collections::HashMap<String, Snapshot>> =
+        once_cell::sync::Lazy::new(|| {
+            serde_json::from_str(include_str!("../pretty_width_snapshots.json")).unwrap()
+        });
+    let hash = expected.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    let Some(snapshot) = SNAPSHOTS.get(&format!("{hash:016x}")) else {
+        return Cow::Borrowed(expected);
+    };
+    assert_eq!(expected.len(), snapshot.bytes);
+    assert!(!snapshot.reason.is_empty());
+    assert!(expected.lines().any(|line| line.chars().count() > 80));
+    let mut updated = expected.to_owned();
+    for (start, end, replacement) in snapshot.edits.iter().rev() {
+        assert!(expected[*start..*end].chars().all(char::is_whitespace));
+        assert!(replacement.chars().all(char::is_whitespace));
+        updated.replace_range(*start..*end, replacement);
+    }
+    Cow::Owned(updated)
+}
 
 fn has_formatting_newline(sql: &str) -> bool {
     let mut in_string = false;
@@ -121,7 +154,7 @@ pub fn dialect_identity_test(
         return Err("No statements parsed".to_string());
     }
 
-    let expected_output = expected.unwrap_or(sql);
+    let expected_output = width_snapshot(expected.unwrap_or(sql));
 
     // Use pretty printing if expected output contains newlines
     // This matches SQLGlot's behavior of formatting output when input is multi-line
@@ -210,10 +243,10 @@ pub fn transpile_test(
     expected: &str,
 ) -> Result<(), String> {
     let source_dialect = Dialect::get(source);
-    let expected = polyglot_transpile_expected(sql, source, target, expected);
+    let expected = width_snapshot(polyglot_transpile_expected(sql, source, target, expected));
 
     // If the expected output contains newlines outside of string literals, use pretty-printed generation
-    let use_pretty = has_formatting_newline(expected);
+    let use_pretty = has_formatting_newline(&expected);
 
     let results = if use_pretty {
         source_dialect
@@ -371,6 +404,7 @@ pub fn parser_error_test(sql: &str, dialect: Option<DialectType>) -> Result<(), 
 
 /// Run a pretty-print test: parse SQL and verify it generates the expected formatted output
 pub fn pretty_test(input: &str, expected: &str) -> Result<(), String> {
+    let expected = width_snapshot(expected);
     let ast = Parser::parse_sql(input).map_err(|e| format!("Parse error: {}", e))?;
 
     if ast.is_empty() {

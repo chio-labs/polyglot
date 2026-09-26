@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-sql"
-version = "0.13.3"
+version = "0.14.0"
 dependencies = [
  "polyglot-sql-ast-derive",
  "polyglot-sql-function-catalogs",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-sql-ast-derive"
-version = "0.13.3"
+version = "0.14.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-sql-function-catalogs"
-version = "0.13.3"
+version = "0.14.0"
 
 [[package]]
 name = "proc-macro2"

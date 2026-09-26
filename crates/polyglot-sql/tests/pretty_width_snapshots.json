@@ -1,0 +1,12 @@
+{
+  "9be9ddbfa7fa173f": {"bytes":100,"reason":"Wrap function signature before a multiline body","edits":[[24,24,"\n  "],[29,29,"\n"]]},
+  "747ee28ca4a65483": {"bytes":257,"reason":"Wrap nested JSON function call","edits":[[166,166,"\n    "],[219,219,"\n  "]]},
+  "dfe26511e33a52a3": {"bytes":189,"reason":"Move an indivisible long hint off the SELECT line","edits":[[6,6,"\n "]]},
+  "e47ce78ee3f490e8": {"bytes":240,"reason":"Wrap calls in a long CASE expression","edits":[[38,38,"\n    "],[42,42,"\n  "],[73,73,"\n    "],[77,77,"\n  "]]},
+  "01f518e92bff9f7c": {"bytes":877,"reason":"Wrap a long OUTPUT list","edits":[[684,684,"\n   "],[704,704,"\n   "],[725,725,"\n   "],[754,754,"\n   "]]},
+  "93a2c8e1a7ae0c0e": {"bytes":328,"reason":"Wrap a call in XMLTABLE PASSING","edits":[[118,118,"\n      "],[186,186,"\n    "]]},
+  "46139aeff39643ce": {"bytes":249,"reason":"Wrap a long FROM list","edits":[[197,197,"\n "]]},
+  "d0dbdcb7544cb489": {"bytes":1096,"reason":"Wrap long calls and nested FROM lists","edits":[[213,213,"\n       "],[226,226,"\n        "],[246,246,"\n       "],[259,259,"\n       "],[264,264,"\n      "],[280,280,"\n        "],[284,284,"\n       "],[289,289,"\n       "],[295,295,"\n       "],[302,302,"\n       "],[309,309,"\n       "],[314,314,"\n      "],[828,828,"\n  "],[863,863,"\n"],[873,873,"\n  "],[877,877,"\n "],[882,882,"\n "],[888,888,"\n "],[895,895,"\n "],[903,903,"\n "],[908,908,"\n"]]},
+  "6491dfcb938d2205": {"bytes":337,"reason":"Wrap nested table functions","edits":[[148,148,"\n "],[165,165,"\n  "],[178,178,"\n "],[196,196,"\n"],[203,203,"\n  "],[207,207,"\n "],[212,212,"\n "],[218,218,"\n "],[225,225,"\n "],[232,232,"\n "],[237,237,"\n"],[239,239,"\n "],[256,256,"\n  "],[294,294,"\n"],[302,302,"\n  "],[306,306,"\n "],[311,311,"\n "],[317,317,"\n "],[324,324,"\n "],[331,331,"\n "],[336,336,"\n"]]},
+  "0f019123e0d3d37b": {"bytes":159,"reason":"Wrap lateral function arguments","edits":[[60,60,"\n "],[77,77,"\n  "],[90,90,"\n "],[108,108,"\n"],[124,124,"\n  "],[128,128,"\n "],[133,133,"\n "],[139,139,"\n "],[146,146,"\n "],[153,153,"\n "],[158,158,"\n"]]}
+}
