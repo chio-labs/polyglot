@@ -279,7 +279,7 @@ fn inferred_output(expr: &Expression, inner: &Expression, dialect: DialectType) 
         return OutputType::Unknown;
     }
     if let Expression::Literal(literal) = inner {
-        return super::annotate_types::TypeAnnotator::annotate_literal(literal)
+        return super::annotate_types::TypeAnnotator::annotate_literal_for(literal, Some(dialect))
             .map(|t| OutputType::Known(canonical(&t, dialect)))
             .unwrap_or(OutputType::Unknown);
     }

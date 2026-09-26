@@ -40,7 +40,7 @@ pub(crate) const NO_PAREN_FUNCTION_NAME_LIST: &[&str] = &[
     "UTC_TIMESTAMP",
     "SESSION_USER",
     "SYSTEM_USER",
-    // Note: USER by itself is NOT a no-paren function in standard SQL - only CURRENT_USER is
+    // Bare USER is dialect-specific; see `bare_user_is_function`.
     "PI",
     // MySQL/Databricks CURDATE
     "CURDATE",
@@ -2222,6 +2222,21 @@ pub(crate) fn parser_dispatch_behavior_by_name_upper(
 /// Returns true if the given uppercased name can be parsed as a no-paren function.
 pub(crate) fn is_no_paren_function_name_upper(upper_name: &str) -> bool {
     NO_PAREN_FUNCTION_NAME_SET.contains(upper_name)
+}
+
+/// Whether an unquoted, unqualified `USER` is the niladic session-user function.
+/// Other dialects either require `USER()` or treat `user` as an ordinary name.
+pub(crate) fn bare_user_is_function(dialect: Option<DialectType>) -> bool {
+    matches!(
+        dialect,
+        Some(
+            DialectType::PostgreSQL
+                | DialectType::Redshift
+                | DialectType::DuckDB
+                | DialectType::TSQL
+                | DialectType::Oracle
+        )
+    )
 }
 
 /// Returns true if the given uppercased name should use aggregate parsing behavior.

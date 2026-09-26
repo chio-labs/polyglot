@@ -1648,4 +1648,15 @@ pub(crate) fn register<S: CatalogSink>(catalog: &mut S) {
     catalog.register(d, "~~", vec![FunctionSignature::exact(2)]);
     catalog.register(d, "~~*", vec![FunctionSignature::exact(2)]);
     catalog.register(d, "~~~", vec![FunctionSignature::exact(2)]);
+
+    // SQL keyword forms rewritten by DuckDB's parser rather than listed by
+    // duckdb_functions(); they are valid without brackets.
+    for name in [
+        "current_time",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
+    ] {
+        catalog.register(d, name, vec![FunctionSignature::exact(0)]);
+    }
 }

@@ -30406,6 +30406,14 @@ impl Parser {
             let expr = if self.match_token(TokenType::Star) {
                 let right = self.parse_power()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
+            } else if self.match_duckdb_integer_division() {
+                let right = self.parse_power()?;
+                Expression::IntDiv(Box::new(crate::expressions::BinaryFunc {
+                    this: left,
+                    expression: right,
+                    original_name: None,
+                    inferred_type: None,
+                }))
             } else if self.match_token(TokenType::Slash) {
                 let right = self.parse_power()?;
                 Expression::Div(Box::new(BinaryOp::new(left, right)))
@@ -30692,6 +30700,19 @@ impl Parser {
         Ok(expr)
     }
 
+    /// DuckDB's `//` integer-division operator is tokenized as two adjacent slashes.
+    fn match_duckdb_integer_division(&mut self) -> bool {
+        if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+            || !self.check(TokenType::Slash)
+            || !self.check_next(TokenType::Slash)
+            || self.tokens[self.current].span.end != self.tokens[self.current + 1].span.start
+        {
+            return false;
+        }
+        self.current += 2;
+        true
+    }
+
     /// Parse multiplication/division
     #[inline(always)]
     fn parse_multiplication(&mut self) -> Result<Expression> {
@@ -30705,6 +30726,14 @@ impl Parser {
             let expr = if self.match_token(TokenType::Star) {
                 let right = self.parse_power()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
+            } else if self.match_duckdb_integer_division() {
+                let right = self.parse_power()?;
+                Expression::IntDiv(Box::new(crate::expressions::BinaryFunc {
+                    this: left,
+                    expression: right,
+                    original_name: None,
+                    inferred_type: None,
+                }))
             } else if self.match_token(TokenType::Slash) {
                 let right = self.parse_power()?;
                 Expression::Div(Box::new(BinaryOp::new(left, right)))
@@ -32433,7 +32462,10 @@ impl Parser {
         let upper_name = self.peek_text().to_ascii_uppercase();
         if !self.check_next(TokenType::LParen)
             && !self.check_next(TokenType::Dot)
-            && crate::function_registry::is_no_paren_function_name_upper(upper_name.as_str())
+            && (crate::function_registry::is_no_paren_function_name_upper(upper_name.as_str())
+                || (upper_name == "USER"
+                    && self.peek().token_type != TokenType::QuotedIdentifier
+                    && crate::function_registry::bare_user_is_function(self.config.dialect)))
             && !(matches!(
                 self.config.dialect,
                 Some(crate::dialects::DialectType::ClickHouse)
