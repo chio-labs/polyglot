@@ -75,7 +75,46 @@ pub(crate) fn scope_query(expression: &Expression) -> &Expression {
 /// declarations remain available, but do not themselves cause ambiguity.
 pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
     let query = scope_query(&scope.expression);
-    let aliases: HashSet<_> = walk_in_scope(query, false)
+    let selected_expression = match query {
+        Expression::Select(select) => Expression::Select(Box::new(select_without_with(select))),
+        _ => query.clone(),
+    };
+    selected_scope_view(scope, selected_expression)
+}
+
+/// `selected_reference_scope` for a scope tree its caller owns. The query is
+/// moved into the view instead of copied, leaving `scope.expression` as NULL;
+/// the removed WITH clause is returned. Child scopes are unaffected.
+pub(crate) fn take_selected_reference_scope(
+    scope: &mut Scope,
+) -> (Scope, Option<crate::expressions::With>) {
+    fn into_scope_query(expression: Expression) -> Expression {
+        match expression {
+            Expression::Cte(cte) => into_scope_query(cte.this),
+            Expression::Subquery(subquery) => into_scope_query(subquery.this),
+            Expression::Paren(paren) => into_scope_query(paren.this),
+            Expression::Alias(alias) => into_scope_query(alias.this),
+            Expression::Annotated(annotated) => into_scope_query(annotated.this),
+            Expression::Prepare(prepare) => into_scope_query(prepare.statement),
+            Expression::CreateTable(create) if create.as_select.is_some() => {
+                into_scope_query(create.as_select.unwrap())
+            }
+            expression => expression,
+        }
+    }
+    let mut query = into_scope_query(std::mem::replace(
+        &mut scope.expression,
+        Expression::Null(crate::expressions::Null),
+    ));
+    let with = match &mut query {
+        Expression::Select(select) => select.with.take(),
+        _ => None,
+    };
+    (selected_scope_view(scope, query), with)
+}
+
+fn selected_scope_view(scope: &Scope, query: Expression) -> Scope {
+    let aliases: HashSet<_> = walk_in_scope(&query, false)
         .filter_map(|node| match node {
             Expression::Table(table) => {
                 Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
@@ -83,11 +122,7 @@ pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
             _ => None,
         })
         .collect();
-    let selected_expression = match query {
-        Expression::Select(select) => Expression::Select(Box::new(select_without_with(select))),
-        _ => query.clone(),
-    };
-    let mut selected = Scope::new(selected_expression);
+    let mut selected = Scope::new(query);
     selected.cte_sources = scope.cte_sources.clone();
     selected.sources = scope
         .sources

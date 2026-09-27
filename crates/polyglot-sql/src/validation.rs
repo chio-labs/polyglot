@@ -4135,8 +4135,73 @@ fn validate_scope_columns(
     errors
 }
 
+/// A scope tree node under reference validation. An owned tree is consumed:
+/// each query moves into its selected view instead of being copied.
+enum ValidationScope<'a> {
+    Shared(&'a crate::scope::Scope),
+    Owned(&'a mut crate::scope::Scope),
+}
+
+impl ValidationScope<'_> {
+    fn get(&self) -> &crate::scope::Scope {
+        match self {
+            Self::Shared(scope) => scope,
+            Self::Owned(scope) => scope,
+        }
+    }
+
+    fn selected(&mut self) -> (crate::scope::Scope, Option<crate::expressions::With>) {
+        match self {
+            Self::Shared(scope) => (selected_validation_scope(scope), None),
+            Self::Owned(scope) => crate::scope::take_selected_reference_scope(scope),
+        }
+    }
+
+    /// Correlated children (subqueries and UDTFs), or otherwise CTE, derived
+    /// table, and set-operation children.
+    fn children(&mut self, correlated: bool) -> Vec<ValidationScope<'_>> {
+        match self {
+            Self::Shared(scope) => {
+                let children: Vec<_> = if correlated {
+                    scope
+                        .subquery_scopes
+                        .iter()
+                        .chain(&scope.udtf_scopes)
+                        .collect()
+                } else {
+                    scope
+                        .cte_scopes
+                        .iter()
+                        .chain(&scope.derived_table_scopes)
+                        .chain(&scope.union_scopes)
+                        .collect()
+                };
+                children.into_iter().map(ValidationScope::Shared).collect()
+            }
+            Self::Owned(scope) => {
+                let children: Vec<_> = if correlated {
+                    scope
+                        .subquery_scopes
+                        .iter_mut()
+                        .chain(scope.udtf_scopes.iter_mut())
+                        .collect()
+                } else {
+                    scope
+                        .cte_scopes
+                        .iter_mut()
+                        .chain(scope.derived_table_scopes.iter_mut())
+                        .chain(scope.union_scopes.iter_mut())
+                        .collect()
+                };
+                children.into_iter().map(ValidationScope::Owned).collect()
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_scope_tree(
-    scope: &crate::scope::Scope,
+    mut scope: ValidationScope<'_>,
     ancestors: &[&crate::scope::Scope],
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
@@ -4145,20 +4210,16 @@ fn validate_scope_tree(
     bindings: &mut ProjectionAliasBindings,
     mut semantics: Option<&mut SemanticScopeChecks<'_>>,
 ) {
+    let tree = scope.get();
     if matches!(
-        scope_query(&scope.expression),
+        scope_query(&tree.expression),
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-    ) && scope.subquery_scopes.is_empty()
-        && scope.udtf_scopes.is_empty()
-        && !walk_in_scope(scope_query(&scope.expression), false)
+    ) && tree.subquery_scopes.is_empty()
+        && tree.udtf_scopes.is_empty()
+        && !walk_in_scope(scope_query(&tree.expression), false)
             .any(|node| matches!(node, Expression::Table(_)))
     {
-        for child in scope
-            .cte_scopes
-            .iter()
-            .chain(&scope.derived_table_scopes)
-            .chain(&scope.union_scopes)
-        {
+        for child in scope.children(false) {
             validate_scope_tree(
                 child,
                 ancestors,
@@ -4172,14 +4233,21 @@ fn validate_scope_tree(
         }
         return;
     }
-    let mut selected = selected_validation_scope(scope);
+    let (mut selected, taken_with) = scope.selected();
     if let Some(checks) = semantics.as_deref_mut() {
-        let node = scope_query(&scope.expression);
+        let with = taken_with
+            .as_ref()
+            .or_else(|| match scope_query(&scope.get().expression) {
+                Expression::Select(select) => select.with.as_ref(),
+                _ => None,
+            });
+        let node = &selected.expression;
         if let Expression::Select(select) = node {
             checks.selects += 1;
             semantics::check_select_semantics(
                 node,
                 select,
+                with,
                 &selected,
                 options.dialect,
                 Some(checks.schema),
@@ -4193,12 +4261,7 @@ fn validate_scope_tree(
     let mut child_errors = Vec::new();
     // CTEs and ordinary derived tables cannot see their containing SELECT's
     // sources, but may retain ancestors of an enclosing correlated subquery.
-    for child in scope
-        .cte_scopes
-        .iter()
-        .chain(&scope.derived_table_scopes)
-        .chain(&scope.union_scopes)
-    {
+    for child in scope.children(false) {
         validate_scope_tree(
             child,
             ancestors,
@@ -4213,13 +4276,13 @@ fn validate_scope_tree(
     let outer: Vec<_> = std::iter::once(&selected)
         .chain(ancestors.iter().copied())
         .collect();
-    for child in scope.subquery_scopes.iter().chain(&scope.udtf_scopes) {
+    for child in scope.children(true) {
         // A LATERAL subquery inherits only preceding relations. Pass that
         // lexical environment into the entire child tree, so nested correlated
         // queries share the restriction while their own FROM sources stay local.
         let mut lateral_outer = None;
-        if child.scope_type == crate::scope::ScopeType::Udtf {
-            if let Expression::Select(select) = scope_query(&scope.expression) {
+        if child.get().scope_type == crate::scope::ScopeType::Udtf {
+            if let Expression::Select(select) = &selected.expression {
                 let mut preceding = HashSet::new();
                 for relation in select
                     .from
@@ -4227,7 +4290,7 @@ fn validate_scope_tree(
                     .flat_map(|from| &from.expressions)
                     .chain(select.joins.iter().map(|join| &join.this))
                 {
-                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.expression)
+                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.get().expression)
                     {
                         let mut visible = selected.clone();
                         visible.sources.retain(|name, _| preceding.contains(name));
@@ -4345,9 +4408,9 @@ fn validate_statement_with_schema(
     while let Some(expression) = pending.pop() {
         if let Some(select) = crate::binding::dml_scope(expression) {
             let query = Expression::Select(Box::new(select));
-            let scope = build_scope(&query);
+            let mut scope = build_scope(&query);
             validate_scope_tree(
-                &scope,
+                ValidationScope::Owned(&mut scope),
                 &[],
                 schema_map,
                 resolver_schema,
@@ -4410,9 +4473,9 @@ fn validate_statement_with_schema(
                     // ordinary source validation.
                     let mut source = query.clone();
                     attach_query_with_clause(&mut source, insert.with.as_ref());
-                    let scope = build_scope(&source);
+                    let mut scope = build_scope(&source);
                     validate_scope_tree(
-                        &scope,
+                        ValidationScope::Owned(&mut scope),
                         &[],
                         schema_map,
                         resolver_schema,
@@ -4495,9 +4558,9 @@ fn validate_statement_with_schema(
                 | Expression::Intersect(_)
                 | Expression::Except(_)
         ) {
-            let scope = build_scope(expression);
+            let mut scope = build_scope(expression);
             validate_scope_tree(
-                &scope,
+                ValidationScope::Owned(&mut scope),
                 &[],
                 schema_map,
                 resolver_schema,
@@ -4802,7 +4865,7 @@ pub(crate) fn validate_project_query_scope(
     }
     let mut bindings = ProjectionAliasBindings::new();
     validate_scope_tree(
-        scope,
+        ValidationScope::Shared(scope),
         &[],
         &schema_map,
         &resolver_schema,

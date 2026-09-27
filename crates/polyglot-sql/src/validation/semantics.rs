@@ -386,11 +386,12 @@ fn source_identifier(expr: &Expression) -> Option<&Identifier> {
 fn check_structure(
     node: &Expression,
     select: &Select,
+    with: Option<&crate::expressions::With>,
     dialect: DialectType,
     errors: &mut Vec<ValidationError>,
 ) {
     let key = |name: &Identifier| crate::set_operation::identifier_key(name, Some(dialect));
-    if let Some(with) = &select.with {
+    if let Some(with) = with {
         let mut names = HashSet::new();
         for cte in &with.ctes {
             if dialect == DialectType::Snowflake && !cte.columns.is_empty() {
@@ -589,7 +590,16 @@ pub(super) fn check_bound_semantics(
             continue;
         };
         let scope = selected_validation_scope(&build_scope(node));
-        check_select_semantics(node, select, &scope, dialect, schema, mapping, &mut errors);
+        check_select_semantics(
+            node,
+            select,
+            select.with.as_ref(),
+            &scope,
+            dialect,
+            schema,
+            mapping,
+            &mut errors,
+        );
     }
     errors
 }
@@ -629,17 +639,20 @@ pub(super) fn check_set_operation_order(
 }
 
 /// Scope-local checks for one SELECT. `scope` is its selected reference scope:
-/// the SELECT's own sources, with CTE definitions visible at that point.
+/// the SELECT's own sources, with CTE definitions visible at that point. `with`
+/// is the SELECT's own WITH clause, which `select` itself may no longer carry.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_select_semantics(
     node: &Expression,
     select: &Select,
+    with: Option<&crate::expressions::With>,
     scope: &crate::scope::Scope,
     dialect: DialectType,
     schema: Option<&ValidationSchema>,
     mapping: &MappingSchema,
     errors: &mut Vec<ValidationError>,
 ) {
-    check_structure(node, select, dialect, errors);
+    check_structure(node, select, with, dialect, errors);
     if !select.expressions.iter().any(|expr| {
         expr.dfs().any(|node| {
             matches!(node, Expression::Star(_) | Expression::BracedWildcard(_))
