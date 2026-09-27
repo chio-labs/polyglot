@@ -4560,14 +4560,15 @@ pub fn validate_parsed_with_schema(
         if options.check_types {
             // Give the type checker star-sourced column types for every query.
             // Ordered CTE/source star expansion is the cheap lineage path; full
-            // qualification is only needed for stars it cannot resolve, such as
-            // stars over derived tables. Open/partial schemas remain conservative.
-            if has_projection_star(&statement) {
+            // qualification is only needed for unresolved stars that another scope
+            // consumes, such as a star over a derived table inside a subquery.
+            // Open/partial schemas remain conservative.
+            if has_projection_star(&statement, false) {
                 crate::lineage::expand_cte_stars(
                     &mut statement,
                     Some(&resolver_schema as &dyn crate::schema::Schema),
                 );
-                if has_projection_star(&statement) {
+                if has_projection_star(&statement, true) {
                     if let Ok(qualified) = crate::optimizer::qualify_schema_aware_expression(
                         statement.clone(),
                         &resolver_schema,
@@ -4604,9 +4605,20 @@ pub fn validate_parsed_with_schema(
     ValidationResult::with_errors(all_errors)
 }
 
-fn has_projection_star(statement: &Expression) -> bool {
+/// Whether any SELECT projects a star. With `consumed_only`, the root SELECT's
+/// own projection is ignored: its star feeds no expression in the statement, so
+/// only stars read by an outer scope or a set operation affect type checks.
+fn has_projection_star(statement: &Expression, consumed_only: bool) -> bool {
+    let root = match statement {
+        Expression::Select(select) if consumed_only => {
+            Some(select.as_ref() as *const crate::expressions::Select)
+        }
+        _ => None,
+    };
     statement.dfs().any(|node| {
-        matches!(node, Expression::Select(select) if select.expressions.iter().any(|projection| {
+        matches!(node, Expression::Select(select)
+            if root != Some(select.as_ref() as *const crate::expressions::Select)
+                && select.expressions.iter().any(|projection| {
             let mut projection = projection;
             loop {
                 match projection {

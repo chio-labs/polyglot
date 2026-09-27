@@ -1136,6 +1136,8 @@ fn star_sourced_types_are_checked_without_set_operations() {
         "WITH a AS (SELECT * FROM orders) SELECT 1 FROM a JOIN orders AS o ON a.s = o.i",
         "WITH a AS (SELECT * FROM orders), b AS (SELECT * FROM a) SELECT i FROM b WHERE s = i",
         "SELECT 1 FROM (SELECT * FROM orders) AS a JOIN orders AS o ON a.s = o.i",
+        "SELECT * FROM (SELECT o.s = p.i AS x FROM orders AS o JOIN orders AS p ON TRUE) AS a",
+        "SELECT * FROM (SELECT * FROM orders) AS a WHERE a.s = a.i",
     ] {
         let result = validate_with_schema(
             sql,
