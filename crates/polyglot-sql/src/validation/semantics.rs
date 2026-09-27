@@ -564,135 +564,177 @@ pub(crate) fn check_semantics(
     } else {
         stmt
     };
-    let mut errors = Vec::new();
     let mapping =
         schema.map(|schema| mapping_schema_from_validation_schema_with_dialect(schema, dialect));
     let empty_schema = MappingSchema::with_dialect(dialect);
+    check_bound_semantics(
+        stmt,
+        dialect,
+        schema,
+        mapping.as_ref().unwrap_or(&empty_schema),
+    )
+}
+
+/// `check_semantics` over a statement whose lambdas are already bound.
+pub(super) fn check_bound_semantics(
+    stmt: &Expression,
+    dialect: DialectType,
+    schema: Option<&ValidationSchema>,
+    mapping: &MappingSchema,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
     for node in stmt.dfs() {
-        let set_order = match node {
-            Expression::Union(query) => query.order_by.as_ref(),
-            Expression::Intersect(query) => query.order_by.as_ref(),
-            Expression::Except(query) => query.order_by.as_ref(),
-            _ => None,
-        };
-        if let Some(order) = set_order.filter(|order| !is_order_by_all(order, dialect)) {
-            if let Ok(outputs) = crate::set_operation::query_output_identifiers(node, Some(dialect))
-            {
-                for ordered in &order.expressions {
-                    if let Expression::Column(column) = &ordered.this {
-                        if !outputs.iter().any(|name| {
-                            crate::set_operation::identifier_key(name, Some(dialect))
-                                == crate::set_operation::identifier_key(&column.name, Some(dialect))
-                        }) {
-                            errors.push(issue(
-                                &ordered.this,
-                                "E201",
-                                "Set-operation ORDER BY references a non-output column",
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        check_set_operation_order(node, dialect, &mut errors);
         let Expression::Select(select) = node else {
             continue;
         };
-        check_structure(node, select, dialect, &mut errors);
-        if !select
-            .expressions
-            .iter()
-            .any(|expr| expr.dfs().any(|node| matches!(node, Expression::Star(_) | Expression::BracedWildcard(_)) || matches!(node, Expression::Function(f) if f.name.eq_ignore_ascii_case("columns"))))
-        {
-            for ordered in select.order_by.iter().filter(|order| !is_order_by_all(order, dialect)).flat_map(|order| &order.expressions) {
-                if let Expression::Literal(literal) = &ordered.this {
-                    if let crate::expressions::Literal::Number(number) = literal.as_ref() {
-                        if number.parse::<usize>().is_ok_and(|position| {
-                            position == 0 || position > select.expressions.len()
-                        }) {
-                            errors.push(issue(
-                                &ordered.this,
-                                "E201",
-                                "ORDER BY position is outside the output column range",
-                            ));
-                        }
-                    }
-                }
-            }
-        }
         let scope = selected_validation_scope(&build_scope(node));
-        let mut resolver = Resolver::new(&scope, mapping.as_ref().unwrap_or(&empty_schema), true);
-        let mut input_names = HashSet::new();
-        let mut input_column_names = HashSet::new();
-        let mut open = false;
-        for source in scope.sources.keys() {
-            let columns = resolver.get_source_columns(source).unwrap_or_default();
-            input_column_names.extend(columns.iter().cloned());
-            open |= columns.is_empty() || columns.iter().any(|column| column == "*");
-            input_names.extend(columns.iter().map(|column| {
-                crate::set_operation::identifier_key(
-                    &crate::binding::schema_identifier(column),
-                    Some(dialect),
-                )
-            }));
-        }
-        let mut left_columns = HashSet::new();
-        let mut left_open = false;
-        for source in select.from.iter().flat_map(|from| &from.expressions) {
-            if let Some(name) = source_identifier(source) {
-                let columns = resolver.get_source_columns(&name.name).unwrap_or_default();
-                left_open |= columns.is_empty() || columns.iter().any(|column| column == "*");
-                left_columns.extend(columns.into_iter().map(|column| lower(&column)));
-            } else {
-                left_open = true;
-            }
-        }
-        for join in &select.joins {
-            if let Some(name) = source_identifier(&join.this) {
-                let right = resolver.get_source_columns(&name.name).unwrap_or_default();
-                let right_open = right.is_empty() || right.iter().any(|column| column == "*");
-                for column in &join.using {
-                    if (!left_open && !left_columns.contains(&lower(&column.name)))
-                        || (!right_open
-                            && !right
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&column.name)))
-                    {
+        check_select_semantics(node, select, &scope, dialect, schema, mapping, &mut errors);
+    }
+    errors
+}
+
+/// Set-operation checks that do not depend on a SELECT scope. Returns whether
+/// `node` is a SELECT, so callers can account for per-SELECT checks.
+pub(super) fn check_set_operation_order(
+    node: &Expression,
+    dialect: DialectType,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    let set_order = match node {
+        Expression::Union(query) => query.order_by.as_ref(),
+        Expression::Intersect(query) => query.order_by.as_ref(),
+        Expression::Except(query) => query.order_by.as_ref(),
+        _ => return matches!(node, Expression::Select(_)),
+    };
+    if let Some(order) = set_order.filter(|order| !is_order_by_all(order, dialect)) {
+        if let Ok(outputs) = crate::set_operation::query_output_identifiers(node, Some(dialect)) {
+            for ordered in &order.expressions {
+                if let Expression::Column(column) = &ordered.this {
+                    if !outputs.iter().any(|name| {
+                        crate::set_operation::identifier_key(name, Some(dialect))
+                            == crate::set_operation::identifier_key(&column.name, Some(dialect))
+                    }) {
                         errors.push(issue(
-                            node,
+                            &ordered.this,
                             "E201",
-                            &format!(
-                                "JOIN USING column '{}' must exist on both sides",
-                                column.name
-                            ),
+                            "Set-operation ORDER BY references a non-output column",
                         ));
                     }
                 }
-                left_columns.extend(right.into_iter().map(|column| lower(&column)));
-                left_open |= right_open;
-            } else {
-                left_open = true;
             }
         }
-        for projection in &select.expressions {
-            if dialect == DialectType::DuckDB && !open {
-                for expr in walk_in_scope(projection, false) {
-                    if let Expression::Function(function) = expr {
-                        if function.name.eq_ignore_ascii_case("columns") {
-                            if let Some(Expression::Literal(literal)) = function.args.first() {
-                                if let crate::expressions::Literal::String(pattern) =
-                                    literal.as_ref()
-                                {
-                                    if let Ok(regex) = regex::Regex::new(pattern) {
-                                        if !input_column_names
-                                            .iter()
-                                            .any(|name| regex.is_match(name))
-                                        {
-                                            errors.push(issue(
-                                                expr,
-                                                "E201",
-                                                "COLUMNS pattern matches no input columns",
-                                            ));
-                                        }
+    }
+    false
+}
+
+/// Scope-local checks for one SELECT. `scope` is its selected reference scope:
+/// the SELECT's own sources, with CTE definitions visible at that point.
+pub(super) fn check_select_semantics(
+    node: &Expression,
+    select: &Select,
+    scope: &crate::scope::Scope,
+    dialect: DialectType,
+    schema: Option<&ValidationSchema>,
+    mapping: &MappingSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    check_structure(node, select, dialect, errors);
+    if !select.expressions.iter().any(|expr| {
+        expr.dfs().any(|node| {
+            matches!(node, Expression::Star(_) | Expression::BracedWildcard(_))
+                || matches!(node, Expression::Function(f) if f.name.eq_ignore_ascii_case("columns"))
+        })
+    }) {
+        for ordered in select
+            .order_by
+            .iter()
+            .filter(|order| !is_order_by_all(order, dialect))
+            .flat_map(|order| &order.expressions)
+        {
+            if let Expression::Literal(literal) = &ordered.this {
+                if let crate::expressions::Literal::Number(number) = literal.as_ref() {
+                    if number
+                        .parse::<usize>()
+                        .is_ok_and(|position| position == 0 || position > select.expressions.len())
+                    {
+                        errors.push(issue(
+                            &ordered.this,
+                            "E201",
+                            "ORDER BY position is outside the output column range",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut resolver = Resolver::new(scope, mapping, true);
+    let mut input_names = HashSet::new();
+    let mut input_column_names = HashSet::new();
+    let mut open = false;
+    for source in scope.sources.keys() {
+        let columns = resolver.get_source_columns(source).unwrap_or_default();
+        input_column_names.extend(columns.iter().cloned());
+        open |= columns.is_empty() || columns.iter().any(|column| column == "*");
+        input_names.extend(columns.iter().map(|column| {
+            crate::set_operation::identifier_key(
+                &crate::binding::schema_identifier(column),
+                Some(dialect),
+            )
+        }));
+    }
+    let mut left_columns = HashSet::new();
+    let mut left_open = false;
+    for source in select.from.iter().flat_map(|from| &from.expressions) {
+        if let Some(name) = source_identifier(source) {
+            let columns = resolver.get_source_columns(&name.name).unwrap_or_default();
+            left_open |= columns.is_empty() || columns.iter().any(|column| column == "*");
+            left_columns.extend(columns.into_iter().map(|column| lower(&column)));
+        } else {
+            left_open = true;
+        }
+    }
+    for join in &select.joins {
+        if let Some(name) = source_identifier(&join.this) {
+            let right = resolver.get_source_columns(&name.name).unwrap_or_default();
+            let right_open = right.is_empty() || right.iter().any(|column| column == "*");
+            for column in &join.using {
+                if (!left_open && !left_columns.contains(&lower(&column.name)))
+                    || (!right_open
+                        && !right
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&column.name)))
+                {
+                    errors.push(issue(
+                        node,
+                        "E201",
+                        &format!(
+                            "JOIN USING column '{}' must exist on both sides",
+                            column.name
+                        ),
+                    ));
+                }
+            }
+            left_columns.extend(right.into_iter().map(|column| lower(&column)));
+            left_open |= right_open;
+        } else {
+            left_open = true;
+        }
+    }
+    for projection in &select.expressions {
+        if dialect == DialectType::DuckDB && !open {
+            for expr in walk_in_scope(projection, false) {
+                if let Expression::Function(function) = expr {
+                    if function.name.eq_ignore_ascii_case("columns") {
+                        if let Some(Expression::Literal(literal)) = function.args.first() {
+                            if let crate::expressions::Literal::String(pattern) = literal.as_ref() {
+                                if let Ok(regex) = regex::Regex::new(pattern) {
+                                    if !input_column_names.iter().any(|name| regex.is_match(name)) {
+                                        errors.push(issue(
+                                            expr,
+                                            "E201",
+                                            "COLUMNS pattern matches no input columns",
+                                        ));
                                     }
                                 }
                             }
@@ -700,230 +742,228 @@ pub(crate) fn check_semantics(
                     }
                 }
             }
-            if let Expression::Star(star) = projection {
-                if let Some(table) = &star.table {
-                    if resolve_scope_source_name(&scope, &table.name).is_none() {
+        }
+        if let Expression::Star(star) = projection {
+            if let Some(table) = &star.table {
+                if resolve_scope_source_name(scope, &table.name).is_none() {
+                    errors.push(issue(
+                        projection,
+                        "E200",
+                        "Qualified star references an unknown table alias",
+                    ));
+                }
+            }
+            if !open {
+                for name in star
+                    .except
+                    .iter()
+                    .flatten()
+                    .chain(star.replace.iter().flatten().map(|alias| &alias.alias))
+                {
+                    let key = crate::set_operation::identifier_key(name, Some(dialect));
+                    if !input_names.contains(&key) {
                         errors.push(issue(
                             projection,
-                            "E200",
-                            "Qualified star references an unknown table alias",
+                            "E201",
+                            &format!("Star modifier references unknown column '{}'", name.name),
                         ));
                     }
                 }
-                if !open {
-                    for name in star
-                        .except
-                        .iter()
-                        .flatten()
-                        .chain(star.replace.iter().flatten().map(|alias| &alias.alias))
-                    {
-                        let key = crate::set_operation::identifier_key(name, Some(dialect));
-                        if !input_names.contains(&key) {
-                            errors.push(issue(
-                                projection,
-                                "E201",
-                                &format!("Star modifier references unknown column '{}'", name.name),
-                            ));
-                        }
-                    }
-                }
             }
-        }
-        let no_aliases = HashMap::new();
-        let mut aliases = HashMap::new();
-        let mut duplicate = HashSet::new();
-        for projection in &select.expressions {
-            placement(
-                projection,
-                true,
-                true,
-                if !open && crate::binding::lateral_aliases(dialect) {
-                    &aliases
-                } else {
-                    &no_aliases
-                },
-                dialect,
-                &mut errors,
-            );
-            if let Expression::Alias(alias) = projection {
-                let key = crate::set_operation::identifier_key(&alias.alias, Some(dialect));
-                if matches!(&alias.this, Expression::Column(column) if column.table.is_none() && crate::set_operation::identifier_key(&column.name, Some(dialect)) == key)
-                {
-                    continue;
-                }
-                if !input_names.contains(&key)
-                    && !duplicate.contains(&key)
-                    && aliases.insert(key.clone(), &alias.this).is_some()
-                {
-                    aliases.remove(&key);
-                    duplicate.insert(key);
-                }
-            }
-        }
-        // Incomplete source metadata cannot prove that a name refers to an
-        // output alias rather than an input column for placement diagnostics.
-        let placement_aliases = if open { &no_aliases } else { &aliases };
-        use crate::binding::{clause_aliases, AliasClause};
-        for expression in select
-            .prewhere
-            .iter()
-            .chain(select.where_clause.iter().map(|c| &c.this))
-        {
-            placement(
-                expression,
-                false,
-                false,
-                if clause_aliases(dialect, AliasClause::Where) {
-                    placement_aliases
-                } else {
-                    &no_aliases
-                },
-                dialect,
-                &mut errors,
-            );
-        }
-        for join in &select.joins {
-            if let Some(on) = &join.on {
-                placement(on, false, false, &no_aliases, dialect, &mut errors);
-            }
-        }
-        if let Some(group) = &select.group_by {
-            for e in &group.expressions {
-                let e = match e {
-                    Expression::Literal(literal) => literal
-                        .value_str()
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|i| i.checked_sub(1))
-                        .and_then(|i| select.expressions.get(i))
-                        .unwrap_or(e),
-                    _ => e,
-                };
-                placement(
-                    e,
-                    false,
-                    false,
-                    if clause_aliases(dialect, AliasClause::Group) {
-                        placement_aliases
-                    } else {
-                        &no_aliases
-                    },
-                    dialect,
-                    &mut errors,
-                );
-            }
-        }
-        if let Some(having) = &select.having {
-            placement(
-                &having.this,
-                true,
-                false,
-                if clause_aliases(dialect, AliasClause::Having) {
-                    placement_aliases
-                } else {
-                    &no_aliases
-                },
-                dialect,
-                &mut errors,
-            );
-        }
-        if let Some(qualify) = &select.qualify {
-            placement(
-                &qualify.this,
-                true,
-                true,
-                if clause_aliases(dialect, AliasClause::Qualify) {
-                    placement_aliases
-                } else {
-                    &no_aliases
-                },
-                dialect,
-                &mut errors,
-            );
-        }
-        if let Some(order) = select
-            .order_by
-            .as_ref()
-            .filter(|order| !is_order_by_all(order, dialect))
-        {
-            for e in &order.expressions {
-                placement(&e.this, true, true, placement_aliases, dialect, &mut errors);
-            }
-        }
-        let sources = scope
-            .sources
-            .keys()
-            .map(|name| {
-                crate::set_operation::identifier_key(
-                    &crate::binding::schema_identifier(name),
-                    Some(dialect),
-                )
-            })
-            .collect();
-        grouping(
-            select,
-            dialect,
-            schema,
-            &aliases,
-            &mut resolver,
-            &sources,
-            &mut errors,
-        );
-        if let Some(star) = select
-            .expressions
-            .iter()
-            .find(|e| matches!(e, Expression::Star(_)))
-        {
-            let mut warning = issue(star, "W001", "SELECT * is discouraged; specify columns explicitly for better performance and maintainability");
-            warning.severity = crate::ValidationSeverity::Warning;
-            errors.push(warning);
-        }
-        if select.distinct
-            && select
-                .order_by
-                .as_ref()
-                .is_some_and(|order| !is_order_by_all(order, dialect))
-        {
-            if dialect == DialectType::Snowflake
-                && select
-                    .expressions
-                    .iter()
-                    .all(|expr| matches!(unalias(expr), Expression::Column(_)))
-            {
-                let key =
-                    |name: &Identifier| crate::set_operation::identifier_key(name, Some(dialect));
-                let mut selected = HashSet::new();
-                for expr in &select.expressions {
-                    if let Expression::Alias(alias) = expr {
-                        selected.insert(key(&alias.alias));
-                    }
-                    if let Expression::Column(column) = unalias(expr) {
-                        selected.insert(key(&column.name));
-                    }
-                }
-                for ordered in select.order_by.iter().flat_map(|order| &order.expressions) {
-                    if let Expression::Column(column) = &ordered.this {
-                        if !selected.contains(&key(&column.name)) {
-                            errors.push(issue(
-                                &ordered.this,
-                                validation_codes::E_UNKNOWN_COLUMN,
-                                "DISTINCT ORDER BY references a non-selected column",
-                            ));
-                        }
-                    }
-                }
-            }
-            errors.push(ValidationError::warning(
-                "DISTINCT with ORDER BY: ensure ORDER BY columns are in SELECT list",
-                "W003",
-            ));
-        }
-        if select.limit.is_some() && select.order_by.is_none() {
-            errors.push(ValidationError::warning(
-                "LIMIT without ORDER BY produces non-deterministic results",
-                "W004",
-            ));
         }
     }
-    errors
+    let no_aliases = HashMap::new();
+    let mut aliases = HashMap::new();
+    let mut duplicate = HashSet::new();
+    for projection in &select.expressions {
+        placement(
+            projection,
+            true,
+            true,
+            if !open && crate::binding::lateral_aliases(dialect) {
+                &aliases
+            } else {
+                &no_aliases
+            },
+            dialect,
+            errors,
+        );
+        if let Expression::Alias(alias) = projection {
+            let key = crate::set_operation::identifier_key(&alias.alias, Some(dialect));
+            if matches!(&alias.this, Expression::Column(column) if column.table.is_none() && crate::set_operation::identifier_key(&column.name, Some(dialect)) == key)
+            {
+                continue;
+            }
+            if !input_names.contains(&key)
+                && !duplicate.contains(&key)
+                && aliases.insert(key.clone(), &alias.this).is_some()
+            {
+                aliases.remove(&key);
+                duplicate.insert(key);
+            }
+        }
+    }
+    // Incomplete source metadata cannot prove that a name refers to an
+    // output alias rather than an input column for placement diagnostics.
+    let placement_aliases = if open { &no_aliases } else { &aliases };
+    use crate::binding::{clause_aliases, AliasClause};
+    for expression in select
+        .prewhere
+        .iter()
+        .chain(select.where_clause.iter().map(|c| &c.this))
+    {
+        placement(
+            expression,
+            false,
+            false,
+            if clause_aliases(dialect, AliasClause::Where) {
+                placement_aliases
+            } else {
+                &no_aliases
+            },
+            dialect,
+            errors,
+        );
+    }
+    for join in &select.joins {
+        if let Some(on) = &join.on {
+            placement(on, false, false, &no_aliases, dialect, errors);
+        }
+    }
+    if let Some(group) = &select.group_by {
+        for e in &group.expressions {
+            let e = match e {
+                Expression::Literal(literal) => literal
+                    .value_str()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| select.expressions.get(i))
+                    .unwrap_or(e),
+                _ => e,
+            };
+            placement(
+                e,
+                false,
+                false,
+                if clause_aliases(dialect, AliasClause::Group) {
+                    placement_aliases
+                } else {
+                    &no_aliases
+                },
+                dialect,
+                errors,
+            );
+        }
+    }
+    if let Some(having) = &select.having {
+        placement(
+            &having.this,
+            true,
+            false,
+            if clause_aliases(dialect, AliasClause::Having) {
+                placement_aliases
+            } else {
+                &no_aliases
+            },
+            dialect,
+            errors,
+        );
+    }
+    if let Some(qualify) = &select.qualify {
+        placement(
+            &qualify.this,
+            true,
+            true,
+            if clause_aliases(dialect, AliasClause::Qualify) {
+                placement_aliases
+            } else {
+                &no_aliases
+            },
+            dialect,
+            errors,
+        );
+    }
+    if let Some(order) = select
+        .order_by
+        .as_ref()
+        .filter(|order| !is_order_by_all(order, dialect))
+    {
+        for e in &order.expressions {
+            placement(&e.this, true, true, placement_aliases, dialect, errors);
+        }
+    }
+    let sources = scope
+        .sources
+        .keys()
+        .map(|name| {
+            crate::set_operation::identifier_key(
+                &crate::binding::schema_identifier(name),
+                Some(dialect),
+            )
+        })
+        .collect();
+    grouping(
+        select,
+        dialect,
+        schema,
+        &aliases,
+        &mut resolver,
+        &sources,
+        errors,
+    );
+    if let Some(star) = select
+        .expressions
+        .iter()
+        .find(|e| matches!(e, Expression::Star(_)))
+    {
+        let mut warning = issue(star, "W001", "SELECT * is discouraged; specify columns explicitly for better performance and maintainability");
+        warning.severity = crate::ValidationSeverity::Warning;
+        errors.push(warning);
+    }
+    if select.distinct
+        && select
+            .order_by
+            .as_ref()
+            .is_some_and(|order| !is_order_by_all(order, dialect))
+    {
+        if dialect == DialectType::Snowflake
+            && select
+                .expressions
+                .iter()
+                .all(|expr| matches!(unalias(expr), Expression::Column(_)))
+        {
+            let key = |name: &Identifier| crate::set_operation::identifier_key(name, Some(dialect));
+            let mut selected = HashSet::new();
+            for expr in &select.expressions {
+                if let Expression::Alias(alias) = expr {
+                    selected.insert(key(&alias.alias));
+                }
+                if let Expression::Column(column) = unalias(expr) {
+                    selected.insert(key(&column.name));
+                }
+            }
+            for ordered in select.order_by.iter().flat_map(|order| &order.expressions) {
+                if let Expression::Column(column) = &ordered.this {
+                    if !selected.contains(&key(&column.name)) {
+                        errors.push(issue(
+                            &ordered.this,
+                            validation_codes::E_UNKNOWN_COLUMN,
+                            "DISTINCT ORDER BY references a non-selected column",
+                        ));
+                    }
+                }
+            }
+        }
+        errors.push(ValidationError::warning(
+            "DISTINCT with ORDER BY: ensure ORDER BY columns are in SELECT list",
+            "W003",
+        ));
+    }
+    if select.limit.is_some() && select.order_by.is_none() {
+        errors.push(ValidationError::warning(
+            "LIMIT without ORDER BY produces non-deterministic results",
+            "W004",
+        ));
+    }
 }

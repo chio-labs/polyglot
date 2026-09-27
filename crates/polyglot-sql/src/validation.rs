@@ -3596,6 +3596,15 @@ struct ReferenceValidationOptions {
     check_types: bool,
 }
 
+/// Per-SELECT semantic checks run on the reference-validation scope tree, so a
+/// query's scopes are built once. `selects` counts the SELECT scopes visited.
+struct SemanticScopeChecks<'a> {
+    schema: &'a ValidationSchema,
+    mapping: &'a MappingSchema,
+    errors: Vec<ValidationError>,
+    selects: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputNameResolution {
     InputOnly,
@@ -4099,6 +4108,7 @@ fn validate_scope_tree(
     options: ReferenceValidationOptions,
     errors: &mut Vec<ValidationError>,
     bindings: &mut ProjectionAliasBindings,
+    mut semantics: Option<&mut SemanticScopeChecks<'_>>,
 ) {
     if matches!(
         scope_query(&scope.expression),
@@ -4122,11 +4132,27 @@ fn validate_scope_tree(
                 options,
                 errors,
                 bindings,
+                semantics.as_deref_mut(),
             );
         }
         return;
     }
     let mut selected = selected_validation_scope(scope);
+    if let Some(checks) = semantics.as_deref_mut() {
+        let node = scope_query(&scope.expression);
+        if let Expression::Select(select) = node {
+            checks.selects += 1;
+            semantics::check_select_semantics(
+                node,
+                select,
+                &selected,
+                options.dialect,
+                Some(checks.schema),
+                checks.mapping,
+                &mut checks.errors,
+            );
+        }
+    }
     // Bind children before consumers, but retain the existing parent-first
     // diagnostic order. Only physical sources are inherited, never output aliases.
     let mut child_errors = Vec::new();
@@ -4146,6 +4172,7 @@ fn validate_scope_tree(
             options,
             &mut child_errors,
             bindings,
+            semantics.as_deref_mut(),
         );
     }
     let outer: Vec<_> = std::iter::once(&selected)
@@ -4215,6 +4242,7 @@ fn validate_scope_tree(
             options,
             &mut child_errors,
             bindings,
+            semantics.as_deref_mut(),
         );
     }
     bind_scope_projection_aliases(
@@ -4274,6 +4302,7 @@ fn validate_statement_with_schema(
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
     bindings: &mut ProjectionAliasBindings,
+    mut semantics: Option<&mut SemanticScopeChecks<'_>>,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     // Visit each query tree once, including queries embedded in DML/DDL.
@@ -4290,6 +4319,7 @@ fn validate_statement_with_schema(
                 options,
                 &mut errors,
                 bindings,
+                None,
             );
             let target_columns = match expression {
                 Expression::Insert(insert) => {
@@ -4354,6 +4384,7 @@ fn validate_statement_with_schema(
                         options,
                         &mut errors,
                         bindings,
+                        None,
                     );
                 }
             }
@@ -4438,6 +4469,9 @@ fn validate_statement_with_schema(
                 options,
                 &mut errors,
                 bindings,
+                semantics
+                    .as_deref_mut()
+                    .filter(|_| std::ptr::eq(expression, stmt)),
             );
         } else {
             // DDL may declare a new table; only its query inputs are references.
@@ -4539,8 +4573,22 @@ pub fn validate_parsed_with_schema(
     }
 
     for mut statement in statements {
+        // A query's per-SELECT semantic checks reuse the reference scope tree.
+        // Other statements, such as DML with synthetic scopes, keep the
+        // standalone traversal.
+        let fused_semantics = options.semantic
+            && matches!(
+                statement,
+                Expression::Select(_)
+                    | Expression::Union(_)
+                    | Expression::Intersect(_)
+                    | Expression::Except(_)
+            );
+        let mut semantic_errors = Vec::new();
         if options.semantic {
-            all_errors.extend(check_semantics(&statement, dialect, Some(schema)));
+            if !fused_semantics {
+                semantic_errors = check_semantics(&statement, dialect, Some(schema));
+            }
             if !options.check_types {
                 for node in statement.dfs() {
                     if let Expression::Function(function) = node {
@@ -4554,14 +4602,14 @@ pub fn validate_parsed_with_schema(
                                 function.args.len(),
                                 dialect,
                                 strict,
-                                &mut all_errors,
+                                &mut semantic_errors,
                             );
                             check_function_catalog(
                                 function,
                                 dialect,
                                 effective_function_catalog,
                                 strict,
-                                &mut all_errors,
+                                &mut semantic_errors,
                             );
                         }
                     }
@@ -4571,7 +4619,13 @@ pub fn validate_parsed_with_schema(
         crate::binding::bind_dml_pseudoreferences(&mut statement);
         let statement = bind_validation_lambdas(statement, dialect);
         let mut bindings = ProjectionAliasBindings::new();
-        all_errors.extend(validate_statement_with_schema(
+        let mut scope_semantics = fused_semantics.then(|| SemanticScopeChecks {
+            schema,
+            mapping: &resolver_schema,
+            errors: Vec::new(),
+            selects: 0,
+        });
+        let reference_errors = validate_statement_with_schema(
             &statement,
             &schema_map,
             &resolver_schema,
@@ -4582,7 +4636,34 @@ pub fn validate_parsed_with_schema(
                 check_types: options.check_types,
             },
             &mut bindings,
-        ));
+            scope_semantics.as_mut(),
+        );
+        if let Some(checks) = scope_semantics {
+            let mut errors = Vec::new();
+            let mut selects = 0;
+            for node in statement.dfs() {
+                selects += usize::from(semantics::check_set_operation_order(
+                    node,
+                    dialect,
+                    &mut errors,
+                ));
+            }
+            if selects == checks.selects {
+                errors.extend(checks.errors);
+            } else {
+                // A SELECT outside the scope tree must still be checked.
+                errors = semantics::check_bound_semantics(
+                    &statement,
+                    dialect,
+                    Some(schema),
+                    &resolver_schema,
+                );
+            }
+            errors.append(&mut semantic_errors);
+            semantic_errors = errors;
+        }
+        all_errors.extend(semantic_errors);
+        all_errors.extend(reference_errors);
         let mut statement = apply_projection_alias_bindings(statement, &bindings);
         if options.check_types {
             // Give the type checker star-sourced column types for every query.
@@ -4691,6 +4772,7 @@ pub(crate) fn validate_project_query_scope(
         },
         &mut errors,
         &mut bindings,
+        None,
     );
     if options.check_references {
         let statement = apply_projection_alias_bindings(scope.expression.clone(), &bindings);
