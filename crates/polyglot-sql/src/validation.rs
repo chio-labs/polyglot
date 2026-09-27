@@ -1614,6 +1614,15 @@ fn check_generic_function(
     }
 }
 
+/// DuckDB rewrites these SQL keywords itself; they are not callable functions,
+/// so only the bracket-free keyword form is valid.
+const DUCKDB_KEYWORD_ONLY_FUNCTIONS: [&str; 4] = [
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+];
+
 fn check_function_catalog(
     function: &Function,
     dialect: DialectType,
@@ -1621,6 +1630,24 @@ fn check_function_catalog(
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    if function_catalog.is_some()
+        && dialect == DialectType::DuckDB
+        && !function.no_parens
+        && DUCKDB_KEYWORD_ONLY_FUNCTIONS
+            .iter()
+            .any(|keyword| function_base_name(&function.name).eq_ignore_ascii_case(keyword))
+    {
+        let message = format!(
+            "Unknown function '{}' for dialect {:?}",
+            function.name, dialect
+        );
+        errors.push(if strict {
+            ValidationError::error(message, validation_codes::E_UNKNOWN_FUNCTION)
+        } else {
+            ValidationError::warning(message, validation_codes::E_UNKNOWN_FUNCTION)
+        });
+        return;
+    }
     check_named_function_catalog(
         &function.name,
         function.args.len(),

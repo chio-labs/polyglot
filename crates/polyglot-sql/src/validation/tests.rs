@@ -1126,6 +1126,42 @@ fn review_builtin_and_unknown_cast_targets_do_not_error() {
 }
 
 #[test]
+fn duckdb_keyword_time_functions_are_valid_only_without_brackets() {
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    let schema = semantic_type_schema();
+    for sql in [
+        "SELECT CURRENT_TIMESTAMP AS ts",
+        "SELECT current_time AS t",
+        "SELECT LOCALTIMESTAMP AS ts",
+        "SELECT localtime AS t",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(
+            !result.errors.iter().any(|e| e.code == "E202"),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+    for sql in [
+        "SELECT CURRENT_TIMESTAMP() AS ts",
+        "SELECT current_time() AS t",
+        "SELECT LOCALTIMESTAMP() AS ts",
+        "SELECT localtime() AS t",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(
+            !result.valid && result.errors.iter().any(|e| e.code == "E202"),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+}
+
+#[test]
 fn star_sourced_types_are_checked_without_set_operations() {
     let options = SchemaValidationOptions {
         semantic: true,
