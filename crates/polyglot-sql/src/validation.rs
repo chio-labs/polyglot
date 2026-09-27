@@ -3758,22 +3758,50 @@ fn validate_scope_columns(
             }
         }
     }
-    let mut normalized = select.clone();
     // Only a qualifier that names no visible source can be a struct access.
-    if walk_in_scope(&scope.expression, false).any(|node| {
-        matches!(node, Expression::Column(column) if column.table.as_ref().is_some_and(|root| {
-            !visible
-                .sources
-                .keys()
-                .any(|source| source.eq_ignore_ascii_case(&root.name))
-        }))
-    }) {
-        let mut normalizer = Resolver::new(&visible, resolver_schema, true);
-        let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
-    }
+    // Without one, normalization is the identity and the scope's own SELECT is
+    // read in place.
+    let normalized = walk_in_scope(&scope.expression, false)
+        .any(|node| {
+            matches!(node, Expression::Column(column) if column.table.as_ref().is_some_and(|root| {
+                !visible
+                    .sources
+                    .keys()
+                    .any(|source| source.eq_ignore_ascii_case(&root.name))
+            }))
+        })
+        .then(|| {
+            let mut normalized = select.clone();
+            let mut normalizer = Resolver::new(&visible, resolver_schema, true);
+            let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+            // Separate query-level ordering from the ordinary scope walk. This
+            // avoids accidentally exempting a same-named reference in another
+            // clause, window, or nested query, and leaves the caller's AST untouched.
+            let order_by = normalized.order_by.take();
+            (Expression::Select(normalized), order_by)
+        });
+    let (expression, order_by, order_nodes) = match &normalized {
+        Some((expression, order_by)) => (expression, order_by.as_ref(), HashSet::new()),
+        None => {
+            let order_by = select.order_by.as_ref();
+            let nodes: HashSet<*const Column> = order_by
+                .into_iter()
+                .flat_map(|order| &order.expressions)
+                .flat_map(|ordered| walk_in_scope(&ordered.this, false))
+                .filter_map(|node| match node {
+                    Expression::Column(column) => Some(column.as_ref() as *const Column),
+                    _ => None,
+                })
+                .collect();
+            (&scope.expression, order_by, nodes)
+        }
+    };
+    let Expression::Select(normalized_select) = expression else {
+        unreachable!("validated scope SELECT")
+    };
     let strategy = get_normalization_strategy(Some(dialect));
     let mut output_names = HashMap::<String, usize>::new();
-    for projection in &normalized.expressions {
+    for projection in &normalized_select.expressions {
         let identifier = match projection {
             // Until wildcards are expanded, output-name uniqueness is not
             // known. Preserve source validation instead of letting an explicit
@@ -3793,11 +3821,6 @@ fn validate_scope_columns(
         let name = normalize_identifier(identifier.clone(), strategy).name;
         *output_names.entry(name).or_default() += 1;
     }
-    // Separate query-level ordering from the ordinary scope walk. This avoids
-    // accidentally exempting a same-named reference in another clause, window,
-    // or nested query, and leaves the caller's AST untouched.
-    let order_by = normalized.order_by.take();
-    let expression = Expression::Select(normalized);
     let sources_by_scope: Vec<_> = std::iter::once(scope)
         .chain(ancestors.iter().copied())
         .map(|scope| {
@@ -3853,7 +3876,7 @@ fn validate_scope_columns(
     // indexed above. Do not falsely bind them against generated pivot columns.
     // Nested input queries still receive their own lexical validation pass.
     let mut pivot_inputs = HashSet::new();
-    for node in walk_in_scope(&expression, false) {
+    for node in walk_in_scope(expression, false) {
         if let Expression::Unpivot(unpivot) = node {
             let resolver = Resolver::new(scope, resolver_schema, true);
             let columns = resolver.get_source_output_columns(&unpivot.this);
@@ -3906,21 +3929,23 @@ fn validate_scope_columns(
             }
         }
     }
-    let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
-        Expression::Column(column) if !pivot_inputs.contains(&(column.as_ref() as *const _)) => {
+    let input_columns = walk_in_scope(expression, false).filter_map(|node| match node {
+        Expression::Column(column)
+            if !pivot_inputs.contains(&(column.as_ref() as *const _))
+                && !order_nodes.contains(&(column.as_ref() as *const _)) =>
+        {
             Some((column.as_ref(), OutputNameResolution::InputOnly))
         }
         _ => None,
     });
     let order_columns = order_by
-        .as_ref()
         .into_iter()
         .flat_map(|order| order_by_validation_columns(order, dialect));
     // A lateral relation's arguments see preceding sources, never its own
     // generated columns or following relations. Ordinary projections see all.
     let mut lateral_inputs = HashMap::new();
     let mut preceding = HashSet::new();
-    if let Expression::Select(selected) = &expression {
+    if let Expression::Select(selected) = expression {
         for relation in selected
             .from
             .iter()
