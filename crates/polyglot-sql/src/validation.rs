@@ -4714,10 +4714,35 @@ pub fn validate_parsed_with_schema(
                 }
             }
         }
-        crate::binding::bind_dml_pseudoreferences(&mut statement);
-        let statement = bind_validation_lambdas(statement, dialect);
-        let mut bindings = ProjectionAliasBindings::new();
+        // One traversal of a fused query collects its statement-level
+        // semantic findings, SELECT count, projection stars, and lambdas.
+        // Lambda binding does not change query outputs or SELECTs.
+        let mut statement_semantics = None;
         let mut projection_star = None;
+        let mut has_lambda = true;
+        if fused_semantics {
+            let mut errors = Vec::new();
+            let mut selects = 0;
+            let mut star = false;
+            let mut lambda = false;
+            for node in statement.dfs() {
+                lambda = lambda || matches!(node, Expression::Lambda(_));
+                if semantics::check_set_operation_order(node, dialect, &mut errors) {
+                    selects += 1;
+                    star = star
+                        || matches!(node, Expression::Select(select) if select_projects_star(select));
+                }
+            }
+            statement_semantics = Some((errors, selects));
+            projection_star = Some(star);
+            has_lambda = lambda;
+        }
+        crate::binding::bind_dml_pseudoreferences(&mut statement);
+        if has_lambda {
+            statement = bind_validation_lambdas(statement, dialect);
+        }
+        let statement = statement;
+        let mut bindings = ProjectionAliasBindings::new();
         let mut scope_semantics = fused_semantics.then(|| SemanticScopeChecks {
             schema,
             mapping: &resolver_schema,
@@ -4737,18 +4762,8 @@ pub fn validate_parsed_with_schema(
             &mut bindings,
             scope_semantics.as_mut(),
         );
-        if let Some(checks) = scope_semantics {
-            let mut errors = Vec::new();
-            let mut selects = 0;
-            let mut star = false;
-            for node in statement.dfs() {
-                if semantics::check_set_operation_order(node, dialect, &mut errors) {
-                    selects += 1;
-                    star = star
-                        || matches!(node, Expression::Select(select) if select_projects_star(select));
-                }
-            }
-            projection_star = Some(star);
+        if let (Some(checks), Some((mut errors, selects))) = (scope_semantics, statement_semantics)
+        {
             if selects == checks.selects {
                 errors.extend(checks.errors);
             } else {
