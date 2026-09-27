@@ -850,6 +850,8 @@ struct NullabilityContext<'a> {
     scopes: Vec<NullabilityScope<'a>>,
     scope_ids: HashMap<*const Scope, usize>,
     outputs: RefCell<HashMap<(usize, usize), ProjectionNullability>>,
+    /// Derived-table scope per (frame, source name); matching compares whole queries.
+    derived_scopes: RefCell<HashMap<(*const Scope, String), Option<usize>>>,
     resolving: RefCell<HashSet<(usize, usize)>>,
     uncertain_columns: &'a HashMap<(usize, usize), ReferenceConfidence>,
 }
@@ -888,6 +890,7 @@ impl<'a> NullabilityContext<'a> {
             empty_schema: MappingSchema::with_dialect(dialect),
             dialect,
             scopes: Vec::new(),
+            derived_scopes: RefCell::new(HashMap::new()),
             scope_ids: HashMap::new(),
             outputs: RefCell::new(HashMap::new()),
             resolving: RefCell::new(HashSet::new()),
@@ -2807,10 +2810,16 @@ impl NullabilityContext<'_> {
             }
         }
         if source.kind == SourceKind::DerivedTable && source.is_scope {
-            return frame.derived.iter().copied().find(|id| {
+            let key = (frame.scope as *const Scope, name.to_owned());
+            if let Some(found) = self.derived_scopes.borrow().get(&key) {
+                return *found;
+            }
+            let found = frame.derived.iter().copied().find(|id| {
                 crate::scope::scope_query(&self.scopes[*id].scope.expression)
                     == crate::scope::scope_query(&source.expression)
             });
+            self.derived_scopes.borrow_mut().insert(key, found);
+            return found;
         }
         None
     }

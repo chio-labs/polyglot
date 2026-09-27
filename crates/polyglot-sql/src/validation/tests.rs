@@ -1203,6 +1203,71 @@ fn star_sourced_types_are_checked_without_set_operations() {
     );
 }
 
+#[test]
+fn semantic_checks_resolve_sibling_ctes_in_cte_bodies() {
+    // The physical `a` shows that the CTE, not the same-named table, is bound.
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({"tables":[
+        {"name":"orders","columns":[{"name":"id","type":"INTEGER"},{"name":"amount","type":"INTEGER"}]},
+        {"name":"a","columns":[{"name":"x","type":"INTEGER"}]}
+    ]}))
+    .unwrap();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    let invalid = validate_with_schema(
+        "WITH a AS (SELECT id, amount FROM orders), b AS (SELECT * EXCLUDE (missing) FROM a) SELECT * FROM b",
+        DialectType::DuckDB,
+        &schema,
+        &options,
+    );
+    assert!(
+        invalid
+            .errors
+            .iter()
+            .any(|error| error.code == "E201" && error.message.contains("'missing'")),
+        "{:?}",
+        invalid.errors
+    );
+    let valid = validate_with_schema(
+        "WITH a AS (SELECT id, amount FROM orders), b AS (SELECT * EXCLUDE (id) FROM a) SELECT * FROM b",
+        DialectType::DuckDB,
+        &schema,
+        &options,
+    );
+    assert!(valid.valid, "{:?}", valid.errors);
+}
+
+#[test]
+fn semantic_checks_cover_every_select_once() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        semantic: true,
+        ..Default::default()
+    };
+    // Nested aggregates in a CTE, a derived table, a scalar subquery and a
+    // set-operation branch are each reported exactly once.
+    let result = validate_with_schema(
+        "WITH q AS (SELECT SUM(SUM(i)) AS t FROM orders) \
+         SELECT (SELECT SUM(SUM(i)) FROM orders) FROM (SELECT SUM(SUM(i)) AS t FROM orders) AS d \
+         UNION ALL SELECT SUM(SUM(i)) FROM orders",
+        DialectType::DuckDB,
+        &schema,
+        &options,
+    );
+    assert_eq!(
+        result
+            .errors
+            .iter()
+            .filter(|error| error.code == "E231")
+            .count(),
+        4,
+        "{:?}",
+        result.errors
+    );
+}
+
 fn semantic_type_schema() -> ValidationSchema {
     serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[
         {"name":"i","type":"INTEGER"}, {"name":"s","type":"VARCHAR"},

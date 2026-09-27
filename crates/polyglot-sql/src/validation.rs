@@ -3596,6 +3596,15 @@ struct ReferenceValidationOptions {
     check_types: bool,
 }
 
+/// Per-SELECT semantic checks run on the reference-validation scope tree, so a
+/// query's scopes are built once. `selects` counts the SELECT scopes visited.
+struct SemanticScopeChecks<'a> {
+    schema: &'a ValidationSchema,
+    mapping: &'a MappingSchema,
+    errors: Vec<ValidationError>,
+    selects: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputNameResolution {
     InputOnly,
@@ -3749,12 +3758,50 @@ fn validate_scope_columns(
             }
         }
     }
-    let mut normalized = select.clone();
-    let mut normalizer = Resolver::new(&visible, resolver_schema, true);
-    let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+    // Only a qualifier that names no visible source can be a struct access.
+    // Without one, normalization is the identity and the scope's own SELECT is
+    // read in place.
+    let normalized = walk_in_scope(&scope.expression, false)
+        .any(|node| {
+            matches!(node, Expression::Column(column) if column.table.as_ref().is_some_and(|root| {
+                !visible
+                    .sources
+                    .keys()
+                    .any(|source| source.eq_ignore_ascii_case(&root.name))
+            }))
+        })
+        .then(|| {
+            let mut normalized = select.clone();
+            let mut normalizer = Resolver::new(&visible, resolver_schema, true);
+            let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+            // Separate query-level ordering from the ordinary scope walk. This
+            // avoids accidentally exempting a same-named reference in another
+            // clause, window, or nested query, and leaves the caller's AST untouched.
+            let order_by = normalized.order_by.take();
+            (Expression::Select(normalized), order_by)
+        });
+    let (expression, order_by, order_nodes) = match &normalized {
+        Some((expression, order_by)) => (expression, order_by.as_ref(), HashSet::new()),
+        None => {
+            let order_by = select.order_by.as_ref();
+            let nodes: HashSet<*const Column> = order_by
+                .into_iter()
+                .flat_map(|order| &order.expressions)
+                .flat_map(|ordered| walk_in_scope(&ordered.this, false))
+                .filter_map(|node| match node {
+                    Expression::Column(column) => Some(column.as_ref() as *const Column),
+                    _ => None,
+                })
+                .collect();
+            (&scope.expression, order_by, nodes)
+        }
+    };
+    let Expression::Select(normalized_select) = expression else {
+        unreachable!("validated scope SELECT")
+    };
     let strategy = get_normalization_strategy(Some(dialect));
     let mut output_names = HashMap::<String, usize>::new();
-    for projection in &normalized.expressions {
+    for projection in &normalized_select.expressions {
         let identifier = match projection {
             // Until wildcards are expanded, output-name uniqueness is not
             // known. Preserve source validation instead of letting an explicit
@@ -3774,11 +3821,6 @@ fn validate_scope_columns(
         let name = normalize_identifier(identifier.clone(), strategy).name;
         *output_names.entry(name).or_default() += 1;
     }
-    // Separate query-level ordering from the ordinary scope walk. This avoids
-    // accidentally exempting a same-named reference in another clause, window,
-    // or nested query, and leaves the caller's AST untouched.
-    let order_by = normalized.order_by.take();
-    let expression = Expression::Select(normalized);
     let sources_by_scope: Vec<_> = std::iter::once(scope)
         .chain(ancestors.iter().copied())
         .map(|scope| {
@@ -3834,7 +3876,7 @@ fn validate_scope_columns(
     // indexed above. Do not falsely bind them against generated pivot columns.
     // Nested input queries still receive their own lexical validation pass.
     let mut pivot_inputs = HashSet::new();
-    for node in walk_in_scope(&expression, false) {
+    for node in walk_in_scope(expression, false) {
         if let Expression::Unpivot(unpivot) = node {
             let resolver = Resolver::new(scope, resolver_schema, true);
             let columns = resolver.get_source_output_columns(&unpivot.this);
@@ -3887,21 +3929,23 @@ fn validate_scope_columns(
             }
         }
     }
-    let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
-        Expression::Column(column) if !pivot_inputs.contains(&(column.as_ref() as *const _)) => {
+    let input_columns = walk_in_scope(expression, false).filter_map(|node| match node {
+        Expression::Column(column)
+            if !pivot_inputs.contains(&(column.as_ref() as *const _))
+                && !order_nodes.contains(&(column.as_ref() as *const _)) =>
+        {
             Some((column.as_ref(), OutputNameResolution::InputOnly))
         }
         _ => None,
     });
     let order_columns = order_by
-        .as_ref()
         .into_iter()
         .flat_map(|order| order_by_validation_columns(order, dialect));
     // A lateral relation's arguments see preceding sources, never its own
     // generated columns or following relations. Ordinary projections see all.
     let mut lateral_inputs = HashMap::new();
     let mut preceding = HashSet::new();
-    if let Expression::Select(selected) = &expression {
+    if let Expression::Select(selected) = expression {
         for relation in selected
             .from
             .iter()
@@ -4091,29 +4135,91 @@ fn validate_scope_columns(
     errors
 }
 
+/// A scope tree node under reference validation. An owned tree is consumed:
+/// each query moves into its selected view instead of being copied.
+enum ValidationScope<'a> {
+    Shared(&'a crate::scope::Scope),
+    Owned(&'a mut crate::scope::Scope),
+}
+
+impl ValidationScope<'_> {
+    fn get(&self) -> &crate::scope::Scope {
+        match self {
+            Self::Shared(scope) => scope,
+            Self::Owned(scope) => scope,
+        }
+    }
+
+    fn selected(&mut self) -> (crate::scope::Scope, Option<crate::expressions::With>) {
+        match self {
+            Self::Shared(scope) => (selected_validation_scope(scope), None),
+            Self::Owned(scope) => crate::scope::take_selected_reference_scope(scope),
+        }
+    }
+
+    /// Correlated children (subqueries and UDTFs), or otherwise CTE, derived
+    /// table, and set-operation children.
+    fn children(&mut self, correlated: bool) -> Vec<ValidationScope<'_>> {
+        match self {
+            Self::Shared(scope) => {
+                let children: Vec<_> = if correlated {
+                    scope
+                        .subquery_scopes
+                        .iter()
+                        .chain(&scope.udtf_scopes)
+                        .collect()
+                } else {
+                    scope
+                        .cte_scopes
+                        .iter()
+                        .chain(&scope.derived_table_scopes)
+                        .chain(&scope.union_scopes)
+                        .collect()
+                };
+                children.into_iter().map(ValidationScope::Shared).collect()
+            }
+            Self::Owned(scope) => {
+                let children: Vec<_> = if correlated {
+                    scope
+                        .subquery_scopes
+                        .iter_mut()
+                        .chain(scope.udtf_scopes.iter_mut())
+                        .collect()
+                } else {
+                    scope
+                        .cte_scopes
+                        .iter_mut()
+                        .chain(scope.derived_table_scopes.iter_mut())
+                        .chain(scope.union_scopes.iter_mut())
+                        .collect()
+                };
+                children.into_iter().map(ValidationScope::Owned).collect()
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_scope_tree(
-    scope: &crate::scope::Scope,
+    mut scope: ValidationScope<'_>,
     ancestors: &[&crate::scope::Scope],
     schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
     errors: &mut Vec<ValidationError>,
     bindings: &mut ProjectionAliasBindings,
+    mut semantics: Option<&mut SemanticScopeChecks<'_>>,
 ) {
+    let tree = scope.get();
     if matches!(
-        scope_query(&scope.expression),
+        scope_query(&tree.expression),
         Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-    ) && scope.subquery_scopes.is_empty()
-        && scope.udtf_scopes.is_empty()
-        && !walk_in_scope(scope_query(&scope.expression), false)
+    ) && tree.subquery_scopes.is_empty()
+        && tree.udtf_scopes.is_empty()
+        && !walk_in_scope(scope_query(&tree.expression), false)
             .any(|node| matches!(node, Expression::Table(_)))
     {
-        for child in scope
-            .cte_scopes
-            .iter()
-            .chain(&scope.derived_table_scopes)
-            .chain(&scope.union_scopes)
-        {
+        for child in scope.children(false) {
             validate_scope_tree(
                 child,
                 ancestors,
@@ -4122,22 +4228,40 @@ fn validate_scope_tree(
                 options,
                 errors,
                 bindings,
+                semantics.as_deref_mut(),
             );
         }
         return;
     }
-    let mut selected = selected_validation_scope(scope);
+    let (mut selected, taken_with) = scope.selected();
+    if let Some(checks) = semantics.as_deref_mut() {
+        let with = taken_with
+            .as_ref()
+            .or_else(|| match scope_query(&scope.get().expression) {
+                Expression::Select(select) => select.with.as_ref(),
+                _ => None,
+            });
+        let node = &selected.expression;
+        if let Expression::Select(select) = node {
+            checks.selects += 1;
+            semantics::check_select_semantics(
+                node,
+                select,
+                with,
+                &selected,
+                options.dialect,
+                Some(checks.schema),
+                checks.mapping,
+                &mut checks.errors,
+            );
+        }
+    }
     // Bind children before consumers, but retain the existing parent-first
     // diagnostic order. Only physical sources are inherited, never output aliases.
     let mut child_errors = Vec::new();
     // CTEs and ordinary derived tables cannot see their containing SELECT's
     // sources, but may retain ancestors of an enclosing correlated subquery.
-    for child in scope
-        .cte_scopes
-        .iter()
-        .chain(&scope.derived_table_scopes)
-        .chain(&scope.union_scopes)
-    {
+    for child in scope.children(false) {
         validate_scope_tree(
             child,
             ancestors,
@@ -4146,18 +4270,19 @@ fn validate_scope_tree(
             options,
             &mut child_errors,
             bindings,
+            semantics.as_deref_mut(),
         );
     }
     let outer: Vec<_> = std::iter::once(&selected)
         .chain(ancestors.iter().copied())
         .collect();
-    for child in scope.subquery_scopes.iter().chain(&scope.udtf_scopes) {
+    for child in scope.children(true) {
         // A LATERAL subquery inherits only preceding relations. Pass that
         // lexical environment into the entire child tree, so nested correlated
         // queries share the restriction while their own FROM sources stay local.
         let mut lateral_outer = None;
-        if child.scope_type == crate::scope::ScopeType::Udtf {
-            if let Expression::Select(select) = scope_query(&scope.expression) {
+        if child.get().scope_type == crate::scope::ScopeType::Udtf {
+            if let Expression::Select(select) = &selected.expression {
                 let mut preceding = HashSet::new();
                 for relation in select
                     .from
@@ -4165,7 +4290,7 @@ fn validate_scope_tree(
                     .flat_map(|from| &from.expressions)
                     .chain(select.joins.iter().map(|join| &join.this))
                 {
-                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.expression)
+                    if matches!(relation, Expression::Subquery(query) if query.lateral && query.this == child.get().expression)
                     {
                         let mut visible = selected.clone();
                         visible.sources.retain(|name, _| preceding.contains(name));
@@ -4215,6 +4340,7 @@ fn validate_scope_tree(
             options,
             &mut child_errors,
             bindings,
+            semantics.as_deref_mut(),
         );
     }
     bind_scope_projection_aliases(
@@ -4274,6 +4400,7 @@ fn validate_statement_with_schema(
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
     bindings: &mut ProjectionAliasBindings,
+    mut semantics: Option<&mut SemanticScopeChecks<'_>>,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     // Visit each query tree once, including queries embedded in DML/DDL.
@@ -4281,15 +4408,16 @@ fn validate_statement_with_schema(
     while let Some(expression) = pending.pop() {
         if let Some(select) = crate::binding::dml_scope(expression) {
             let query = Expression::Select(Box::new(select));
-            let scope = build_scope(&query);
+            let mut scope = build_scope(&query);
             validate_scope_tree(
-                &scope,
+                ValidationScope::Owned(&mut scope),
                 &[],
                 schema_map,
                 resolver_schema,
                 options,
                 &mut errors,
                 bindings,
+                None,
             );
             let target_columns = match expression {
                 Expression::Insert(insert) => {
@@ -4345,15 +4473,16 @@ fn validate_statement_with_schema(
                     // ordinary source validation.
                     let mut source = query.clone();
                     attach_query_with_clause(&mut source, insert.with.as_ref());
-                    let scope = build_scope(&source);
+                    let mut scope = build_scope(&source);
                     validate_scope_tree(
-                        &scope,
+                        ValidationScope::Owned(&mut scope),
                         &[],
                         schema_map,
                         resolver_schema,
                         options,
                         &mut errors,
                         bindings,
+                        None,
                     );
                 }
             }
@@ -4429,15 +4558,18 @@ fn validate_statement_with_schema(
                 | Expression::Intersect(_)
                 | Expression::Except(_)
         ) {
-            let scope = build_scope(expression);
+            let mut scope = build_scope(expression);
             validate_scope_tree(
-                &scope,
+                ValidationScope::Owned(&mut scope),
                 &[],
                 schema_map,
                 resolver_schema,
                 options,
                 &mut errors,
                 bindings,
+                semantics
+                    .as_deref_mut()
+                    .filter(|_| std::ptr::eq(expression, stmt)),
             );
         } else {
             // DDL may declare a new table; only its query inputs are references.
@@ -4539,8 +4671,22 @@ pub fn validate_parsed_with_schema(
     }
 
     for mut statement in statements {
+        // A query's per-SELECT semantic checks reuse the reference scope tree.
+        // Other statements, such as DML with synthetic scopes, keep the
+        // standalone traversal.
+        let fused_semantics = options.semantic
+            && matches!(
+                statement,
+                Expression::Select(_)
+                    | Expression::Union(_)
+                    | Expression::Intersect(_)
+                    | Expression::Except(_)
+            );
+        let mut semantic_errors = Vec::new();
         if options.semantic {
-            all_errors.extend(check_semantics(&statement, dialect, Some(schema)));
+            if !fused_semantics {
+                semantic_errors = check_semantics(&statement, dialect, Some(schema));
+            }
             if !options.check_types {
                 for node in statement.dfs() {
                     if let Expression::Function(function) = node {
@@ -4554,24 +4700,56 @@ pub fn validate_parsed_with_schema(
                                 function.args.len(),
                                 dialect,
                                 strict,
-                                &mut all_errors,
+                                &mut semantic_errors,
                             );
                             check_function_catalog(
                                 function,
                                 dialect,
                                 effective_function_catalog,
                                 strict,
-                                &mut all_errors,
+                                &mut semantic_errors,
                             );
                         }
                     }
                 }
             }
         }
+        // One traversal of a fused query collects its statement-level
+        // semantic findings, SELECT count, projection stars, and lambdas.
+        // Lambda binding does not change query outputs or SELECTs.
+        let mut statement_semantics = None;
+        let mut projection_star = None;
+        let mut has_lambda = true;
+        if fused_semantics {
+            let mut errors = Vec::new();
+            let mut selects = 0;
+            let mut star = false;
+            let mut lambda = false;
+            for node in statement.dfs() {
+                lambda = lambda || matches!(node, Expression::Lambda(_));
+                if semantics::check_set_operation_order(node, dialect, &mut errors) {
+                    selects += 1;
+                    star = star
+                        || matches!(node, Expression::Select(select) if select_projects_star(select));
+                }
+            }
+            statement_semantics = Some((errors, selects));
+            projection_star = Some(star);
+            has_lambda = lambda;
+        }
         crate::binding::bind_dml_pseudoreferences(&mut statement);
-        let statement = bind_validation_lambdas(statement, dialect);
+        if has_lambda {
+            statement = bind_validation_lambdas(statement, dialect);
+        }
+        let statement = statement;
         let mut bindings = ProjectionAliasBindings::new();
-        all_errors.extend(validate_statement_with_schema(
+        let mut scope_semantics = fused_semantics.then(|| SemanticScopeChecks {
+            schema,
+            mapping: &resolver_schema,
+            errors: Vec::new(),
+            selects: 0,
+        });
+        let reference_errors = validate_statement_with_schema(
             &statement,
             &schema_map,
             &resolver_schema,
@@ -4582,7 +4760,26 @@ pub fn validate_parsed_with_schema(
                 check_types: options.check_types,
             },
             &mut bindings,
-        ));
+            scope_semantics.as_mut(),
+        );
+        if let (Some(checks), Some((mut errors, selects))) = (scope_semantics, statement_semantics)
+        {
+            if selects == checks.selects {
+                errors.extend(checks.errors);
+            } else {
+                // A SELECT outside the scope tree must still be checked.
+                errors = semantics::check_bound_semantics(
+                    &statement,
+                    dialect,
+                    Some(schema),
+                    &resolver_schema,
+                );
+            }
+            errors.append(&mut semantic_errors);
+            semantic_errors = errors;
+        }
+        all_errors.extend(semantic_errors);
+        all_errors.extend(reference_errors);
         let mut statement = apply_projection_alias_bindings(statement, &bindings);
         if options.check_types {
             // Give the type checker star-sourced column types for every query.
@@ -4590,7 +4787,7 @@ pub fn validate_parsed_with_schema(
             // qualification is only needed for unresolved stars that another scope
             // consumes, such as a star over a derived table inside a subquery.
             // Open/partial schemas remain conservative.
-            if has_projection_star(&statement, false) {
+            if projection_star.unwrap_or_else(|| has_projection_star(&statement, false)) {
                 crate::lineage::expand_cte_stars(
                     &mut statement,
                     Some(&resolver_schema as &dyn crate::schema::Schema),
@@ -4645,19 +4842,23 @@ fn has_projection_star(statement: &Expression, consumed_only: bool) -> bool {
     statement.dfs().any(|node| {
         matches!(node, Expression::Select(select)
             if root != Some(select.as_ref() as *const crate::expressions::Select)
-                && select.expressions.iter().any(|projection| {
-            let mut projection = projection;
-            loop {
-                match projection {
-                    Expression::Alias(alias) => projection = &alias.this,
-                    Expression::Annotated(annotated) => projection = &annotated.this,
-                    Expression::Paren(paren) => projection = &paren.this,
-                    _ => break,
-                }
+                && select_projects_star(select))
+    })
+}
+
+fn select_projects_star(select: &crate::expressions::Select) -> bool {
+    select.expressions.iter().any(|projection| {
+        let mut projection = projection;
+        loop {
+            match projection {
+                Expression::Alias(alias) => projection = &alias.this,
+                Expression::Annotated(annotated) => projection = &annotated.this,
+                Expression::Paren(paren) => projection = &paren.this,
+                _ => break,
             }
-            matches!(projection, Expression::Star(_))
-                || matches!(projection, Expression::Column(column) if column.name.name == "*")
-        }))
+        }
+        matches!(projection, Expression::Star(_))
+            || matches!(projection, Expression::Column(column) if column.name.name == "*")
     })
 }
 
@@ -4679,7 +4880,7 @@ pub(crate) fn validate_project_query_scope(
     }
     let mut bindings = ProjectionAliasBindings::new();
     validate_scope_tree(
-        scope,
+        ValidationScope::Shared(scope),
         &[],
         &schema_map,
         &resolver_schema,
@@ -4691,6 +4892,7 @@ pub(crate) fn validate_project_query_scope(
         },
         &mut errors,
         &mut bindings,
+        None,
     );
     if options.check_references {
         let statement = apply_projection_alias_bindings(scope.expression.clone(), &bindings);

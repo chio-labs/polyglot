@@ -1048,6 +1048,9 @@ struct LineageScopeContext<'a> {
     scopes: Vec<IndexedScope<'a>>,
     scope_ids: HashMap<*const Scope, ScopeId>,
     resolved_states: RefCell<HashSet<LineageResolutionState>>,
+    /// Child-scope lookups by source name; each lookup is a pure function of the
+    /// immutable scope tree, and derived-table matching compares whole queries.
+    child_scopes: RefCell<HashMap<(ScopeId, String), Option<ScopeId>>>,
     /// Usage analysis must not claim undeclared qualifiers as physical tables.
     conservative: bool,
 }
@@ -1228,6 +1231,7 @@ impl<'a> LineageScopeContext<'a> {
             scopes: Vec::new(),
             scope_ids: HashMap::new(),
             resolved_states: RefCell::new(HashSet::new()),
+            child_scopes: RefCell::new(HashMap::new()),
             conservative: false,
             schema: None,
         };
@@ -3541,6 +3545,20 @@ fn trim_source(select_expr: &Expression, target_expr: &Expression) -> Expression
 
 /// Find the child scope (CTE or derived table) for a given source name.
 fn find_child_scope(
+    context: &LineageScopeContext,
+    scope_id: ScopeId,
+    source_name: &str,
+) -> Option<ScopeId> {
+    let key = (scope_id, source_name.to_owned());
+    if let Some(found) = context.child_scopes.borrow().get(&key) {
+        return *found;
+    }
+    let found = find_child_scope_uncached(context, scope_id, source_name);
+    context.child_scopes.borrow_mut().insert(key, found);
+    found
+}
+
+fn find_child_scope_uncached(
     context: &LineageScopeContext,
     scope_id: ScopeId,
     source_name: &str,
