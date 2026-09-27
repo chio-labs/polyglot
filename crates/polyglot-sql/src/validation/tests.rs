@@ -1125,6 +1125,46 @@ fn review_builtin_and_unknown_cast_targets_do_not_error() {
     }
 }
 
+#[test]
+fn star_sourced_types_are_checked_without_set_operations() {
+    let options = SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        ..Default::default()
+    };
+    for sql in [
+        "WITH a AS (SELECT * FROM orders) SELECT 1 FROM a JOIN orders AS o ON a.s = o.i",
+        "WITH a AS (SELECT * FROM orders), b AS (SELECT * FROM a) SELECT i FROM b WHERE s = i",
+        "SELECT 1 FROM (SELECT * FROM orders) AS a JOIN orders AS o ON a.s = o.i",
+    ] {
+        let result = validate_with_schema(
+            sql,
+            DialectType::Snowflake,
+            &semantic_type_schema(),
+            &options,
+        );
+        assert!(
+            result.errors.iter().any(|e| e.code == "W210"),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+    let result = validate_with_schema(
+        "WITH a AS (SELECT * FROM orders) SELECT 1 FROM a JOIN orders AS o ON a.i = o.i",
+        DialectType::Snowflake,
+        &semantic_type_schema(),
+        &options,
+    );
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.code.get(1..).is_some_and(|n| n.starts_with("21"))),
+        "{:?}",
+        result.errors
+    );
+}
+
 fn semantic_type_schema() -> ValidationSchema {
     serde_json::from_value(serde_json::json!({"tables":[{"name":"orders","columns":[
         {"name":"i","type":"INTEGER"}, {"name":"s","type":"VARCHAR"},
