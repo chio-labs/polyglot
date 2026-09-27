@@ -3759,8 +3759,18 @@ fn validate_scope_columns(
         }
     }
     let mut normalized = select.clone();
-    let mut normalizer = Resolver::new(&visible, resolver_schema, true);
-    let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+    // Only a qualifier that names no visible source can be a struct access.
+    if walk_in_scope(&scope.expression, false).any(|node| {
+        matches!(node, Expression::Column(column) if column.table.as_ref().is_some_and(|root| {
+            !visible
+                .sources
+                .keys()
+                .any(|source| source.eq_ignore_ascii_case(&root.name))
+        }))
+    }) {
+        let mut normalizer = Resolver::new(&visible, resolver_schema, true);
+        let _ = normalize_dotted_columns_in_scope(&mut normalized, &visible, &mut normalizer);
+    }
     let strategy = get_normalization_strategy(Some(dialect));
     let mut output_names = HashMap::<String, usize>::new();
     for projection in &normalized.expressions {
