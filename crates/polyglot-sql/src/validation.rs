@@ -4629,6 +4629,7 @@ pub fn validate_parsed_with_schema(
         crate::binding::bind_dml_pseudoreferences(&mut statement);
         let statement = bind_validation_lambdas(statement, dialect);
         let mut bindings = ProjectionAliasBindings::new();
+        let mut projection_star = None;
         let mut scope_semantics = fused_semantics.then(|| SemanticScopeChecks {
             schema,
             mapping: &resolver_schema,
@@ -4651,13 +4652,15 @@ pub fn validate_parsed_with_schema(
         if let Some(checks) = scope_semantics {
             let mut errors = Vec::new();
             let mut selects = 0;
+            let mut star = false;
             for node in statement.dfs() {
-                selects += usize::from(semantics::check_set_operation_order(
-                    node,
-                    dialect,
-                    &mut errors,
-                ));
+                if semantics::check_set_operation_order(node, dialect, &mut errors) {
+                    selects += 1;
+                    star = star
+                        || matches!(node, Expression::Select(select) if select_projects_star(select));
+                }
             }
+            projection_star = Some(star);
             if selects == checks.selects {
                 errors.extend(checks.errors);
             } else {
@@ -4681,7 +4684,7 @@ pub fn validate_parsed_with_schema(
             // qualification is only needed for unresolved stars that another scope
             // consumes, such as a star over a derived table inside a subquery.
             // Open/partial schemas remain conservative.
-            if has_projection_star(&statement, false) {
+            if projection_star.unwrap_or_else(|| has_projection_star(&statement, false)) {
                 crate::lineage::expand_cte_stars(
                     &mut statement,
                     Some(&resolver_schema as &dyn crate::schema::Schema),
@@ -4736,19 +4739,23 @@ fn has_projection_star(statement: &Expression, consumed_only: bool) -> bool {
     statement.dfs().any(|node| {
         matches!(node, Expression::Select(select)
             if root != Some(select.as_ref() as *const crate::expressions::Select)
-                && select.expressions.iter().any(|projection| {
-            let mut projection = projection;
-            loop {
-                match projection {
-                    Expression::Alias(alias) => projection = &alias.this,
-                    Expression::Annotated(annotated) => projection = &annotated.this,
-                    Expression::Paren(paren) => projection = &paren.this,
-                    _ => break,
-                }
+                && select_projects_star(select))
+    })
+}
+
+fn select_projects_star(select: &crate::expressions::Select) -> bool {
+    select.expressions.iter().any(|projection| {
+        let mut projection = projection;
+        loop {
+            match projection {
+                Expression::Alias(alias) => projection = &alias.this,
+                Expression::Annotated(annotated) => projection = &annotated.this,
+                Expression::Paren(paren) => projection = &paren.this,
+                _ => break,
             }
-            matches!(projection, Expression::Star(_))
-                || matches!(projection, Expression::Column(column) if column.name.name == "*")
-        }))
+        }
+        matches!(projection, Expression::Star(_))
+            || matches!(projection, Expression::Column(column) if column.name.name == "*")
     })
 }
 
