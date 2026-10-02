@@ -858,6 +858,11 @@ struct NullabilityContext<'a> {
 
 struct NullabilityScope<'a> {
     scope: &'a Scope,
+    /// The scope's complete expression; set-operation branches borrow it from their
+    /// parent because nested branch scopes store a shallow copy.
+    expression: &'a Expression,
+    /// `expression` with query containers unwrapped.
+    query: &'a Expression,
     selected: Scope,
     bindings: HashMap<String, &'a Expression>,
     ctes: HashMap<String, usize>,
@@ -896,8 +901,21 @@ impl<'a> NullabilityContext<'a> {
             resolving: RefCell::new(HashSet::new()),
             uncertain_columns,
         };
-        context.index_scope(scope, HashMap::new(), None, selected_scopes.as_mut());
+        context.index_scope(
+            scope,
+            &scope.expression,
+            HashMap::new(),
+            None,
+            selected_scopes.as_mut(),
+        );
         context
+    }
+
+    /// The complete expression of an indexed scope, for rooting scoped lineage.
+    fn scope_expression(&self, scope: &'a Scope) -> &'a Expression {
+        self.scope_ids
+            .get(&(scope as *const Scope))
+            .map_or(&scope.expression, |id| self.scopes[*id].expression)
     }
 
     fn selected_scope(&self, scope: &Scope) -> Option<&Scope> {
@@ -911,6 +929,7 @@ impl<'a> NullabilityContext<'a> {
     fn index_scope(
         &mut self,
         scope: &'a Scope,
+        expression: &'a Expression,
         mut ctes: HashMap<String, usize>,
         recursive_name: Option<&Identifier>,
         mut selected_scopes: Option<&mut HashMap<*const Scope, Scope>>,
@@ -923,7 +942,7 @@ impl<'a> NullabilityContext<'a> {
                 id,
             );
         }
-        let query = crate::scope::scope_query(&scope.expression);
+        let query = crate::scope::scope_query(expression);
         let bindings: HashMap<_, _> = if let Expression::Select(select) = query {
             select
                 .from
@@ -943,6 +962,8 @@ impl<'a> NullabilityContext<'a> {
             .unwrap_or_else(|| crate::scope::selected_reference_scope(scope));
         self.scopes.push(NullabilityScope {
             scope,
+            expression,
+            query,
             selected,
             bindings,
             ctes: HashMap::new(),
@@ -950,13 +971,13 @@ impl<'a> NullabilityContext<'a> {
             branches: Vec::new(),
             nullable_sources: nullable_source_names(query, self.dialect),
         });
-        let recursive = with_clause(crate::scope::scope_query(&scope.expression))
-            .is_some_and(|with| with.recursive);
+        let recursive = with_clause(query).is_some_and(|with| with.recursive);
         for child in &scope.cte_scopes {
             if let Expression::Cte(cte) = &child.expression {
                 let name = &cte.alias;
                 let child_id = self.index_scope(
                     child,
+                    &child.expression,
                     ctes.clone(),
                     recursive.then_some(name),
                     selected_scopes.as_deref_mut(),
@@ -969,13 +990,25 @@ impl<'a> NullabilityContext<'a> {
         }
         self.scopes[id].ctes = ctes.clone();
         for child in &scope.derived_table_scopes {
-            let child_id =
-                self.index_scope(child, ctes.clone(), None, selected_scopes.as_deref_mut());
+            let child_id = self.index_scope(
+                child,
+                &child.expression,
+                ctes.clone(),
+                None,
+                selected_scopes.as_deref_mut(),
+            );
             self.scopes[id].derived.push(child_id);
         }
-        for child in &scope.union_scopes {
-            let child_id =
-                self.index_scope(child, ctes.clone(), None, selected_scopes.as_deref_mut());
+        let branch_queries = crate::scope::set_operation_branch_queries(expression);
+        for (index, child) in scope.union_scopes.iter().enumerate() {
+            let branch_query = branch_queries.map_or(&child.expression, |queries| queries[index]);
+            let child_id = self.index_scope(
+                child,
+                branch_query,
+                ctes.clone(),
+                None,
+                selected_scopes.as_deref_mut(),
+            );
             self.scopes[id].branches.push(child_id);
         }
         id
@@ -1961,8 +1994,9 @@ fn projection_fact<'a>(
                 .as_ref()
                 .and_then(|root| root.for_scope(scope))
                 .unwrap_or_else(|| {
-                    ScopedLineage::with_schema(
+                    ScopedLineage::with_schema_for_expression(
                         scope,
+                        nullability_context.scope_expression(scope),
                         &[],
                         dialect,
                         nullability_context
@@ -2255,8 +2289,9 @@ fn cached_terminal_references_for_expression<'a>(
                             .as_ref()
                             .and_then(|root| root.for_scope(scope))
                             .unwrap_or_else(|| {
-                                ScopedLineage::with_schema(
+                                ScopedLineage::with_schema_for_expression(
                                     scope,
+                                    context.scope_expression(scope),
                                     &[],
                                     dialect,
                                     context.mapping_schema.map(|schema| schema as &dyn Schema),
@@ -2698,7 +2733,7 @@ impl NullabilityContext<'_> {
     fn output_inner(&self, scope_id: usize, ordinal: usize, depth: usize) -> ProjectionNullability {
         use ProjectionNullability::*;
         let frame = &self.scopes[scope_id];
-        let query = crate::scope::scope_query(&frame.scope.expression);
+        let query = crate::scope::scope_query(frame.query);
         if let Expression::Select(select) = query {
             return select
                 .expressions
