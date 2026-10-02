@@ -239,7 +239,14 @@ pub struct ColumnRef {
 /// Scopes can be nested (subqueries, CTEs, derived tables) and form a tree.
 #[derive(Debug, Clone)]
 pub struct Scope {
-    /// The expression at the root of this scope
+    /// The expression at the root of this scope.
+    ///
+    /// A set-operation branch that is itself an unmodified set operation (the
+    /// inner levels of `a UNION b UNION c`) stores its operator and clauses with
+    /// NULL placeholders for set-operation operands; those operands are the
+    /// expressions of its own `union_scopes`. Copying them into every level would
+    /// make long chains quadratic. Borrow a branch's complete query from its
+    /// parent's with [`set_operation_branch_queries`].
     pub expression: Expression,
 
     /// Type of this scope relative to its parent
@@ -436,7 +443,15 @@ impl Scope {
     /// This is intended for result schema style output columns (e.g. UNION
     /// outputs), unlike [`Self::columns`], which returns raw referenced columns.
     pub fn output_columns(&self) -> Vec<String> {
-        crate::ast_transforms::get_output_column_names(&self.expression)
+        // Set-operation output names come from the leftmost branch, which is the
+        // first branch scope; a nested branch stores only a shallow copy.
+        match (&self.expression, self.union_scopes.first()) {
+            (
+                Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_),
+                Some(left),
+            ) => left.output_columns(),
+            _ => crate::ast_transforms::get_output_column_names(&self.expression),
+        }
     }
 
     /// Get all source names in this scope
@@ -751,6 +766,79 @@ pub(crate) fn build_scope_with_ctes(
     root
 }
 
+/// Borrow the complete queries of a set-operation scope's two branch scopes,
+/// in `union_scopes` order, from the scope's complete query.
+pub fn set_operation_branch_queries(query: &Expression) -> Option<[&Expression; 2]> {
+    match scope_query(query) {
+        Expression::Union(operation) => Some([&operation.left, &operation.right]),
+        Expression::Intersect(operation) => Some([&operation.left, &operation.right]),
+        Expression::Except(operation) => Some([&operation.left, &operation.right]),
+        _ => None,
+    }
+}
+
+fn is_unmodified_set_operation(expression: &Expression) -> bool {
+    macro_rules! unmodified {
+        ($operation:expr) => {
+            $operation.order_by.is_none()
+                && $operation.limit.is_none()
+                && $operation.offset.is_none()
+        };
+    }
+    match expression {
+        Expression::Union(operation) => unmodified!(operation),
+        Expression::Intersect(operation) => unmodified!(operation),
+        Expression::Except(operation) => unmodified!(operation),
+        _ => false,
+    }
+}
+
+/// The expression stored on a set-operation branch scope; see [`Scope::expression`].
+fn set_operation_branch_expression(operand: &Expression) -> Expression {
+    fn operand_copy(operand: &Expression) -> Expression {
+        if matches!(
+            operand,
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+        ) {
+            Expression::Null(crate::expressions::Null)
+        } else {
+            operand.clone()
+        }
+    }
+    macro_rules! shallow {
+        ($variant:ident, $operation:expr) => {
+            Expression::$variant(Box::new(crate::expressions::$variant {
+                left: operand_copy(&$operation.left),
+                right: operand_copy(&$operation.right),
+                all: $operation.all,
+                distinct: $operation.distinct,
+                with: $operation.with.clone(),
+                order_by: $operation.order_by.clone(),
+                limit: $operation.limit.clone(),
+                offset: $operation.offset.clone(),
+                distribute_by: $operation.distribute_by.clone(),
+                sort_by: $operation.sort_by.clone(),
+                cluster_by: $operation.cluster_by.clone(),
+                by_name: $operation.by_name,
+                side: $operation.side.clone(),
+                kind: $operation.kind.clone(),
+                corresponding: $operation.corresponding,
+                strict: $operation.strict,
+                on_columns: $operation.on_columns.clone(),
+            }))
+        };
+    }
+    if !is_unmodified_set_operation(operand) {
+        return operand.clone();
+    }
+    match operand {
+        Expression::Union(operation) => shallow!(Union, operation),
+        Expression::Intersect(operation) => shallow!(Intersect, operation),
+        Expression::Except(operation) => shallow!(Except, operation),
+        _ => unreachable!("only set operations are shallow"),
+    }
+}
+
 fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
     match expression {
         Expression::Prepare(prepare) => {
@@ -787,11 +875,16 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
                 process_ctes(with, current_scope);
             }
 
-            let mut left_scope = current_scope.branch(union.left.clone(), ScopeType::SetOperation);
+            let mut left_scope = current_scope.branch(
+                set_operation_branch_expression(&union.left),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&union.left, &mut left_scope);
 
-            let mut right_scope =
-                current_scope.branch(union.right.clone(), ScopeType::SetOperation);
+            let mut right_scope = current_scope.branch(
+                set_operation_branch_expression(&union.right),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&union.right, &mut right_scope);
 
             current_scope.union_scopes.push(left_scope);
@@ -802,12 +895,16 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
                 process_ctes(with, current_scope);
             }
 
-            let mut left_scope =
-                current_scope.branch(intersect.left.clone(), ScopeType::SetOperation);
+            let mut left_scope = current_scope.branch(
+                set_operation_branch_expression(&intersect.left),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&intersect.left, &mut left_scope);
 
-            let mut right_scope =
-                current_scope.branch(intersect.right.clone(), ScopeType::SetOperation);
+            let mut right_scope = current_scope.branch(
+                set_operation_branch_expression(&intersect.right),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&intersect.right, &mut right_scope);
 
             current_scope.union_scopes.push(left_scope);
@@ -818,11 +915,16 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
                 process_ctes(with, current_scope);
             }
 
-            let mut left_scope = current_scope.branch(except.left.clone(), ScopeType::SetOperation);
+            let mut left_scope = current_scope.branch(
+                set_operation_branch_expression(&except.left),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&except.left, &mut left_scope);
 
-            let mut right_scope =
-                current_scope.branch(except.right.clone(), ScopeType::SetOperation);
+            let mut right_scope = current_scope.branch(
+                set_operation_branch_expression(&except.right),
+                ScopeType::SetOperation,
+            );
             build_scope_impl(&except.right, &mut right_scope);
 
             current_scope.union_scopes.push(left_scope);
@@ -1822,5 +1924,72 @@ mod tests {
             !scopes.is_empty(),
             "traverse_scope should return scopes for CTAS"
         );
+    }
+
+    fn set_operation_chain(branches: usize, operator: &str) -> String {
+        (0..branches)
+            .map(|i| format!("SELECT {i} AS id, 'open' AS status FROM orders"))
+            .collect::<Vec<_>>()
+            .join(&format!(" {operator} "))
+    }
+
+    fn stored_expression_nodes(scope: &Scope) -> usize {
+        scope.expression.dfs().count()
+            + scope
+                .union_scopes
+                .iter()
+                .chain(&scope.cte_scopes)
+                .chain(&scope.derived_table_scopes)
+                .chain(&scope.subquery_scopes)
+                .map(stored_expression_nodes)
+                .sum::<usize>()
+    }
+
+    fn set_operation_depth(scope: &Scope) -> usize {
+        scope
+            .union_scopes
+            .first()
+            .map_or(0, |left| 1 + set_operation_depth(left))
+    }
+
+    #[test]
+    fn long_set_operation_chain_scopes_store_linear_expression_size() {
+        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            let short = parse_and_build_scope(&set_operation_chain(100, operator));
+            let long = parse_and_build_scope(&set_operation_chain(400, operator));
+            assert_eq!(set_operation_depth(&short), 99, "{operator}");
+            assert_eq!(set_operation_depth(&long), 399, "{operator}");
+            let ratio =
+                stored_expression_nodes(&long) as f64 / stored_expression_nodes(&short) as f64;
+            assert!(
+                ratio < 4.5,
+                "{operator}: 4x branches stored {ratio:.1}x expression nodes"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_set_operation_branches_resolve_complete_queries_from_parent() {
+        let sql = "SELECT id FROM orders UNION ALL BY NAME SELECT id, status FROM returns EXCEPT SELECT id, status FROM orders INTERSECT SELECT id, status FROM returns";
+        let ast = Parser::parse_sql(sql).expect("Failed to parse SQL");
+        let root = build_scope(&ast[0]);
+
+        fn check(scope: &Scope, query: &Expression) {
+            assert_eq!(
+                scope.output_columns(),
+                crate::ast_transforms::get_output_column_names(query)
+            );
+            let Some(branches) = set_operation_branch_queries(query) else {
+                assert!(scope.union_scopes.is_empty());
+                assert_eq!(&scope.expression, query);
+                return;
+            };
+            assert_eq!(scope.union_scopes.len(), 2);
+            for (child, branch) in scope.union_scopes.iter().zip(branches) {
+                check(child, branch);
+            }
+        }
+        assert_eq!(root.expression, ast[0]);
+        check(&root, &ast[0]);
     }
 }

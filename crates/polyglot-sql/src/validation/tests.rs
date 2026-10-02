@@ -4481,3 +4481,160 @@ fn schema_validation_propagates_complexity_guard_to_both_parses() {
         assert!(invalid.errors.iter().any(|error| error.code == "E201"));
     }
 }
+
+#[test]
+fn set_operation_after_subquery_operand_checks_outer_branch_arity() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        ..Default::default()
+    };
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::Snowflake,
+        DialectType::BigQuery,
+        DialectType::TSQL,
+        DialectType::Databricks,
+    ] {
+        for sql in [
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) UNION ALL SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) EXCEPT SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) INTERSECT SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, SUM(o.i) AS total FROM orders AS o GROUP BY o.i HAVING SUM(o.i) > (SELECT MIN(p.i) FROM orders AS p) UNION ALL SELECT o.i, o.i FROM orders AS o",
+        ] {
+            let result = validate_with_schema(sql, dialect, &schema, &options);
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|error| error.message.contains("different column counts")),
+                "{dialect:?}: {sql}: {:?}",
+                result.errors
+            );
+        }
+        let mismatched = validate_with_schema(
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) UNION ALL SELECT o.i FROM orders AS o",
+            dialect,
+            &schema,
+            &options,
+        );
+        assert!(
+            mismatched
+                .errors
+                .iter()
+                .any(|error| error.message.contains("left 2, right 1")),
+            "{dialect:?}: {:?}",
+            mismatched.errors
+        );
+    }
+}
+
+fn set_operation_chain_sql(
+    branches: usize,
+    operator: &str,
+    mismatched_branch: Option<usize>,
+) -> String {
+    (0..branches)
+        .map(|i| match mismatched_branch {
+            Some(branch) if branch == i => format!("SELECT {i} AS id"),
+            _ => format!("SELECT {i} AS id, CAST({i} AS DOUBLE) AS amount, 'open' AS status"),
+        })
+        .collect::<Vec<_>>()
+        .join(&format!(" {operator} "))
+}
+
+fn set_operation_chain_options() -> SchemaValidationOptions {
+    SchemaValidationOptions {
+        semantic: true,
+        check_types: true,
+        check_references: true,
+        ..Default::default()
+    }
+}
+
+fn validated_set_operation_chain(
+    branches: usize,
+    operator: &str,
+    mismatched_branch: Option<usize>,
+    dialect: DialectType,
+) -> ValidationResult {
+    validate_with_schema(
+        &set_operation_chain_sql(branches, operator, mismatched_branch),
+        dialect,
+        &semantic_type_schema(),
+        &set_operation_chain_options(),
+    )
+}
+
+#[test]
+fn long_set_operation_chain_validation_scales_linearly() {
+    // Time validation of a parsed chain; parsing is outside this guard.
+    let fastest = |branches: usize| {
+        let sql = set_operation_chain_sql(branches, "UNION ALL", None);
+        let parsed = crate::parse_one(&sql, DialectType::DuckDB).unwrap();
+        (0..5)
+            .map(|_| {
+                let statement = parsed.clone();
+                let start = std::time::Instant::now();
+                let result = validate_parsed_with_schema(
+                    vec![statement],
+                    DialectType::DuckDB,
+                    &semantic_type_schema(),
+                    &set_operation_chain_options(),
+                );
+                let elapsed = start.elapsed();
+                assert!(result.valid, "{:?}", result.errors);
+                elapsed
+            })
+            .min()
+            .unwrap()
+    };
+    fastest(100);
+    let short = fastest(100);
+    let long = fastest(400);
+    let ratio = long.as_secs_f64() / short.as_secs_f64();
+    assert!(
+        ratio < 8.0,
+        "4x UNION ALL branches took {ratio:.1}x as long ({short:?} -> {long:?})"
+    );
+}
+
+#[test]
+fn long_set_operation_chain_mismatch_diagnostics_match_short_chain() {
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::Snowflake,
+        DialectType::BigQuery,
+        DialectType::TSQL,
+        DialectType::Databricks,
+    ] {
+        for operator in ["UNION ALL", "EXCEPT", "INTERSECT"] {
+            for (long_branch, short_branch, counts) in [
+                (0, 0, "left 1, right 3"),
+                (30, 1, "left 3, right 1"),
+                (59, 2, "left 3, right 1"),
+            ] {
+                let long = validated_set_operation_chain(60, operator, Some(long_branch), dialect);
+                let short = validated_set_operation_chain(3, operator, Some(short_branch), dialect);
+                assert_eq!(
+                    long.errors.len(),
+                    1,
+                    "{dialect:?} {operator}: {:?}",
+                    long.errors
+                );
+                assert!(
+                    long.errors[0].message.ends_with(counts),
+                    "{dialect:?} {operator}: {:?}",
+                    long.errors
+                );
+                assert_eq!(
+                    format!("{:?}", long.errors),
+                    format!("{:?}", short.errors),
+                    "{dialect:?} {operator} mismatch at branch {long_branch}"
+                );
+            }
+        }
+    }
+}

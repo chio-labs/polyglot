@@ -1036,6 +1036,9 @@ struct ScopeId(usize);
 
 struct IndexedScope<'a> {
     scope: &'a Scope,
+    /// The scope's complete query. Set-operation branches borrow it from their
+    /// parent because nested branch scopes store a shallow copy.
+    expression: &'a Expression,
     subquery_scopes: Vec<ScopeId>,
     derived_table_scopes: Vec<ScopeId>,
     cte_scopes: Vec<ScopeId>,
@@ -1105,8 +1108,20 @@ impl<'a> ScopedLineage<'a> {
         dialect: DialectType,
         schema: Option<&'a dyn Schema>,
     ) -> Self {
+        Self::with_schema_for_expression(scope, &scope.expression, inherited_ctes, dialect, schema)
+    }
+
+    /// Like [`Self::with_schema`], for a scope whose complete query is `expression`;
+    /// a nested set-operation branch scope stores only a shallow copy.
+    pub(crate) fn with_schema_for_expression(
+        scope: &'a Scope,
+        expression: &'a Expression,
+        inherited_ctes: &[&'a Scope],
+        dialect: DialectType,
+        schema: Option<&'a dyn Schema>,
+    ) -> Self {
         let visible_ctes = scope.cte_sources.clone();
-        let (mut context, root) = LineageScopeContext::from_scope(scope);
+        let (mut context, root) = LineageScopeContext::from_scope(scope, expression);
         context.schema = schema;
         context.conservative = true;
         let mut ctes = context.indexed(root).cte_scopes.clone();
@@ -1119,7 +1134,7 @@ impl<'a> ScopedLineage<'a> {
                         .iter()
                         .any(|id| context.scope(*id).expression == cte_scope.expression)
                 {
-                    ctes.push(context.insert_scope(cte_scope));
+                    ctes.push(context.insert_scope(cte_scope, &cte_scope.expression));
                 }
             }
         }
@@ -1196,7 +1211,7 @@ impl<'a> ScopedLineage<'a> {
 
     pub(crate) fn output_names(&self) -> Vec<String> {
         crate::ast_transforms::get_output_column_names_for_dialect(
-            effective_scope_expression(&self.context.scope(self.root).expression),
+            effective_scope_expression(self.context.expression(self.root)),
             self.dialect,
         )
     }
@@ -1225,7 +1240,7 @@ impl<'a> ScopedLineage<'a> {
 }
 
 impl<'a> LineageScopeContext<'a> {
-    fn from_scope(scope: &'a Scope) -> (Self, ScopeId) {
+    fn from_scope(scope: &'a Scope, expression: &'a Expression) -> (Self, ScopeId) {
         let mut context = Self {
             projection_indexes: RefCell::new(HashMap::new()),
             scopes: Vec::new(),
@@ -1235,11 +1250,11 @@ impl<'a> LineageScopeContext<'a> {
             conservative: false,
             schema: None,
         };
-        let root = context.insert_scope(scope);
+        let root = context.insert_scope(scope, expression);
         (context, root)
     }
 
-    fn insert_scope(&mut self, scope: &'a Scope) -> ScopeId {
+    fn insert_scope(&mut self, scope: &'a Scope, expression: &'a Expression) -> ScopeId {
         let scope_key = scope as *const Scope;
         if let Some(id) = self.scope_ids.get(&scope_key) {
             return *id;
@@ -1248,6 +1263,7 @@ impl<'a> LineageScopeContext<'a> {
         self.scope_ids.insert(scope_key, id);
         self.scopes.push(IndexedScope {
             scope,
+            expression,
             subquery_scopes: Vec::new(),
             derived_table_scopes: Vec::new(),
             cte_scopes: Vec::new(),
@@ -1256,26 +1272,32 @@ impl<'a> LineageScopeContext<'a> {
         let subquery_scopes = scope
             .subquery_scopes
             .iter()
-            .map(|child| self.insert_scope(child))
+            .map(|child| self.insert_scope(child, &child.expression))
             .collect();
         let derived_table_scopes = scope
             .derived_table_scopes
             .iter()
-            .map(|child| self.insert_scope(child))
+            .map(|child| self.insert_scope(child, &child.expression))
             .collect();
         let cte_scopes = scope
             .cte_scopes
             .iter()
-            .map(|child| self.insert_scope(child))
+            .map(|child| self.insert_scope(child, &child.expression))
             .collect();
+        let branch_queries = crate::scope::set_operation_branch_queries(expression);
         let union_scopes = scope
             .union_scopes
             .iter()
-            .map(|child| self.insert_scope(child))
+            .enumerate()
+            .map(|(index, child)| {
+                let query = branch_queries.map_or(&child.expression, |queries| queries[index]);
+                self.insert_scope(child, query)
+            })
             .collect();
 
         self.scopes[id.0] = IndexedScope {
             scope,
+            expression,
             subquery_scopes,
             derived_table_scopes,
             cte_scopes,
@@ -1290,6 +1312,10 @@ impl<'a> LineageScopeContext<'a> {
 
     fn scope(&self, id: ScopeId) -> &Scope {
         self.indexed(id).scope
+    }
+
+    fn expression(&self, id: ScopeId) -> &'a Expression {
+        self.indexed(id).expression
     }
 
     fn select_expression(
@@ -1399,7 +1425,7 @@ fn to_node(
     reference_node_name: &str,
     trim_selects: bool,
 ) -> Result<LineageNode> {
-    let (context, scope_id) = LineageScopeContext::from_scope(&scope);
+    let (context, scope_id) = LineageScopeContext::from_scope(&scope, &scope.expression);
     to_node_inner(
         column,
         &context,
@@ -1447,7 +1473,7 @@ fn to_node_inner(
         )));
     }
     let scope = context.scope(scope_id);
-    let scope_expr = &scope.expression;
+    let scope_expr = context.expression(scope_id);
 
     // Build combined CTE scopes: current scope's cte_scopes + ancestors
     let mut all_cte_scopes = context.indexed(scope_id).cte_scopes.clone();
@@ -4767,7 +4793,7 @@ mod tests {
             "WITH base AS (SELECT order_id FROM orders), first_pass AS (SELECT order_id FROM base UNION ALL SELECT order_id FROM base), second_pass AS (SELECT order_id FROM first_pass UNION ALL SELECT order_id FROM first_pass) SELECT order_id FROM second_pass",
         );
         let scope = build_scope(&expression);
-        let (context, _) = LineageScopeContext::from_scope(&scope);
+        let (context, _) = LineageScopeContext::from_scope(&scope, &scope.expression);
         let mut unique_scopes: HashSet<*const Scope> = HashSet::new();
         collect_unique_scope_pointers(&scope, &mut unique_scopes);
 
