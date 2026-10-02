@@ -4481,3 +4481,51 @@ fn schema_validation_propagates_complexity_guard_to_both_parses() {
         assert!(invalid.errors.iter().any(|error| error.code == "E201"));
     }
 }
+
+#[test]
+fn set_operation_after_subquery_operand_checks_outer_branch_arity() {
+    let schema = semantic_type_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        ..Default::default()
+    };
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::Snowflake,
+        DialectType::BigQuery,
+        DialectType::TSQL,
+        DialectType::Databricks,
+    ] {
+        for sql in [
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) UNION ALL SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) EXCEPT SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) INTERSECT SELECT o.i, o.s FROM orders AS o",
+            "SELECT o.i, SUM(o.i) AS total FROM orders AS o GROUP BY o.i HAVING SUM(o.i) > (SELECT MIN(p.i) FROM orders AS p) UNION ALL SELECT o.i, o.i FROM orders AS o",
+        ] {
+            let result = validate_with_schema(sql, dialect, &schema, &options);
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|error| error.message.contains("different column counts")),
+                "{dialect:?}: {sql}: {:?}",
+                result.errors
+            );
+        }
+        let mismatched = validate_with_schema(
+            "SELECT o.i, o.s FROM orders AS o WHERE o.i < (SELECT MAX(p.i) FROM orders AS p) UNION ALL SELECT o.i FROM orders AS o",
+            dialect,
+            &schema,
+            &options,
+        );
+        assert!(
+            mismatched
+                .errors
+                .iter()
+                .any(|error| error.message.contains("left 2, right 1")),
+            "{dialect:?}: {:?}",
+            mismatched.errors
+        );
+    }
+}

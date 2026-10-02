@@ -13645,9 +13645,11 @@ impl Parser {
             // - (WITH cte AS (SELECT 1) SELECT * FROM cte) (CTE in parens)
             let mut as_select_parenthesized = self.check(TokenType::LParen);
             let query = if as_select_parenthesized {
-                // Parenthesized query - parse as expression which handles subqueries
-                // Note: parse_primary will consume set operations like UNION internally
-                let subquery = self.parse_primary()?;
+                // Parenthesized query - parse as expression which handles subqueries and
+                // consumes set operations like `(SELECT 1) UNION ALL (SELECT 2)`
+                self.expect(TokenType::LParen)?;
+                let lparen_comments = self.previous_trailing_comments().to_vec();
+                let subquery = self.parse_parenthesized_primary(lparen_comments, true)?;
                 // If parse_primary returned a set operation, the outer parens weren't wrapping
                 // the entire expression - they were part of the operands
                 if matches!(
@@ -31954,7 +31956,17 @@ impl Parser {
         }
     }
 
-    fn parse_parenthesized_primary(&mut self, lparen_comments: Vec<String>) -> Result<Expression> {
+    /// Parse the remainder of a parenthesized primary after its opening parenthesis.
+    ///
+    /// `set_operation_may_follow` controls whether a parenthesized query may absorb a
+    /// following UNION/INTERSECT/EXCEPT. Callers enable it only where the parenthesized
+    /// query starts a query expression; as an operator or clause operand
+    /// (`WHERE x < (SELECT ...) UNION ...`) the set operation belongs to the enclosing query.
+    fn parse_parenthesized_primary(
+        &mut self,
+        lparen_comments: Vec<String>,
+        set_operation_may_follow: bool,
+    ) -> Result<Expression> {
         let raw_start = self.previous().span.start;
 
         // Empty parens () — could be empty tuple or zero-param lambda () -> body
@@ -32155,7 +32167,11 @@ impl Parser {
                 }))
             };
 
-            let set_result = self.parse_set_operation(subquery)?;
+            let set_result = if set_operation_may_follow {
+                self.parse_set_operation(subquery)?
+            } else {
+                subquery
+            };
             let had_set_operation = matches!(
                 &set_result,
                 Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
@@ -32252,9 +32268,10 @@ impl Parser {
             self.expect(TokenType::RParen)?;
             let mut nested_paren_comments = lparen_comments.clone();
             nested_paren_comments.extend_from_slice(self.previous_trailing_comments());
-            if self.check(TokenType::Union)
-                || self.check(TokenType::Intersect)
-                || self.check(TokenType::Except)
+            if set_operation_may_follow
+                && (self.check(TokenType::Union)
+                    || self.check(TokenType::Intersect)
+                    || self.check(TokenType::Except))
             {
                 if let Expression::Subquery(subq) = &result {
                     let set_result = self.parse_set_operation(subq.this.clone())?;
@@ -33282,7 +33299,11 @@ impl Parser {
         // Parenthesized expression or subquery
         if self.match_token(TokenType::LParen) {
             let lparen_comments = self.previous_trailing_comments().to_vec();
-            return self.parse_parenthesized_primary(lparen_comments);
+            // A parenthesized query that opens an enclosing parenthesis, as in
+            // `x IN ((SELECT 1) UNION (SELECT 2))`, may continue into a set operation.
+            let set_operation_may_follow =
+                self.current < 2 || self.tokens[self.current - 2].token_type == TokenType::LParen;
+            return self.parse_parenthesized_primary(lparen_comments, set_operation_may_follow);
         }
 
         // NULL
