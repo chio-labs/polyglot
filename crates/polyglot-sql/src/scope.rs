@@ -242,8 +242,9 @@ pub struct Scope {
     /// The expression at the root of this scope.
     ///
     /// A set-operation branch that is itself an unmodified set operation (the
-    /// inner levels of `a UNION b UNION c`) stores its operator and clauses with
-    /// NULL placeholders for set-operation operands; those operands are the
+    /// inner levels of `a UNION b UNION c`, including inside the comment wrapper
+    /// the parser adds before a commented set operator) stores its operator and
+    /// clauses with NULL placeholders for set-operation operands; those operands are the
     /// expressions of its own `union_scopes`. Copying them into every level would
     /// make long chains quadratic. Borrow a branch's complete query from its
     /// parent's with [`set_operation_branch_queries`].
@@ -789,6 +790,19 @@ fn is_unmodified_set_operation(expression: &Expression) -> bool {
         Expression::Union(operation) => unmodified!(operation),
         Expression::Intersect(operation) => unmodified!(operation),
         Expression::Except(operation) => unmodified!(operation),
+        // The parser wraps a set-operation operand that precedes a commented
+        // set operator; the wrapper only carries the comments.
+        Expression::Annotated(annotated) => is_unmodified_set_operation(&annotated.this),
+        _ => false,
+    }
+}
+
+/// Whether `operand` is a set operation, possibly inside comment wrappers,
+/// and is therefore the expression of its own branch scope.
+fn is_set_operation_operand(operand: &Expression) -> bool {
+    match operand {
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => true,
+        Expression::Annotated(annotated) => is_set_operation_operand(&annotated.this),
         _ => false,
     }
 }
@@ -796,10 +810,7 @@ fn is_unmodified_set_operation(expression: &Expression) -> bool {
 /// The expression stored on a set-operation branch scope; see [`Scope::expression`].
 fn set_operation_branch_expression(operand: &Expression) -> Expression {
     fn operand_copy(operand: &Expression) -> Expression {
-        if matches!(
-            operand,
-            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-        ) {
+        if is_set_operation_operand(operand) {
             Expression::Null(crate::expressions::Null)
         } else {
             operand.clone()
@@ -835,6 +846,12 @@ fn set_operation_branch_expression(operand: &Expression) -> Expression {
         Expression::Union(operation) => shallow!(Union, operation),
         Expression::Intersect(operation) => shallow!(Intersect, operation),
         Expression::Except(operation) => shallow!(Except, operation),
+        Expression::Annotated(annotated) => {
+            Expression::Annotated(Box::new(crate::expressions::Annotated {
+                this: set_operation_branch_expression(&annotated.this),
+                trailing_comments: annotated.trailing_comments.clone(),
+            }))
+        }
         _ => unreachable!("only set operations are shallow"),
     }
 }
@@ -1926,11 +1943,13 @@ mod tests {
         );
     }
 
-    fn set_operation_chain(branches: usize, operator: &str) -> String {
+    /// A chain whose operators follow `separator`; a line comment there makes
+    /// the parser wrap each left operand in a comment annotation.
+    fn commented_set_operation_chain(branches: usize, operator: &str, separator: &str) -> String {
         (0..branches)
             .map(|i| format!("SELECT {i} AS id, 'open' AS status FROM orders"))
             .collect::<Vec<_>>()
-            .join(&format!(" {operator} "))
+            .join(&format!("{separator}{operator} "))
     }
 
     fn stored_expression_nodes(scope: &Scope) -> usize {
@@ -1954,23 +1973,77 @@ mod tests {
 
     #[test]
     fn long_set_operation_chain_scopes_store_linear_expression_size() {
-        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
-            let short = parse_and_build_scope(&set_operation_chain(100, operator));
-            let long = parse_and_build_scope(&set_operation_chain(400, operator));
-            assert_eq!(set_operation_depth(&short), 99, "{operator}");
-            assert_eq!(set_operation_depth(&long), 399, "{operator}");
-            let ratio =
-                stored_expression_nodes(&long) as f64 / stored_expression_nodes(&short) as f64;
-            assert!(
-                ratio < 4.5,
-                "{operator}: 4x branches stored {ratio:.1}x expression nodes"
-            );
+        // Commented chains nest twice as deep, so they stay within the parser's
+        // default depth guard with fewer branches.
+        for (separator, short_branches) in [(" ", 100), ("\n-- row\n", 50), (" /* row */\n", 50)] {
+            let long_branches = 4 * short_branches;
+            for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+                let short = parse_and_build_scope(&commented_set_operation_chain(
+                    short_branches,
+                    operator,
+                    separator,
+                ));
+                let long = parse_and_build_scope(&commented_set_operation_chain(
+                    long_branches,
+                    operator,
+                    separator,
+                ));
+                assert_eq!(
+                    set_operation_depth(&short),
+                    short_branches - 1,
+                    "{operator} {separator:?}"
+                );
+                assert_eq!(
+                    set_operation_depth(&long),
+                    long_branches - 1,
+                    "{operator} {separator:?}"
+                );
+                let ratio =
+                    stored_expression_nodes(&long) as f64 / stored_expression_nodes(&short) as f64;
+                assert!(
+                    ratio < 4.5,
+                    "{operator} {separator:?}: 4x branches stored {ratio:.1}x expression nodes"
+                );
+            }
         }
     }
 
     #[test]
+    fn commented_set_operation_branches_store_comment_wrapped_shallow_copies() {
+        let sql = commented_set_operation_chain(4, "UNION ALL", "\n-- row\n");
+        let ast = Parser::parse_sql(&sql).expect("Failed to parse SQL");
+        let root = build_scope(&ast[0]);
+        assert_eq!(root.expression, ast[0]);
+
+        let Expression::Union(root_union) = &ast[0] else {
+            panic!("expected a UNION chain");
+        };
+        let Expression::Annotated(wrapped) = &root_union.left else {
+            panic!("expected a comment-wrapped left operand");
+        };
+        let left = &root.union_scopes[0];
+        let Expression::Annotated(stored) = &left.expression else {
+            panic!("expected the branch to keep its comment wrapper");
+        };
+        assert_eq!(stored.trailing_comments, wrapped.trailing_comments);
+        let Expression::Union(stored_union) = &stored.this else {
+            panic!("expected a shallow UNION copy");
+        };
+        assert!(matches!(stored_union.left, Expression::Null(_)));
+        assert!(matches!(stored_union.right, Expression::Select(_)));
+    }
+
+    #[test]
     fn nested_set_operation_branches_resolve_complete_queries_from_parent() {
-        let sql = "SELECT id FROM orders UNION ALL BY NAME SELECT id, status FROM returns EXCEPT SELECT id, status FROM orders INTERSECT SELECT id, status FROM returns";
+        for sql in [
+            "SELECT id FROM orders UNION ALL BY NAME SELECT id, status FROM returns EXCEPT SELECT id, status FROM orders INTERSECT SELECT id, status FROM returns",
+            "SELECT id FROM orders\n-- first\nUNION ALL BY NAME SELECT id, status FROM returns\n-- second\nEXCEPT SELECT id, status FROM orders /* third */\nINTERSECT SELECT id, status FROM returns",
+        ] {
+            check_set_operation_branches(sql);
+        }
+    }
+
+    fn check_set_operation_branches(sql: &str) {
         let ast = Parser::parse_sql(sql).expect("Failed to parse SQL");
         let root = build_scope(&ast[0]);
 
