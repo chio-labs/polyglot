@@ -113,25 +113,62 @@ pub(crate) fn take_selected_reference_scope(
     (selected_scope_view(scope, query), with)
 }
 
-fn selected_scope_view(scope: &Scope, query: Expression) -> Scope {
-    let aliases: HashSet<_> = walk_in_scope(&query, false)
+/// `selected_reference_scope(&build_scope_with_ctes(expression, ctes))` without
+/// building child scopes or copying the query. Only `sources` and `cte_sources`
+/// are populated; the view's expression is NULL.
+pub(crate) fn selected_source_scope(
+    expression: &Expression,
+    ctes: &HashMap<String, SourceInfo>,
+) -> Scope {
+    let select = match expression {
+        Expression::Select(select) if select.with.is_none() => select,
+        _ => return selected_reference_scope(&build_scope_with_ctes(expression, ctes)),
+    };
+    let mut scope = Scope::new(Expression::Null(crate::expressions::Null));
+    scope.cte_sources = std::sync::Arc::new(ctes.clone());
+    if let Some(from) = &select.from {
+        for table in &from.expressions {
+            add_table_to_scope(table, &mut scope, false);
+        }
+    }
+    for join in &select.joins {
+        add_table_to_scope(&join.this, &mut scope, false);
+    }
+    for lateral_view in &select.lateral_views {
+        add_lateral_view_to_scope(lateral_view, &mut scope);
+    }
+    let aliases = selected_table_aliases(expression);
+    scope
+        .sources
+        .retain(|name, source| selected_source(name, source, &aliases));
+    scope
+}
+
+fn selected_table_aliases(query: &Expression) -> HashSet<String> {
+    walk_in_scope(query, false)
         .filter_map(|node| match node {
             Expression::Table(table) => {
                 Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
             }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+fn selected_source(name: &str, source: &SourceInfo, aliases: &HashSet<String>) -> bool {
+    // Source keys use the spelling of the actual FROM/JOIN binding.
+    // Folding here can accidentally retain an unused, quoted CTE.
+    source.kind != SourceKind::Cte || aliases.contains(name)
+}
+
+fn selected_scope_view(scope: &Scope, query: Expression) -> Scope {
+    let aliases = selected_table_aliases(&query);
     let mut selected = Scope::new(query);
     selected.cte_sources = scope.cte_sources.clone();
     selected.sources = scope
         .sources
         .iter()
-        .filter(|(name, source)| {
-            // Source keys use the spelling of the actual FROM/JOIN binding.
-            // Folding here can accidentally retain an unused, quoted CTE.
-            source.kind != SourceKind::Cte || aliases.contains(*name)
-        })
+        .filter(|(name, source)| selected_source(name, source, &aliases))
         .map(|(name, source)| (name.clone(), source.clone()))
         .collect();
     selected
@@ -870,13 +907,13 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Process FROM clause
             if let Some(from) = &select.from {
                 for table in &from.expressions {
-                    add_table_to_scope(table, current_scope);
+                    add_table_to_scope(table, current_scope, true);
                 }
             }
 
             // Process JOINs
             for join in &select.joins {
-                add_table_to_scope(&join.this, current_scope);
+                add_table_to_scope(&join.this, current_scope, true);
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
@@ -999,7 +1036,9 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
         .is_empty()
 }
 
-fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
+/// Register a FROM/JOIN relation as a source of `scope`, building the child
+/// scopes of derived relations when `build_children` is set.
+fn add_table_to_scope(expr: &Expression, scope: &mut Scope, build_children: bool) {
     match expr {
         Expression::Table(table) => {
             let name = table
@@ -1041,15 +1080,18 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             } else {
                 ScopeType::DerivedTable
             };
-            let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            let derived_scope = build_children.then(|| {
+                let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
+                build_scope_impl(&subquery.this, &mut derived_scope);
+                derived_scope
+            });
 
             if subquery.lateral {
                 scope.add_lateral_source(name, expr.clone(), true);
-                scope.udtf_scopes.push(derived_scope);
+                scope.udtf_scopes.extend(derived_scope);
             } else {
                 scope.add_source(name, expr.clone(), true);
-                scope.derived_table_scopes.push(derived_scope);
+                scope.derived_table_scopes.extend(derived_scope);
             }
         }
         Expression::Values(values) => {
@@ -1074,17 +1116,20 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 .iter()
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>();
-            let mut derived_scope = scope.branch_with_options(
-                alias.this.clone(),
-                ScopeType::DerivedTable,
-                None,
-                None,
-                Some(outer_columns),
-            );
-            build_scope_impl(&alias.this, &mut derived_scope);
+            let derived_scope = build_children.then(|| {
+                let mut derived_scope = scope.branch_with_options(
+                    alias.this.clone(),
+                    ScopeType::DerivedTable,
+                    None,
+                    None,
+                    Some(outer_columns),
+                );
+                build_scope_impl(&alias.this, &mut derived_scope);
+                derived_scope
+            });
 
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
-            scope.derived_table_scopes.push(derived_scope);
+            scope.derived_table_scopes.extend(derived_scope);
         }
         Expression::Lateral(lateral) => {
             let name = lateral
@@ -1103,7 +1148,9 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&pivot.this, scope);
+            if build_children {
+                add_pivot_inner_scope(&pivot.this, scope);
+            }
         }
         Expression::Unpivot(unpivot) => {
             let name = pivot_source_name(
@@ -1114,10 +1161,12 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&unpivot.this, scope);
+            if build_children {
+                add_pivot_inner_scope(&unpivot.this, scope);
+            }
         }
         Expression::Paren(paren) => {
-            add_table_to_scope(&paren.this, scope);
+            add_table_to_scope(&paren.this, scope, build_children);
         }
         _ => {}
     }

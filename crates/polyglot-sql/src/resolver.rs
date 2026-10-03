@@ -16,6 +16,7 @@ use crate::generator::Generator;
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{Scope, SourceInfo};
 use crate::traversal::ExpressionWalk;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -55,7 +56,9 @@ pub struct Resolver<'a> {
     /// Whether to infer schema from context
     infer_schema: bool,
     /// Cached source columns: source_name -> column names
-    source_columns_cache: HashMap<String, Vec<String>>,
+    source_columns_cache: HashMap<String, SourceColumns>,
+    /// Sources whose columns resolve, in `scope.sources` order
+    resolved_sources_cache: Option<Vec<String>>,
     /// Cached unambiguous columns: column_name -> source_name
     unambiguous_columns_cache: Option<HashMap<String, String>>,
     /// Cached set of all available columns
@@ -63,6 +66,45 @@ pub struct Resolver<'a> {
     /// Actual correlated parents, nearest first. Physical schema entries alone
     /// do not make a relation visible in a query.
     outer_scopes: Vec<&'a Scope>,
+    /// Cached outer-scope column lookups; see `find_column_in_outer_scopes`
+    outer_columns_cache: RefCell<HashMap<String, Option<String>>>,
+}
+
+/// A source's column names and, once lookups repeat, their normalized forms;
+/// each is computed once per resolver.
+struct SourceColumns {
+    columns: Vec<String>,
+    normalized: std::cell::OnceCell<HashSet<String>>,
+    /// Whether a lookup has already scanned `columns`. Short-lived resolvers
+    /// often look up a single column, which a scan answers more cheaply.
+    scanned: std::cell::Cell<bool>,
+}
+
+impl SourceColumns {
+    fn new(columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            normalized: std::cell::OnceCell::new(),
+            scanned: std::cell::Cell::new(false),
+        }
+    }
+
+    fn contains_normalized(&self, normalized_column: &str, dialect: Option<DialectType>) -> bool {
+        if self.normalized.get().is_none() && !self.scanned.replace(true) {
+            return self
+                .columns
+                .iter()
+                .any(|column| normalize_column_name(column, dialect) == normalized_column);
+        }
+        self.normalized
+            .get_or_init(|| {
+                self.columns
+                    .iter()
+                    .map(|column| normalize_column_name(column, dialect))
+                    .collect()
+            })
+            .contains(normalized_column)
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -74,14 +116,16 @@ impl<'a> Resolver<'a> {
             dialect: schema.dialect(),
             infer_schema,
             source_columns_cache: HashMap::new(),
+            resolved_sources_cache: None,
             unambiguous_columns_cache: None,
             all_columns_cache: None,
             outer_scopes: Vec::new(),
+            outer_columns_cache: RefCell::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn with_outer_scopes(mut self, scopes: &'a [Scope]) -> Self {
-        self.outer_scopes = scopes.iter().rev().collect();
+    pub(crate) fn with_outer_scopes(mut self, scopes: &[&'a Scope]) -> Self {
+        self.outer_scopes = scopes.iter().rev().copied().collect();
         self
     }
 
@@ -95,6 +139,17 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn find_column_in_outer_scopes(&self, column: &str) -> Option<String> {
+        if let Some(table) = self.outer_columns_cache.borrow().get(column) {
+            return table.clone();
+        }
+        let table = self.find_column_in_outer_scopes_uncached(column);
+        self.outer_columns_cache
+            .borrow_mut()
+            .insert(column.to_string(), table.clone());
+        table
+    }
+
+    fn find_column_in_outer_scopes_uncached(&self, column: &str) -> Option<String> {
         let mut shadowed = HashSet::new();
         shadowed.extend(
             self.scope
@@ -123,7 +178,7 @@ impl<'a> Resolver<'a> {
     /// Returns the table name if it can be found/inferred.
     pub fn get_table(&mut self, column_name: &str) -> Option<String> {
         // Try to find table from all sources (unambiguous lookup)
-        let table_name = self.get_table_name_from_sources(column_name, None);
+        let table_name = self.get_table_name_from_sources(column_name);
 
         // If we found a table, return it
         if table_name.is_some() {
@@ -134,10 +189,11 @@ impl<'a> Resolver<'a> {
         // assume the column belongs to that source
         if self.infer_schema {
             let sources_without_schema: Vec<_> = self
-                .get_all_source_columns()
-                .iter()
-                .filter(|(_, columns)| columns.is_empty() || columns.contains(&"*".to_string()))
-                .map(|(name, _)| name.clone())
+                .resolved_source_columns()
+                .filter(|(_, source)| {
+                    source.columns.is_empty() || source.columns.iter().any(|column| column == "*")
+                })
+                .map(|(name, _)| name)
                 .collect();
 
             if sources_without_schema.len() == 1 {
@@ -182,8 +238,8 @@ impl<'a> Resolver<'a> {
     pub fn all_columns(&mut self) -> &HashSet<String> {
         if self.all_columns_cache.is_none() {
             let mut all = HashSet::new();
-            for columns in self.get_all_source_columns().values() {
-                all.extend(columns.iter().cloned());
+            for (_, source) in self.resolved_source_columns() {
+                all.extend(source.columns.iter().cloned());
             }
             self.all_columns_cache = Some(all);
         }
@@ -196,25 +252,58 @@ impl<'a> Resolver<'a> {
     ///
     /// Returns the list of column names available from the given source.
     pub fn get_source_columns(&mut self, source_name: &str) -> ResolverResult<Vec<String>> {
-        // Check cache first
-        if let Some(columns) = self.source_columns_cache.get(source_name) {
-            return Ok(columns.clone());
+        self.source_columns(source_name).map(<[String]>::to_vec)
+    }
+
+    /// Borrow the column names of a source; see [`Self::get_source_columns`].
+    pub(crate) fn source_columns(&mut self, source_name: &str) -> ResolverResult<&[String]> {
+        Ok(&self.cached_source_columns(source_name)?.columns)
+    }
+
+    /// Whether a source has a column whose normalized name is `normalized_column`.
+    pub(crate) fn source_has_normalized_column(
+        &mut self,
+        source_name: &str,
+        normalized_column: &str,
+    ) -> ResolverResult<bool> {
+        let dialect = self.dialect;
+        Ok(self
+            .cached_source_columns(source_name)?
+            .contains_normalized(normalized_column, dialect))
+    }
+
+    fn cached_source_columns(&mut self, source_name: &str) -> ResolverResult<&SourceColumns> {
+        if !self.source_columns_cache.contains_key(source_name) {
+            let source_info = self
+                .scope
+                .sources
+                .get(source_name)
+                .ok_or_else(|| ResolverError::UnknownTable(source_name.to_string()))?;
+            let columns = self.extract_columns_from_source(source_info)?;
+            self.source_columns_cache
+                .insert(source_name.to_string(), SourceColumns::new(columns));
         }
+        Ok(&self.source_columns_cache[source_name])
+    }
 
-        // Get the source info
-        let source_info = self
-            .scope
-            .sources
-            .get(source_name)
-            .ok_or_else(|| ResolverError::UnknownTable(source_name.to_string()))?;
-
-        let columns = self.extract_columns_from_source(source_info)?;
-
-        // Cache the result
-        self.source_columns_cache
-            .insert(source_name.to_string(), columns.clone());
-
-        Ok(columns)
+    /// The scope's sources whose columns resolve, in `scope.sources` order.
+    fn resolved_source_columns(&mut self) -> impl Iterator<Item = (&String, &SourceColumns)> {
+        if self.resolved_sources_cache.is_none() {
+            let scope = self.scope;
+            let resolved = scope
+                .sources
+                .keys()
+                .filter(|name| self.cached_source_columns(name).is_ok())
+                .cloned()
+                .collect();
+            self.resolved_sources_cache = Some(resolved);
+        }
+        let columns = &self.source_columns_cache;
+        self.resolved_sources_cache
+            .as_deref()
+            .expect("cache populated above")
+            .iter()
+            .map(move |name| (name, &columns[name.as_str()]))
     }
 
     /// Extract column names from a source expression
@@ -571,60 +660,32 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Get all source columns for all sources in the scope
-    fn get_all_source_columns(&mut self) -> HashMap<String, Vec<String>> {
-        let source_names: Vec<_> = self.scope.sources.keys().cloned().collect();
-
-        let mut result = HashMap::new();
-        for source_name in source_names {
-            if let Ok(columns) = self.get_source_columns(&source_name) {
-                result.insert(source_name, columns);
-            }
-        }
-        result
-    }
-
     /// Get the table name for a column from the sources
-    fn get_table_name_from_sources(
-        &mut self,
-        column_name: &str,
-        source_columns: Option<&HashMap<String, Vec<String>>>,
-    ) -> Option<String> {
+    fn get_table_name_from_sources(&mut self, column_name: &str) -> Option<String> {
         let normalized_column_name = normalize_column_name(column_name, self.dialect);
-        let unambiguous = match source_columns {
-            Some(cols) => self.compute_unambiguous_columns(cols),
-            None => {
-                if self.unambiguous_columns_cache.is_none() {
-                    let all_source_columns = self.get_all_source_columns();
-                    self.unambiguous_columns_cache =
-                        Some(self.compute_unambiguous_columns(&all_source_columns));
-                }
-                self.unambiguous_columns_cache
-                    .clone()
-                    .expect("cache populated above")
-            }
-        };
-
-        unambiguous.get(&normalized_column_name).cloned()
+        if self.unambiguous_columns_cache.is_none() {
+            let unambiguous = self.compute_unambiguous_columns();
+            self.unambiguous_columns_cache = Some(unambiguous);
+        }
+        self.unambiguous_columns_cache
+            .as_ref()
+            .expect("cache populated above")
+            .get(&normalized_column_name)
+            .cloned()
     }
 
     /// Compute unambiguous columns mapping
     ///
-    /// A column is unambiguous if it appears in exactly one source.
-    fn compute_unambiguous_columns(
-        &self,
-        source_columns: &HashMap<String, Vec<String>>,
-    ) -> HashMap<String, String> {
-        if source_columns.is_empty() {
-            return HashMap::new();
-        }
-
+    /// A column is unambiguous if it appears in exactly one source. A column
+    /// listed twice by one source is ambiguous.
+    fn compute_unambiguous_columns(&mut self) -> HashMap<String, String> {
+        let dialect = self.dialect;
         let mut column_to_sources: HashMap<String, Vec<String>> = HashMap::new();
 
-        for (source_name, columns) in source_columns {
-            for column in columns {
+        for (source_name, source) in self.resolved_source_columns() {
+            for column in &source.columns {
                 column_to_sources
-                    .entry(normalize_column_name(column, self.dialect))
+                    .entry(normalize_column_name(column, dialect))
                     .or_default()
                     .push(source_name.clone());
             }
@@ -641,31 +702,19 @@ impl<'a> Resolver<'a> {
     /// Check if a column is ambiguous (appears in multiple sources)
     pub fn is_ambiguous(&mut self, column_name: &str) -> bool {
         let normalized_column_name = normalize_column_name(column_name, self.dialect);
-        let all_source_columns = self.get_all_source_columns();
-        let sources_with_column: Vec<_> = all_source_columns
-            .iter()
-            .filter(|(_, columns)| {
-                columns.iter().any(|column| {
-                    normalize_column_name(column, self.dialect) == normalized_column_name
-                })
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        sources_with_column.len() > 1
+        let dialect = self.dialect;
+        self.resolved_source_columns()
+            .filter(|(_, source)| source.contains_normalized(&normalized_column_name, dialect))
+            .nth(1)
+            .is_some()
     }
 
     /// Get all sources that contain a given column
     pub fn sources_for_column(&mut self, column_name: &str) -> Vec<String> {
         let normalized_column_name = normalize_column_name(column_name, self.dialect);
-        let all_source_columns = self.get_all_source_columns();
-        all_source_columns
-            .iter()
-            .filter(|(_, columns)| {
-                columns.iter().any(|column| {
-                    normalize_column_name(column, self.dialect) == normalized_column_name
-                })
-            })
+        let dialect = self.dialect;
+        self.resolved_source_columns()
+            .filter(|(_, source)| source.contains_normalized(&normalized_column_name, dialect))
             .map(|(name, _)| name.clone())
             .collect()
     }
@@ -683,12 +732,11 @@ impl<'a> Resolver<'a> {
         let mut matching_sources = Vec::new();
 
         for source_name in available_sources {
-            if let Ok(columns) = self.get_source_columns(source_name) {
-                if columns.iter().any(|column| {
-                    normalize_column_name(column, self.dialect) == normalized_column_name
-                }) {
-                    matching_sources.push(source_name.clone());
-                }
+            if self
+                .source_has_normalized_column(source_name, &normalized_column_name)
+                .unwrap_or(false)
+            {
+                matching_sources.push(source_name.clone());
             }
         }
 
