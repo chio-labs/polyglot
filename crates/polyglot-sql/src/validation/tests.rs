@@ -4569,9 +4569,21 @@ fn validated_set_operation_chain(
 
 #[test]
 fn long_set_operation_chain_validation_scales_linearly() {
+    assert_set_operation_chain_validation_scales_linearly(" ", 100);
+}
+
+#[test]
+fn long_commented_set_operation_chain_validation_scales_linearly() {
+    // A comment before each operator makes the parser wrap every left operand;
+    // those chains nest twice as deep, so fewer branches fit the depth guard.
+    assert_set_operation_chain_validation_scales_linearly("\n-- row\n", 60);
+}
+
+fn assert_set_operation_chain_validation_scales_linearly(separator: &str, short_branches: usize) {
     // Time validation of a parsed chain; parsing is outside this guard.
     let fastest = |branches: usize| {
-        let sql = set_operation_chain_sql(branches, "UNION ALL", None);
+        let sql = set_operation_chain_sql(branches, "UNION ALL", None)
+            .replace(" UNION ALL ", &format!("{separator}UNION ALL "));
         let parsed = crate::parse_one(&sql, DialectType::DuckDB).unwrap();
         (0..5)
             .map(|_| {
@@ -4590,13 +4602,13 @@ fn long_set_operation_chain_validation_scales_linearly() {
             .min()
             .unwrap()
     };
-    fastest(100);
-    let short = fastest(100);
-    let long = fastest(400);
+    fastest(short_branches);
+    let short = fastest(short_branches);
+    let long = fastest(4 * short_branches);
     let ratio = long.as_secs_f64() / short.as_secs_f64();
     assert!(
         ratio < 8.0,
-        "4x UNION ALL branches took {ratio:.1}x as long ({short:?} -> {long:?})"
+        "4x UNION ALL branches ({separator:?}) took {ratio:.1}x as long ({short:?} -> {long:?})"
     );
 }
 

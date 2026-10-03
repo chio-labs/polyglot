@@ -12,9 +12,7 @@ use crate::expressions::{
 };
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
-use crate::scope::{
-    build_scope_with_ctes, selected_reference_scope, traverse_scope, Scope, SourceInfo, SourceKind,
-};
+use crate::scope::{selected_source_scope, traverse_scope, Scope, SourceInfo, SourceKind};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -173,7 +171,7 @@ fn qualify_nested_queries(
     schema: &dyn Schema,
     options: &QualifyColumnsOptions,
     ctes: &HashMap<String, SourceInfo>,
-    outer: &[Scope],
+    outer: &[&Scope],
 ) -> QualifyColumnsResult<Expression> {
     transform_in_scope(expression, |node| match node {
         Expression::Select(_)
@@ -189,7 +187,7 @@ fn qualify_query(
     schema: &dyn Schema,
     options: &QualifyColumnsOptions,
     inherited_ctes: &HashMap<String, SourceInfo>,
-    outer: &[Scope],
+    outer: &[&Scope],
 ) -> QualifyColumnsResult<Expression> {
     #[cfg(feature = "stacker")]
     {
@@ -204,6 +202,11 @@ fn qualify_query(
     }
     #[cfg(not(feature = "stacker"))]
     qualify_query_inner(expression, schema, options, inherited_ctes, outer)
+}
+
+/// Move an expression out of the tree, leaving NULL in its place.
+fn take(expression: &mut Expression) -> Expression {
+    std::mem::replace(expression, Expression::Null(crate::expressions::Null))
 }
 
 fn is_lateral_source(expression: &Expression) -> bool {
@@ -221,7 +224,7 @@ fn qualify_query_inner(
     schema: &dyn Schema,
     options: &QualifyColumnsOptions,
     inherited_ctes: &HashMap<String, SourceInfo>,
-    outer: &[Scope],
+    outer: &[&Scope],
 ) -> QualifyColumnsResult<Expression> {
     let infer_schema = options.infer_schema.unwrap_or(schema.is_empty());
     let dialect = options.dialect.or_else(|| schema.dialect());
@@ -279,43 +282,36 @@ fn qualify_query_inner(
         if let Some(from) = &mut select.from {
             let sources = std::mem::take(&mut from.expressions);
             for source in sources {
+                let lateral_scope = is_lateral_source(&source)
+                    .then(|| selected_source_scope(&Expression::Select(select.clone()), &ctes));
                 let mut visible_outer = outer.to_vec();
-                if is_lateral_source(&source) {
-                    visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
-                        &Expression::Select(select.clone()),
-                        &ctes,
-                    )));
-                }
+                visible_outer.extend(lateral_scope.as_ref());
                 let qualified =
                     qualify_nested_queries(source, schema, options, &ctes, &visible_outer)?;
                 select.from.as_mut().unwrap().expressions.push(qualified);
             }
         }
         for mut join in joins {
-            let mut visible_outer = outer.to_vec();
-            if is_lateral_source(&join.this)
+            let lateral_scope = (is_lateral_source(&join.this)
                 || matches!(
                     join.kind,
                     JoinKind::Lateral
                         | JoinKind::LeftLateral
                         | JoinKind::CrossApply
                         | JoinKind::OuterApply
-                )
-            {
-                visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
-                    &Expression::Select(select.clone()),
-                    &ctes,
-                )));
-            }
+                ))
+            .then(|| selected_source_scope(&Expression::Select(select.clone()), &ctes));
+            let mut visible_outer = outer.to_vec();
+            visible_outer.extend(lateral_scope.as_ref());
             join.this = qualify_nested_queries(join.this, schema, options, &ctes, &visible_outer)?;
             select.joins.push(join);
         }
     }
 
     if matches!(expression, Expression::Select(_)) {
-        let scope = selected_reference_scope(&build_scope_with_ctes(&expression, &ctes));
+        let scope = selected_source_scope(&expression, &ctes);
         let mut nested_outer = outer.to_vec();
-        nested_outer.push(scope.clone());
+        nested_outer.push(&scope);
         // Temporarily detach relation queries: they were already visited, and
         // unlike scalar subqueries must not see this SELECT as a parent.
         let Expression::Select(select) = &mut expression else {
@@ -324,9 +320,11 @@ fn qualify_query_inner(
         let from = select.from.take();
         let mut joins = std::mem::take(&mut select.joins);
         let mut error = None;
+        // A failure discards the whole expression, so children are moved
+        // rather than copied.
         crate::ast_children::for_each_child_mut(&mut expression, |child| {
             if error.is_none() {
-                match qualify_nested_queries(child.clone(), schema, options, &ctes, &nested_outer) {
+                match qualify_nested_queries(take(child), schema, options, &ctes, &nested_outer) {
                     Ok(qualified) => *child = qualified,
                     Err(err) => error = Some(err),
                 }
@@ -337,7 +335,7 @@ fn qualify_query_inner(
         }
         for join in &mut joins {
             if let Some(on) = &mut join.on {
-                *on = qualify_nested_queries(on.clone(), schema, options, &ctes, &nested_outer)?;
+                *on = qualify_nested_queries(take(on), schema, options, &ctes, &nested_outer)?;
             }
         }
         let Expression::Select(select) = &mut expression else {
@@ -370,10 +368,8 @@ fn qualify_query_inner(
             Expression::Except(query) => (&mut query.left, &mut query.right),
             _ => unreachable!(),
         };
-        let left_query = std::mem::replace(left, Expression::Null(crate::expressions::Null));
-        let right_query = std::mem::replace(right, Expression::Null(crate::expressions::Null));
-        *left = qualify_nested_queries(left_query, schema, options, &ctes, outer)?;
-        *right = qualify_nested_queries(right_query, schema, options, &ctes, outer)?;
+        *left = qualify_nested_queries(take(left), schema, options, &ctes, outer)?;
+        *right = qualify_nested_queries(take(right), schema, options, &ctes, outer)?;
         match &mut expression {
             Expression::Union(query) => query.with = with,
             Expression::Intersect(query) => query.with = with,
@@ -560,7 +556,8 @@ fn expand_using(
         column_order: &mut Vec<String>,
         resolver: &mut Resolver,
     ) -> bool {
-        let Ok(source_cols) = resolver.get_source_columns(source_name) else {
+        let dialect = resolver.dialect;
+        let Ok(source_cols) = resolver.source_columns(source_name) else {
             return false;
         };
         let schema_known = !source_cols.is_empty()
@@ -568,10 +565,10 @@ fn expand_using(
                 .iter()
                 .any(|column| column == "*" || column.is_empty());
         for col_name in source_cols {
-            let normalized = normalize_column_name(&col_name, resolver.dialect);
+            let normalized = normalize_column_name(col_name, dialect);
             if let std::collections::hash_map::Entry::Vacant(entry) = columns.entry(normalized) {
                 entry.insert(source_name.to_string());
-                column_order.push(col_name);
+                column_order.push(col_name.clone());
             }
         }
         schema_known
@@ -690,13 +687,8 @@ fn expand_using(
                     .iter()
                     .filter(|t| {
                         resolver
-                            .get_source_columns(t)
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|column| {
-                                normalize_column_name(column, resolver.dialect)
-                                    == normalized_identifier
-                            })
+                            .source_has_normalized_column(t, &normalized_identifier)
+                            .unwrap_or(false)
                     })
                     .cloned()
                     .collect();
@@ -828,7 +820,7 @@ fn rewrite_using_columns_in_expression(
     column_tables: &HashMap<String, Vec<String>>,
     dialect: Option<DialectType>,
 ) {
-    let transformed: crate::Result<_> = transform_in_scope(expr.clone(), |node| match node {
+    let transformed: crate::Result<_> = transform_in_scope(take(expr), |node| match node {
         Expression::Column(col) if col.table.is_none() => {
             let normalized = normalize_column_name(&col.name.name, dialect);
             if let Some(tables) = column_tables.get(&normalized) {
@@ -840,9 +832,7 @@ fn rewrite_using_columns_in_expression(
         other => Ok(other),
     });
 
-    if let Ok(next) = transformed {
-        *expr = next;
-    }
+    *expr = transformed.expect("USING rewrite is infallible");
 }
 
 /// Normalize ambiguous two-part column references into struct/JSON field access.
@@ -894,7 +884,7 @@ pub(crate) fn normalize_dotted_columns_in_expression(
     resolver: &mut Resolver,
 ) -> QualifyColumnsResult<()> {
     let resolver = RefCell::new(resolver);
-    let transformed = transform_in_scope(expression.clone(), |node| {
+    let transformed = transform_in_scope(take(expression), |node| {
         let Expression::Column(column) = node else {
             return Ok(node);
         };
@@ -928,10 +918,9 @@ pub(crate) fn normalize_dotted_columns_in_expression(
             field: column.name.clone(),
             inferred_type: None,
         })))
-    })
-    .map_err(|error: crate::Error| QualifyColumnsError::CannotAutoJoin(error.to_string()))?;
-
-    *expression = transformed;
+    });
+    let transformed: Result<_, crate::Error> = transformed;
+    *expression = transformed.expect("dotted column normalization is infallible");
     Ok(())
 }
 
@@ -1023,12 +1012,12 @@ fn expand_alias_refs(
 /// becomes:
 /// `SELECT a, b FROM t GROUP BY a, b`
 fn expand_group_by(select: &mut Select, _dialect: Option<DialectType>) -> QualifyColumnsResult<()> {
-    let projections = select.expressions.clone();
+    let projections = &select.expressions;
 
     if let Some(group_by) = &mut select.group_by {
         for group_expr in &mut group_by.expressions {
             if let Some(index) = positional_reference(group_expr) {
-                let replacement = select_expression_at_position(&projections, index)?;
+                let replacement = select_expression_at_position(projections, index)?;
                 *group_expr = replacement;
             }
         }
@@ -1051,6 +1040,13 @@ fn expand_stars(
     resolver: &mut Resolver,
     column_tables: &HashMap<String, Vec<String>>,
 ) -> QualifyColumnsResult<()> {
+    if !select.expressions.iter().any(|expr| match expr {
+        Expression::Star(_) => true,
+        Expression::Column(col) => is_star_column(col),
+        _ => false,
+    }) {
+        return Ok(());
+    }
     let mut new_selections: Vec<Expression> = Vec::new();
     let mut has_star = false;
     let mut coalesced_columns: HashSet<String> = HashSet::new();
@@ -1198,25 +1194,25 @@ pub fn qualify_outputs(scope: &Scope) -> QualifyColumnsResult<()> {
 }
 
 fn qualify_outputs_select(select: &mut Select) -> QualifyColumnsResult<()> {
-    fn qualify_output(expr: &Expression, i: usize) -> Expression {
+    fn qualify_output(expr: Expression, i: usize) -> Expression {
         match expr {
-            Expression::Annotated(annotated) => {
-                let mut annotated = annotated.clone();
-                annotated.this = qualify_output(&annotated.this, i);
+            Expression::Annotated(mut annotated) => {
+                annotated.this = qualify_output(annotated.this, i);
                 Expression::Annotated(annotated)
             }
-            Expression::Alias(_) => expr.clone(),
-            Expression::Column(col) => create_alias(expr.clone(), &col.name.name),
-            Expression::Star(_) => expr.clone(),
+            Expression::Alias(_) | Expression::Star(_) => expr,
+            Expression::Column(ref col) => {
+                let name = col.name.name.clone();
+                create_alias(expr, &name)
+            }
             _ => {
-                let alias_name = get_output_name(expr).unwrap_or_else(|| format!("_col_{}", i));
-                create_alias(expr.clone(), &alias_name)
+                let alias_name = get_output_name(&expr).unwrap_or_else(|| format!("_col_{}", i));
+                create_alias(expr, &alias_name)
             }
         }
     }
-    select.expressions = select
-        .expressions
-        .iter()
+    select.expressions = std::mem::take(&mut select.expressions)
+        .into_iter()
         .enumerate()
         .map(|(i, expr)| qualify_output(expr, i))
         .collect();
@@ -1232,7 +1228,7 @@ fn qualify_columns_in_expression(
     let first_error: RefCell<Option<QualifyColumnsError>> = RefCell::new(None);
     let resolver_cell: RefCell<&mut Resolver> = RefCell::new(resolver);
 
-    let transformed = transform_in_scope(expr.clone(), |node| {
+    let transformed = transform_in_scope(take(expr), |node| {
         if first_error.borrow().is_some() {
             return Ok(node);
         }
@@ -1251,15 +1247,14 @@ fn qualify_columns_in_expression(
             }
             _ => Ok(node),
         }
-    })
-    .map_err(|err: crate::Error| QualifyColumnsError::CannotAutoJoin(err.to_string()))?;
-
-    if let Some(err) = first_error.into_inner() {
-        return Err(err);
+    });
+    let transformed: Result<_, crate::Error> = transformed;
+    // On failure the caller discards the whole expression.
+    *expr = transformed.expect("column qualification transform is infallible");
+    match first_error.into_inner() {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
-
-    *expr = transformed;
-    Ok(())
 }
 
 fn qualify_single_column(
@@ -1274,9 +1269,9 @@ fn qualify_single_column(
 
     if let Some(table) = &col.table {
         let table_name = &table.name;
+        let normalized_table_name = normalize_name(table_name, resolver.dialect, true, true);
         let source_name = scope.sources.keys().find(|source| {
-            normalize_name(source, resolver.dialect, true, true)
-                == normalize_name(table_name, resolver.dialect, true, true)
+            normalize_name(source, resolver.dialect, true, true) == normalized_table_name
         });
         let Some(source_name) = source_name else {
             if resolver.outer_source_exists(table_name) {
@@ -1285,16 +1280,17 @@ fn qualify_single_column(
             return Err(QualifyColumnsError::UnknownTable(table_name.clone()));
         };
 
-        if let Ok(source_columns) = resolver.get_source_columns(source_name) {
+        if !allow_partial {
             let normalized_column_name = normalize_column_name(&col.name.name, resolver.dialect);
-            if !allow_partial
-                && !source_columns.is_empty()
-                && !source_columns.iter().any(|column| {
-                    normalize_column_name(column, resolver.dialect) == normalized_column_name
-                })
-                && !source_columns.contains(&"*".to_string())
+            let has_column =
+                resolver.source_has_normalized_column(source_name, &normalized_column_name);
+            if let (Ok(false), Ok(source_columns)) =
+                (has_column, resolver.source_columns(source_name))
             {
-                return Err(QualifyColumnsError::UnknownColumn(col.name.name.clone()));
+                if !source_columns.is_empty() && !source_columns.iter().any(|column| column == "*")
+                {
+                    return Err(QualifyColumnsError::UnknownColumn(col.name.name.clone()));
+                }
             }
         }
         return Ok(());
@@ -1332,7 +1328,7 @@ fn replace_alias_refs_in_expression(
     alias_to_expression: &HashMap<String, (Expression, usize)>,
     literal_index: bool,
 ) {
-    let transformed: crate::Result<_> = transform_in_scope(expr.clone(), |node| match node {
+    let transformed: crate::Result<_> = transform_in_scope(take(expr), |node| match node {
         Expression::Column(col) if col.table.is_none() => {
             if let Some((alias_expr, index)) = alias_to_expression.get(&col.name.name) {
                 if literal_index && matches!(alias_expr, Expression::Literal(_)) {
@@ -1348,9 +1344,7 @@ fn replace_alias_refs_in_expression(
         other => Ok(other),
     });
 
-    if let Ok(next) = transformed {
-        *expr = next;
-    }
+    *expr = transformed.expect("alias reference expansion is infallible");
 }
 
 fn positional_reference(expr: &Expression) -> Option<usize> {

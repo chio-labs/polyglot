@@ -113,25 +113,62 @@ pub(crate) fn take_selected_reference_scope(
     (selected_scope_view(scope, query), with)
 }
 
-fn selected_scope_view(scope: &Scope, query: Expression) -> Scope {
-    let aliases: HashSet<_> = walk_in_scope(&query, false)
+/// `selected_reference_scope(&build_scope_with_ctes(expression, ctes))` without
+/// building child scopes or copying the query. Only `sources` and `cte_sources`
+/// are populated; the view's expression is NULL.
+pub(crate) fn selected_source_scope(
+    expression: &Expression,
+    ctes: &HashMap<String, SourceInfo>,
+) -> Scope {
+    let select = match expression {
+        Expression::Select(select) if select.with.is_none() => select,
+        _ => return selected_reference_scope(&build_scope_with_ctes(expression, ctes)),
+    };
+    let mut scope = Scope::new(Expression::Null(crate::expressions::Null));
+    scope.cte_sources = std::sync::Arc::new(ctes.clone());
+    if let Some(from) = &select.from {
+        for table in &from.expressions {
+            add_table_to_scope(table, &mut scope, false);
+        }
+    }
+    for join in &select.joins {
+        add_table_to_scope(&join.this, &mut scope, false);
+    }
+    for lateral_view in &select.lateral_views {
+        add_lateral_view_to_scope(lateral_view, &mut scope);
+    }
+    let aliases = selected_table_aliases(expression);
+    scope
+        .sources
+        .retain(|name, source| selected_source(name, source, &aliases));
+    scope
+}
+
+fn selected_table_aliases(query: &Expression) -> HashSet<String> {
+    walk_in_scope(query, false)
         .filter_map(|node| match node {
             Expression::Table(table) => {
                 Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
             }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+fn selected_source(name: &str, source: &SourceInfo, aliases: &HashSet<String>) -> bool {
+    // Source keys use the spelling of the actual FROM/JOIN binding.
+    // Folding here can accidentally retain an unused, quoted CTE.
+    source.kind != SourceKind::Cte || aliases.contains(name)
+}
+
+fn selected_scope_view(scope: &Scope, query: Expression) -> Scope {
+    let aliases = selected_table_aliases(&query);
     let mut selected = Scope::new(query);
     selected.cte_sources = scope.cte_sources.clone();
     selected.sources = scope
         .sources
         .iter()
-        .filter(|(name, source)| {
-            // Source keys use the spelling of the actual FROM/JOIN binding.
-            // Folding here can accidentally retain an unused, quoted CTE.
-            source.kind != SourceKind::Cte || aliases.contains(*name)
-        })
+        .filter(|(name, source)| selected_source(name, source, &aliases))
         .map(|(name, source)| (name.clone(), source.clone()))
         .collect();
     selected
@@ -242,8 +279,9 @@ pub struct Scope {
     /// The expression at the root of this scope.
     ///
     /// A set-operation branch that is itself an unmodified set operation (the
-    /// inner levels of `a UNION b UNION c`) stores its operator and clauses with
-    /// NULL placeholders for set-operation operands; those operands are the
+    /// inner levels of `a UNION b UNION c`, including inside the comment wrapper
+    /// the parser adds before a commented set operator) stores its operator and
+    /// clauses with NULL placeholders for set-operation operands; those operands are the
     /// expressions of its own `union_scopes`. Copying them into every level would
     /// make long chains quadratic. Borrow a branch's complete query from its
     /// parent's with [`set_operation_branch_queries`].
@@ -789,6 +827,19 @@ fn is_unmodified_set_operation(expression: &Expression) -> bool {
         Expression::Union(operation) => unmodified!(operation),
         Expression::Intersect(operation) => unmodified!(operation),
         Expression::Except(operation) => unmodified!(operation),
+        // The parser wraps a set-operation operand that precedes a commented
+        // set operator; the wrapper only carries the comments.
+        Expression::Annotated(annotated) => is_unmodified_set_operation(&annotated.this),
+        _ => false,
+    }
+}
+
+/// Whether `operand` is a set operation, possibly inside comment wrappers,
+/// and is therefore the expression of its own branch scope.
+fn is_set_operation_operand(operand: &Expression) -> bool {
+    match operand {
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => true,
+        Expression::Annotated(annotated) => is_set_operation_operand(&annotated.this),
         _ => false,
     }
 }
@@ -796,10 +847,7 @@ fn is_unmodified_set_operation(expression: &Expression) -> bool {
 /// The expression stored on a set-operation branch scope; see [`Scope::expression`].
 fn set_operation_branch_expression(operand: &Expression) -> Expression {
     fn operand_copy(operand: &Expression) -> Expression {
-        if matches!(
-            operand,
-            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-        ) {
+        if is_set_operation_operand(operand) {
             Expression::Null(crate::expressions::Null)
         } else {
             operand.clone()
@@ -835,6 +883,12 @@ fn set_operation_branch_expression(operand: &Expression) -> Expression {
         Expression::Union(operation) => shallow!(Union, operation),
         Expression::Intersect(operation) => shallow!(Intersect, operation),
         Expression::Except(operation) => shallow!(Except, operation),
+        Expression::Annotated(annotated) => {
+            Expression::Annotated(Box::new(crate::expressions::Annotated {
+                this: set_operation_branch_expression(&annotated.this),
+                trailing_comments: annotated.trailing_comments.clone(),
+            }))
+        }
         _ => unreachable!("only set operations are shallow"),
     }
 }
@@ -853,13 +907,13 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Process FROM clause
             if let Some(from) = &select.from {
                 for table in &from.expressions {
-                    add_table_to_scope(table, current_scope);
+                    add_table_to_scope(table, current_scope, true);
                 }
             }
 
             // Process JOINs
             for join in &select.joins {
-                add_table_to_scope(&join.this, current_scope);
+                add_table_to_scope(&join.this, current_scope, true);
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
@@ -982,7 +1036,9 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
         .is_empty()
 }
 
-fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
+/// Register a FROM/JOIN relation as a source of `scope`, building the child
+/// scopes of derived relations when `build_children` is set.
+fn add_table_to_scope(expr: &Expression, scope: &mut Scope, build_children: bool) {
     match expr {
         Expression::Table(table) => {
             let name = table
@@ -1024,15 +1080,18 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             } else {
                 ScopeType::DerivedTable
             };
-            let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            let derived_scope = build_children.then(|| {
+                let mut derived_scope = scope.branch(subquery.this.clone(), scope_type);
+                build_scope_impl(&subquery.this, &mut derived_scope);
+                derived_scope
+            });
 
             if subquery.lateral {
                 scope.add_lateral_source(name, expr.clone(), true);
-                scope.udtf_scopes.push(derived_scope);
+                scope.udtf_scopes.extend(derived_scope);
             } else {
                 scope.add_source(name, expr.clone(), true);
-                scope.derived_table_scopes.push(derived_scope);
+                scope.derived_table_scopes.extend(derived_scope);
             }
         }
         Expression::Values(values) => {
@@ -1057,17 +1116,20 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 .iter()
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>();
-            let mut derived_scope = scope.branch_with_options(
-                alias.this.clone(),
-                ScopeType::DerivedTable,
-                None,
-                None,
-                Some(outer_columns),
-            );
-            build_scope_impl(&alias.this, &mut derived_scope);
+            let derived_scope = build_children.then(|| {
+                let mut derived_scope = scope.branch_with_options(
+                    alias.this.clone(),
+                    ScopeType::DerivedTable,
+                    None,
+                    None,
+                    Some(outer_columns),
+                );
+                build_scope_impl(&alias.this, &mut derived_scope);
+                derived_scope
+            });
 
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
-            scope.derived_table_scopes.push(derived_scope);
+            scope.derived_table_scopes.extend(derived_scope);
         }
         Expression::Lateral(lateral) => {
             let name = lateral
@@ -1086,7 +1148,9 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&pivot.this, scope);
+            if build_children {
+                add_pivot_inner_scope(&pivot.this, scope);
+            }
         }
         Expression::Unpivot(unpivot) => {
             let name = pivot_source_name(
@@ -1097,10 +1161,12 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
                 name,
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&unpivot.this, scope);
+            if build_children {
+                add_pivot_inner_scope(&unpivot.this, scope);
+            }
         }
         Expression::Paren(paren) => {
-            add_table_to_scope(&paren.this, scope);
+            add_table_to_scope(&paren.this, scope, build_children);
         }
         _ => {}
     }
@@ -1926,11 +1992,13 @@ mod tests {
         );
     }
 
-    fn set_operation_chain(branches: usize, operator: &str) -> String {
+    /// A chain whose operators follow `separator`; a line comment there makes
+    /// the parser wrap each left operand in a comment annotation.
+    fn commented_set_operation_chain(branches: usize, operator: &str, separator: &str) -> String {
         (0..branches)
             .map(|i| format!("SELECT {i} AS id, 'open' AS status FROM orders"))
             .collect::<Vec<_>>()
-            .join(&format!(" {operator} "))
+            .join(&format!("{separator}{operator} "))
     }
 
     fn stored_expression_nodes(scope: &Scope) -> usize {
@@ -1954,23 +2022,77 @@ mod tests {
 
     #[test]
     fn long_set_operation_chain_scopes_store_linear_expression_size() {
-        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
-            let short = parse_and_build_scope(&set_operation_chain(100, operator));
-            let long = parse_and_build_scope(&set_operation_chain(400, operator));
-            assert_eq!(set_operation_depth(&short), 99, "{operator}");
-            assert_eq!(set_operation_depth(&long), 399, "{operator}");
-            let ratio =
-                stored_expression_nodes(&long) as f64 / stored_expression_nodes(&short) as f64;
-            assert!(
-                ratio < 4.5,
-                "{operator}: 4x branches stored {ratio:.1}x expression nodes"
-            );
+        // Commented chains nest twice as deep, so they stay within the parser's
+        // default depth guard with fewer branches.
+        for (separator, short_branches) in [(" ", 100), ("\n-- row\n", 50), (" /* row */\n", 50)] {
+            let long_branches = 4 * short_branches;
+            for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+                let short = parse_and_build_scope(&commented_set_operation_chain(
+                    short_branches,
+                    operator,
+                    separator,
+                ));
+                let long = parse_and_build_scope(&commented_set_operation_chain(
+                    long_branches,
+                    operator,
+                    separator,
+                ));
+                assert_eq!(
+                    set_operation_depth(&short),
+                    short_branches - 1,
+                    "{operator} {separator:?}"
+                );
+                assert_eq!(
+                    set_operation_depth(&long),
+                    long_branches - 1,
+                    "{operator} {separator:?}"
+                );
+                let ratio =
+                    stored_expression_nodes(&long) as f64 / stored_expression_nodes(&short) as f64;
+                assert!(
+                    ratio < 4.5,
+                    "{operator} {separator:?}: 4x branches stored {ratio:.1}x expression nodes"
+                );
+            }
         }
     }
 
     #[test]
+    fn commented_set_operation_branches_store_comment_wrapped_shallow_copies() {
+        let sql = commented_set_operation_chain(4, "UNION ALL", "\n-- row\n");
+        let ast = Parser::parse_sql(&sql).expect("Failed to parse SQL");
+        let root = build_scope(&ast[0]);
+        assert_eq!(root.expression, ast[0]);
+
+        let Expression::Union(root_union) = &ast[0] else {
+            panic!("expected a UNION chain");
+        };
+        let Expression::Annotated(wrapped) = &root_union.left else {
+            panic!("expected a comment-wrapped left operand");
+        };
+        let left = &root.union_scopes[0];
+        let Expression::Annotated(stored) = &left.expression else {
+            panic!("expected the branch to keep its comment wrapper");
+        };
+        assert_eq!(stored.trailing_comments, wrapped.trailing_comments);
+        let Expression::Union(stored_union) = &stored.this else {
+            panic!("expected a shallow UNION copy");
+        };
+        assert!(matches!(stored_union.left, Expression::Null(_)));
+        assert!(matches!(stored_union.right, Expression::Select(_)));
+    }
+
+    #[test]
     fn nested_set_operation_branches_resolve_complete_queries_from_parent() {
-        let sql = "SELECT id FROM orders UNION ALL BY NAME SELECT id, status FROM returns EXCEPT SELECT id, status FROM orders INTERSECT SELECT id, status FROM returns";
+        for sql in [
+            "SELECT id FROM orders UNION ALL BY NAME SELECT id, status FROM returns EXCEPT SELECT id, status FROM orders INTERSECT SELECT id, status FROM returns",
+            "SELECT id FROM orders\n-- first\nUNION ALL BY NAME SELECT id, status FROM returns\n-- second\nEXCEPT SELECT id, status FROM orders /* third */\nINTERSECT SELECT id, status FROM returns",
+        ] {
+            check_set_operation_branches(sql);
+        }
+    }
+
+    fn check_set_operation_branches(sql: &str) {
         let ast = Parser::parse_sql(sql).expect("Failed to parse SQL");
         let root = build_scope(&ast[0]);
 
