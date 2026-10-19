@@ -4681,6 +4681,11 @@ impl Parser {
                 }))
             }
         } else if self.match_token(TokenType::LParen) {
+            // A parenthesized query continues into a set operation only where it opens an
+            // enclosing parenthesis, as in `FROM ((SELECT 1) UNION (SELECT 2))`. In
+            // `FROM (SELECT ...) UNION ALL SELECT ...` the set operation combines the outer query.
+            let set_operation_may_follow =
+                self.current < 2 || self.tokens[self.current - 2].token_type == TokenType::LParen;
             // Subquery or parenthesized set operation or (VALUES ...)
             if self.check(TokenType::Values) {
                 // (VALUES (...), (...)) AS t(c1, c2) or (VALUES (0) foo(bar))
@@ -4735,9 +4740,10 @@ impl Parser {
                 // Check for set operations after parenthesized query
                 // If there's a set operation, wrap query in Subquery first to preserve parens
                 // e.g., (SELECT 1) UNION (SELECT 2) - the left operand needs Subquery wrapper
-                let result = if self.check(TokenType::Union)
-                    || self.check(TokenType::Intersect)
-                    || self.check(TokenType::Except)
+                let result = if set_operation_may_follow
+                    && (self.check(TokenType::Union)
+                        || self.check(TokenType::Intersect)
+                        || self.check(TokenType::Except))
                 {
                     let left = Expression::Subquery(Box::new(Subquery {
                         this: query,

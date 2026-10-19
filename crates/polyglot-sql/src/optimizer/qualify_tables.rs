@@ -974,7 +974,7 @@ mod tests {
     fn test_can_disable_set_operation_wrapper_normalization() {
         let options = QualifyTablesOptions::new().with_normalize_set_operation_subqueries(false);
         let expr = parse(
-            "SELECT * FROM (SELECT * FROM tab_1) UNION ALL SELECT * FROM (SELECT * FROM tab_1)",
+            "SELECT * FROM (SELECT * FROM (SELECT * FROM tab_1) UNION ALL SELECT * FROM (SELECT * FROM tab_1))",
         );
         let qualified = qualify_tables(expr, &options);
         let sql = gen(&qualified);
