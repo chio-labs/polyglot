@@ -99,6 +99,34 @@ fn set_operation_after_subquery_operand_applies_to_enclosing_query() {
 }
 
 #[test]
+fn set_operation_after_from_subquery_applies_to_enclosing_query() {
+    let cases = [
+        "SELECT * FROM (SELECT o.id FROM orders AS o) UNION ALL SELECT 1",
+        "SELECT * FROM (SELECT o.id FROM orders AS o) UNION SELECT 1",
+        "SELECT * FROM (SELECT o.id FROM orders AS o) EXCEPT SELECT 1",
+        "SELECT * FROM (SELECT o.id FROM orders AS o) INTERSECT SELECT 1",
+        "SELECT * FROM (SELECT o.id FROM orders AS o) AS t UNION ALL SELECT 1",
+        "SELECT * FROM (WITH c AS (SELECT 1 AS id) SELECT c.id FROM c) UNION ALL SELECT 1",
+        "SELECT * FROM (SELECT o.id FROM orders AS o) UNION ALL SELECT * FROM (SELECT 1 AS id)",
+    ];
+    for dialect in DIALECTS {
+        for sql in cases {
+            let parsed = parse_stable(sql, dialect);
+            let (left, right) = set_operation_operands(&parsed);
+            assert!(
+                matches!(left, Expression::Select(_)) && matches!(right, Expression::Select(_)),
+                "{dialect:?}: {sql}: {parsed:?}"
+            );
+            assert_eq!(
+                set_operation_count(&parsed),
+                1,
+                "{dialect:?}: set operation absorbed by a FROM subquery: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
 fn set_operation_inside_enclosing_parentheses_stays_nested() {
     let cases = [
         "SELECT o.id FROM orders AS o WHERE o.id IN ((SELECT 1) UNION ALL (SELECT 2))",
