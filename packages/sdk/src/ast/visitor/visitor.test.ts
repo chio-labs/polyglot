@@ -953,6 +953,47 @@ describe('Column and Table Renaming', () => {
 // WHERE Clause Manipulation Tests
 // ============================================================================
 
+describe('clause mutation failures', () => {
+  const mutations = [
+    {
+      operation: 'addWhere',
+      amend: (node: Expression) =>
+        addWhere(node, col('amount').gt(lit(0)).toJSON() as Expression),
+    },
+    { operation: 'setLimit', amend: (node: Expression) => setLimit(node, 3) },
+    { operation: 'setOffset', amend: (node: Expression) => setOffset(node, 2) },
+  ];
+
+  it.each(
+    mutations,
+  )('reports deserialization failures from $operation without silently dropping the clause', ({
+    operation,
+    amend,
+  }) => {
+    const arms = Array.from(
+      { length: 80 },
+      (_, value) => `SELECT ${value} AS amount`,
+    );
+    const node = parseFirstWithDialect(
+      `SELECT * FROM (${arms.join(' UNION ALL ')}) q`,
+      Dialect.DuckDB,
+    );
+    const before = structuredClone(node);
+    expect(() => amend(node)).toThrow(
+      new RegExp(`${operation} failed:.*recursion limit`, 'i'),
+    );
+    expect(node).toEqual(before);
+  });
+
+  it.each(mutations)('reports an invalid input AST from $operation', ({
+    operation,
+    amend,
+  }) => {
+    const invalid = makeExpr('not_a_real_expression', {}) as Expression;
+    expect(() => amend(invalid)).toThrow(`${operation} failed:`);
+  });
+});
+
 describe('WHERE Clause Manipulation', () => {
   describe('addWhere()', () => {
     it('should add WHERE clause to query without one', () => {
