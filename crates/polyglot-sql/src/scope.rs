@@ -686,9 +686,7 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
                 .flat_map(|from| &from.expressions)
                 .chain(select.joins.iter().map(|join| &join.this))
             {
-                if let Some(name) = add_table_to_scope(table, current_scope, &preceding_sources) {
-                    preceding_sources.insert(name);
-                }
+                add_relation_to_scope(table, current_scope, &mut preceding_sources);
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
@@ -698,6 +696,10 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
 
             // Process subqueries in WHERE, SELECT expressions, etc.
             collect_subqueries(expression, current_scope);
+        }
+        Expression::JoinedTable(joined) => {
+            let mut preceding_sources = HashSet::new();
+            add_join_group_to_scope(joined, current_scope, &mut preceding_sources);
         }
         Expression::Union(union) => {
             if let Some(with) = &union.with {
@@ -762,6 +764,9 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
         Expression::Paren(paren) => {
             build_scope_impl(&paren.this, current_scope);
         }
+        Expression::Alias(alias) => {
+            build_scope_impl(&alias.this, current_scope);
+        }
         _ => {}
     }
 }
@@ -792,6 +797,45 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
             _ => false,
         })
         .is_empty()
+}
+
+fn add_join_group_to_scope(
+    joined: &crate::expressions::JoinedTable,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+) {
+    add_relation_to_scope(&joined.left, scope, preceding_sources);
+    for join in &joined.joins {
+        add_relation_to_scope(&join.this, scope, preceding_sources);
+        if let Some(condition) = &join.on {
+            collect_subqueries_in_expr(condition, scope);
+        }
+        if let Some(condition) = &join.match_condition {
+            collect_subqueries_in_expr(condition, scope);
+        }
+    }
+    for lateral_view in &joined.lateral_views {
+        add_lateral_view_to_scope(lateral_view, scope);
+    }
+}
+
+/// Unaliased join groups expose each member to following lateral relations.
+fn add_relation_to_scope(
+    expr: &Expression,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+) {
+    match expr {
+        Expression::JoinedTable(joined) if joined.alias.is_none() => {
+            add_join_group_to_scope(joined, scope, preceding_sources);
+        }
+        Expression::Paren(paren) => add_relation_to_scope(&paren.this, scope, preceding_sources),
+        _ => {
+            if let Some(name) = add_table_to_scope(expr, scope, preceding_sources) {
+                preceding_sources.insert(name);
+            }
+        }
+    }
 }
 
 fn add_table_to_scope(
@@ -856,6 +900,14 @@ fn add_table_to_scope(
             scope.derived_table_scopes.push(derived_scope);
             Some(name)
         }
+        Expression::JoinedTable(joined) => {
+            let alias = joined.alias.as_ref()?;
+            let mut derived_scope = scope.branch(expr.clone(), ScopeType::DerivedTable);
+            build_scope_impl(expr, &mut derived_scope);
+            scope.add_source(alias.name.clone(), expr.clone(), true);
+            scope.derived_table_scopes.push(derived_scope);
+            Some(alias.name.clone())
+        }
         Expression::Unnest(unnest) => {
             if let Some(alias) = &unnest.alias {
                 scope.add_virtual_source(alias.name.clone(), expr.clone());
@@ -875,7 +927,10 @@ fn add_table_to_scope(
             scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
             Some(alias.alias.name.clone())
         }
-        Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
+        Expression::Alias(alias)
+            if is_query_like_relation(&alias.this)
+                || matches!(scope_query(&alias.this), Expression::JoinedTable(_)) =>
+        {
             let outer_columns = alias
                 .column_aliases
                 .iter()
@@ -1407,6 +1462,42 @@ mod tests {
     fn parse_and_build_scope(sql: &str) -> Scope {
         let ast = Parser::parse_sql(sql).expect("Failed to parse SQL");
         build_scope(&ast[0])
+    }
+
+    #[test]
+    fn unaliased_join_members_are_visible_to_following_lateral_relations() {
+        let scope = parse_and_build_scope(
+            "SELECT d.id FROM alpha a JOIN (beta b JOIN gamma c ON b.id = c.id) \
+             ON a.id = b.id CROSS JOIN LATERAL (SELECT c.id) AS d",
+        );
+        assert!(scope.sources.contains_key("a"));
+        assert!(scope.sources.contains_key("b"));
+        assert!(scope.sources.contains_key("c"));
+        let lateral = scope.derived_table_scopes.last().expect("lateral scope");
+        assert!(lateral.is_lateral);
+        assert_eq!(
+            lateral
+                .lateral_sources
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["a", "b", "c"]),
+        );
+    }
+
+    #[test]
+    fn aliased_join_group_hides_member_bindings_from_its_parent() {
+        let scope = parse_and_build_scope(
+            "SELECT grouped.id FROM (beta b JOIN gamma c ON b.id = c.id) AS grouped",
+        );
+        assert_eq!(scope.sources.len(), 1);
+        assert!(scope.sources.contains_key("grouped"));
+        let group = scope
+            .derived_table_scopes
+            .first()
+            .expect("join group scope");
+        assert!(group.sources.contains_key("b"));
+        assert!(group.sources.contains_key("c"));
     }
 
     #[test]

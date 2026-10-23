@@ -596,15 +596,23 @@ impl Collector<'_> {
 }
 
 fn query_boundary(expression: &Expression) -> bool {
-    matches!(
-        expression,
-        Expression::Select(_)
-            | Expression::Union(_)
-            | Expression::Intersect(_)
-            | Expression::Except(_)
-            | Expression::Cte(_)
-            | Expression::Subquery(_)
-    )
+    match expression {
+        Expression::JoinedTable(joined) => joined.alias.is_some(),
+        Expression::Alias(alias) => {
+            matches!(scope_query(&alias.this), Expression::JoinedTable(_))
+                || query_boundary(&alias.this)
+        }
+        Expression::Paren(paren) => query_boundary(&paren.this),
+        _ => matches!(
+            expression,
+            Expression::Select(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_)
+                | Expression::Cte(_)
+                | Expression::Subquery(_)
+        ),
+    }
 }
 
 fn append_path(prefix: &str, segments: &[ChildPathSegment]) -> String {
