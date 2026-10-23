@@ -5,6 +5,24 @@ use polyglot_sql::expressions::{
 use polyglot_sql::{ComplexityGuardOptions, TranspileOptions};
 
 #[test]
+fn clickhouse_operand_not_respects_parser_depth_limits() {
+    use polyglot_sql::{parse_one_with_options, ParseOptions};
+
+    let sql = format!("SELECT {}0", "1 + NOT ".repeat(16));
+    let options = |limit| ParseOptions {
+        complexity_guard: Some(ComplexityGuardOptions {
+            max_parser_depth: Some(limit),
+            ..Default::default()
+        }),
+    };
+    let error = parse_one_with_options(&sql, DialectType::ClickHouse, &options(8))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("E_GUARD_PARSER_DEPTH_EXCEEDED"), "{error}");
+    assert!(parse_one_with_options(&sql, DialectType::ClickHouse, &options(128)).is_ok());
+}
+
+#[test]
 fn parse_and_validation_share_per_call_guard_options() {
     use polyglot_sql::{
         parse_one_with_options, parse_with_options, validate_with_options, ParseOptions,

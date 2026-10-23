@@ -233,15 +233,27 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
             });
             for constraint in &mut ct.constraints {
                 if let crate::expressions::TableConstraint::PrimaryKey {
-                    columns, modifiers, ..
+                    columns,
+                    key_parts,
+                    modifiers,
+                    ..
                 } = constraint
                 {
-                    // Strip ASC/DESC from column names
-                    for col in columns.iter_mut() {
-                        if col.name.ends_with(" ASC") {
-                            col.name = col.name[..col.name.len() - 4].to_string();
-                        } else if col.name.ends_with(" DESC") {
-                            col.name = col.name[..col.name.len() - 5].to_string();
+                    if key_parts.is_empty() {
+                        // Older ASTs encoded order modifiers in column names.
+                        for col in columns.iter_mut() {
+                            if col.name.ends_with(" ASC") {
+                                col.name = col.name[..col.name.len() - 4].to_string();
+                            } else if col.name.ends_with(" DESC") {
+                                col.name = col.name[..col.name.len() - 5].to_string();
+                            }
+                        }
+                    } else {
+                        // Structured key names are literal; only remove the
+                        // sort modifiers, including for names ending in DESC.
+                        for part in key_parts.iter_mut() {
+                            part.asc = false;
+                            part.desc = false;
                         }
                     }
                     // Strip TSQL-specific modifiers

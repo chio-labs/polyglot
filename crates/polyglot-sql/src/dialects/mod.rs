@@ -947,6 +947,8 @@ where
             | Expression::BitwiseAnd(_)
             | Expression::BitwiseOr(_)
             | Expression::BitwiseXor(_)
+            | Expression::BitwiseLeftShift(_)
+            | Expression::BitwiseRightShift(_)
             | Expression::Is(_)
             | Expression::MemberOf(_)
             | Expression::ArrayContainsAll(_)
@@ -2110,6 +2112,8 @@ where
         Expression::BitwiseAnd(op) => transform_binary!(BitwiseAnd, *op),
         Expression::BitwiseOr(op) => transform_binary!(BitwiseOr, *op),
         Expression::BitwiseXor(op) => transform_binary!(BitwiseXor, *op),
+        Expression::BitwiseLeftShift(op) => transform_binary!(BitwiseLeftShift, *op),
+        Expression::BitwiseRightShift(op) => transform_binary!(BitwiseRightShift, *op),
         Expression::Is(op) => transform_binary!(Is, *op),
 
         // ===== TryCast / SafeCast =====
@@ -9201,6 +9205,7 @@ impl Dialect {
                 cross_apply: None,
                 ordinality: None,
                 column_aliases: vec![],
+                column_aliases_quoted: vec![],
             }));
 
             // Remove the original join and add to FROM expressions

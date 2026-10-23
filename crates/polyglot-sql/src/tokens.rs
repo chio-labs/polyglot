@@ -3015,6 +3015,14 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         Ok(())
     }
 
+    fn starts_numeric_exponent(&self) -> bool {
+        if !matches!(self.peek(), 'e' | 'E') {
+            return false;
+        }
+        let digits = self.current + 1 + usize::from(matches!(self.peek_next(), '+' | '-'));
+        digits < self.size && self.char_at(digits).is_ascii_digit()
+    }
+
     fn scan_number(&mut self) -> Result<()> {
         // Check for 0x/0X hex number prefix (SQLite-style)
         if self.config.hex_number_strings && self.peek() == '0' && !self.is_at_end() {
@@ -3162,7 +3170,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         }
 
         // Look for exponent
-        if self.peek() == 'e' || self.peek() == 'E' {
+        if self.starts_numeric_exponent() {
             self.advance();
             if self.peek() == '+' || self.peek() == '-' {
                 self.advance();
@@ -3304,7 +3312,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         }
 
         // Look for exponent
-        if self.peek() == 'e' || self.peek() == 'E' {
+        if self.starts_numeric_exponent() {
             self.advance();
             if self.peek() == '+' || self.peek() == '-' {
                 self.advance();

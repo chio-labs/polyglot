@@ -572,6 +572,7 @@ pub struct Parser {
     /// an if-expression. Without this the retry is repeated on every path that reaches
     /// the position, and a chain of `IF`s costs 2^k.
     if_expr_ruled_out: HashSet<usize>,
+    parsing_duckdb_json_path: bool,
     recursion: Arc<ParserRecursion>,
 }
 
@@ -701,6 +702,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -718,6 +720,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -738,6 +741,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -761,6 +765,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: Some(token_guard_stats),
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -4720,7 +4725,9 @@ impl Parser {
                     && !self.check(TokenType::Order)
                     && !self.check(TokenType::Limit)
                     && !self.check(TokenType::Semicolon)
-                    && (self.check(TokenType::Identifier) || self.check(TokenType::Var))
+                    && (self.check(TokenType::Identifier)
+                        || self.check(TokenType::Var)
+                        || self.check(TokenType::QuotedIdentifier))
                 {
                     Some(self.expect_identifier_or_keyword_with_quoted()?)
                 } else {
@@ -4730,10 +4737,13 @@ impl Parser {
                 let alias = alias_ident.map(|id| id.name);
 
                 // Parse column aliases: (col1, col2, ...)
+                let mut column_aliases_quoted = Vec::new();
                 let column_aliases = if alias.is_some() && self.match_token(TokenType::LParen) {
                     let mut cols = Vec::new();
                     loop {
-                        cols.push(self.expect_identifier_or_keyword()?);
+                        let column = self.expect_identifier_or_keyword_with_quoted()?;
+                        column_aliases_quoted.push(column.quoted);
+                        cols.push(column.name);
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -4743,6 +4753,9 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
+                if !column_aliases_quoted.iter().any(|quoted| *quoted) {
+                    column_aliases_quoted.clear();
+                }
 
                 Expression::Lateral(Box::new(Lateral {
                     this: Box::new(func_expr),
@@ -4753,6 +4766,7 @@ impl Parser {
                     cross_apply: None,
                     ordinality,
                     column_aliases,
+                    column_aliases_quoted,
                 }))
             }
         } else if self.match_token(TokenType::LParen) {
@@ -19412,6 +19426,7 @@ impl Parser {
             } else {
                 name.clone()
             };
+            let mut key_parts = Vec::new();
             // ClickHouse: PRIMARY KEY col without parens — parse single column
             let (columns, timeseries_columns) = if matches!(
                 self.config.dialect,
@@ -19459,11 +19474,29 @@ impl Parser {
                     }
                     cols
                 } else {
-                    self.parse_index_identifier_list()?
+                    let (columns, parts) = self.parse_constraint_index_columns()?;
+                    key_parts = parts;
+                    columns
                 };
                 self.expect(TokenType::RParen)?;
                 (cols, timeseries_columns)
             };
+            // Special dialect paths above also produce literal identifiers.
+            // Mark quoted keys explicitly so legacy suffix decoding cannot
+            // reinterpret their names (including Databricks TIMESERIES keys).
+            if key_parts.is_empty() && columns.iter().any(|column| column.quoted) {
+                key_parts = columns
+                    .iter()
+                    .map(|column| IndexKeyPart {
+                        expression: Box::new(Expression::Identifier(column.clone())),
+                        prefix_length: None,
+                        desc: false,
+                        asc: false,
+                        nulls_first: None,
+                        opclass: None,
+                    })
+                    .collect();
+            }
             // Parse optional INCLUDE (columns)
             let include_columns = if self.match_identifier("INCLUDE") {
                 self.expect(TokenType::LParen)?;
@@ -19480,6 +19513,7 @@ impl Parser {
             Ok(TableConstraint::PrimaryKey {
                 name: actual_name.or(name),
                 columns,
+                key_parts,
                 timeseries_columns,
                 include_columns,
                 modifiers,
@@ -19532,7 +19566,7 @@ impl Parser {
                     let parts = self.parse_mysql_index_key_parts()?;
                     Self::split_mysql_table_index_key_parts(parts)
                 } else {
-                    (self.parse_index_identifier_list()?, Vec::new())
+                    self.parse_constraint_index_columns()?
                 };
                 self.expect(TokenType::RParen)?;
                 let mut modifiers = self.parse_constraint_modifiers();
@@ -19555,6 +19589,7 @@ impl Parser {
                     Ok(TableConstraint::Unique {
                         name: actual_name.or(name),
                         columns,
+                        key_parts,
                         columns_parenthesized: true,
                         modifiers,
                         has_constraint_keyword,
@@ -19570,6 +19605,7 @@ impl Parser {
                 Ok(TableConstraint::Unique {
                     name: actual_name.or(name),
                     columns: vec![Identifier::new(col_name)],
+                    key_parts: Vec::new(),
                     columns_parenthesized: false,
                     modifiers,
                     has_constraint_keyword,
@@ -30317,16 +30353,19 @@ impl Parser {
     /// Assignment (:=) has lower precedence than OR, matching Python sqlglot's
     /// _parse_expression -> _parse_assignment -> _parse_disjunction chain
     fn parse_expression(&mut self) -> Result<Expression> {
-        self.with_recursive_stack(|parser| parser.parse_expression_inner())
+        let outer_path = std::mem::take(&mut self.parsing_duckdb_json_path);
+        let result = self.with_recursive_stack(|parser| parser.parse_expression_inner());
+        self.parsing_duckdb_json_path = outer_path;
+        result
     }
 
     fn parse_expression_inner(&mut self) -> Result<Expression> {
-        let mut left = self.parse_or()?;
+        let mut left = self.parse_duckdb_json_arrow()?;
 
         // Handle := assignment operator (MySQL @var := val, DuckDB named args/settings)
         // This has lower precedence than OR
         while self.match_token(TokenType::ColonEq) {
-            let right = self.parse_or()?;
+            let right = self.parse_duckdb_json_arrow()?;
             left = Expression::PropertyEQ(Box::new(BinaryOp::new(left, right)));
         }
 
@@ -30379,6 +30418,47 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    // DuckDB's -> binds below boolean and arithmetic operators. Other dialects
+    // retain their postfix arrows, and ->> keeps its distinct native precedence.
+    fn parse_duckdb_json_arrow(&mut self) -> Result<Expression> {
+        let expression_start = self.current;
+        let mut expression = self.parse_or()?;
+        if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+            while self.match_token(TokenType::Arrow) {
+                let outer_path = std::mem::replace(&mut self.parsing_duckdb_json_path, true);
+                let path = self.parse_or();
+                self.parsing_duckdb_json_path = outer_path;
+                expression = Expression::JsonExtract(Box::new(JsonExtractFunc {
+                    options: None,
+                    source_dialect: None,
+                    this: expression,
+                    path: path?,
+                    returning: None,
+                    arrow_syntax: true,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                }));
+                if self.check(TokenType::DArrow) {
+                    // A mixed chain continues on the extracted document, rather
+                    // than becoming a scalar extraction inside the path.
+                    expression = self.parse_duckdb_concat_tail(expression)?;
+                    expression = self.parse_shift_tail(expression, expression_start)?;
+                    expression = self.parse_bitwise_and_tail(expression)?;
+                    expression = self.parse_bitwise_xor_tail(expression)?;
+                    expression = self.parse_bitwise_or_tail(expression)?;
+                    expression = self.parse_comparison_tail(expression, Vec::new())?;
+                    expression = self.parse_and_tail(expression)?;
+                    expression = self.parse_xor_tail(expression)?;
+                    expression = self.parse_or_tail(expression)?;
+                }
+            }
+        }
+        Ok(expression)
     }
 
     /// Parse OR expressions
@@ -30624,12 +30704,7 @@ impl Parser {
 
     /// Parse NOT expressions
     fn parse_not(&mut self) -> Result<Expression> {
-        if !self.check(TokenType::Not)
-            || matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::ClickHouse)
-            )
-        {
+        if !self.check(TokenType::Not) {
             return self.parse_comparison();
         }
 
@@ -30651,6 +30726,7 @@ impl Parser {
                 self.config.dialect,
                 Some(crate::dialects::DialectType::TSQL)
                     | Some(crate::dialects::DialectType::Fabric)
+                    | Some(crate::dialects::DialectType::ClickHouse)
             );
             if matches!(expr, Expression::Like(_) | Expression::ILike(_))
                 && !preserve_typed_not_like
@@ -31785,8 +31861,57 @@ impl Parser {
     /// Parse bitwise OR expressions (|)
     #[inline(always)]
     fn parse_bitwise_or(&mut self) -> Result<Expression> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::PostgreSQL)
+        ) {
+            return self.parse_bitwise_same_precedence();
+        }
         let left = self.parse_bitwise_xor()?;
         self.parse_bitwise_or_tail(left)
+    }
+
+    /// SQLite's &, |, <<, >> and PostgreSQL's additional # operator share
+    /// one left-associative tier, below arithmetic. PostgreSQL's ^ remains
+    /// exponentiation and is consumed by parse_power.
+    fn parse_bitwise_same_precedence(&mut self) -> Result<Expression> {
+        let expr_start = self.current;
+        let mut left = self.parse_addition()?;
+        loop {
+            let token = self.peek().token_type;
+            if !matches!(
+                token,
+                TokenType::Pipe | TokenType::Amp | TokenType::LtLt | TokenType::GtGt
+            ) && !(token == TokenType::Hash
+                && self.config.dialect == Some(crate::dialects::DialectType::PostgreSQL))
+            {
+                return Ok(left);
+            }
+            self.skip();
+
+            // Preserve the PostgreSQL extension operator <<=> raw fallback.
+            if token == TokenType::LtLt
+                && self.config.dialect == Some(crate::dialects::DialectType::PostgreSQL)
+                && self.match_token(TokenType::DArrow)
+            {
+                let _ = self.parse_addition()?;
+                left = Expression::Raw(Raw {
+                    sql: self.tokens_to_sql(expr_start, self.current),
+                });
+                continue;
+            }
+
+            let right = self.parse_addition()?;
+            let op = Box::new(BinaryOp::new(left, right));
+            left = match token {
+                TokenType::Pipe => Expression::BitwiseOr(op),
+                TokenType::Amp => Expression::BitwiseAnd(op),
+                TokenType::Hash => Expression::BitwiseXor(op),
+                TokenType::LtLt => Expression::BitwiseLeftShift(op),
+                TokenType::GtGt => Expression::BitwiseRightShift(op),
+                _ => unreachable!("bitwise operator was checked above"),
+            };
+        }
     }
 
     #[inline(never)]
@@ -31810,7 +31935,8 @@ impl Parser {
         // Then work up through addition, shift, bitwise AND/XOR/OR
         let mult_result = self.parse_multiplication_continuation(left)?;
         let add_result = self.parse_addition_continuation(mult_result)?;
-        self.parse_bitwise_or_continuation(add_result)
+        let concat_result = self.parse_duckdb_concat_tail(add_result)?;
+        self.parse_bitwise_or_continuation(concat_result)
     }
 
     /// Parse bitwise OR with an existing left expression
@@ -31900,7 +32026,10 @@ impl Parser {
                     trailing_comments,
                     inferred_type: None,
                 }))
-            } else if !self.dpipe_is_logical_or() && self.match_token(TokenType::DPipe) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && !self.dpipe_is_logical_or()
+                && self.match_token(TokenType::DPipe)
+            {
                 let operator_comments = self.previous_trailing_comments().to_vec();
                 let right = self.parse_at_time_zone()?;
                 let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -31981,7 +32110,7 @@ impl Parser {
     #[inline(always)]
     fn parse_shift(&mut self) -> Result<Expression> {
         let expr_start = self.current;
-        let left = self.parse_addition()?;
+        let left = self.parse_duckdb_concat()?;
         self.parse_shift_tail(left, expr_start)
     }
 
@@ -31994,17 +32123,67 @@ impl Parser {
                     Some(crate::dialects::DialectType::PostgreSQL)
                 ) && self.match_token(TokenType::DArrow)
                 {
-                    let _ = self.parse_addition()?;
+                    let _ = self.parse_duckdb_concat()?;
                     left = Expression::Raw(Raw {
                         sql: self.tokens_to_sql(expr_start, self.current),
                     });
                     continue;
                 }
-                let right = self.parse_addition()?;
+                let right = self.parse_duckdb_concat()?;
                 left = Expression::BitwiseLeftShift(Box::new(BinaryOp::new(left, right)));
             } else if self.match_token(TokenType::GtGt) {
-                let right = self.parse_addition()?;
+                let right = self.parse_duckdb_concat()?;
                 left = Expression::BitwiseRightShift(Box::new(BinaryOp::new(left, right)));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_duckdb_concat(&mut self) -> Result<Expression> {
+        let left = self.parse_addition()?;
+        self.parse_duckdb_concat_tail(left)
+    }
+
+    // ->> shares DuckDB's concatenation precedence, below arithmetic but above
+    // comparisons. It intentionally differs from the low-precedence -> operator.
+    fn parse_duckdb_concat_tail(&mut self, mut left: Expression) -> Result<Expression> {
+        if self.config.dialect != Some(crate::dialects::DialectType::DuckDB) {
+            return Ok(left);
+        }
+        loop {
+            if self.parsing_duckdb_json_path && self.check(TokenType::DArrow) {
+                return Ok(left);
+            }
+            if self.match_token(TokenType::DArrow) {
+                let path = self.parse_addition()?;
+                left = Expression::JsonExtractScalar(Box::new(JsonExtractFunc {
+                    options: None,
+                    source_dialect: None,
+                    this: left,
+                    path,
+                    returning: None,
+                    arrow_syntax: true,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                }));
+            } else if self.check(TokenType::DPipe) {
+                let left_comments = self.previous_trailing_comments().to_vec();
+                self.skip();
+                let operator_comments = self.previous_trailing_comments().to_vec();
+                let right = self.parse_addition()?;
+                let trailing_comments = self.previous_trailing_comments().to_vec();
+                left = Expression::Concat(Box::new(BinaryOp {
+                    left,
+                    right,
+                    left_comments,
+                    operator_comments,
+                    trailing_comments,
+                    inferred_type: None,
+                }));
             } else {
                 return Ok(left);
             }
@@ -32049,7 +32228,10 @@ impl Parser {
                     trailing_comments,
                     inferred_type: None,
                 }))
-            } else if !self.dpipe_is_logical_or() && self.match_token(TokenType::DPipe) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && !self.dpipe_is_logical_or()
+                && self.match_token(TokenType::DPipe)
+            {
                 let operator_comments = self.previous_trailing_comments().to_vec();
                 let right = self.parse_at_time_zone()?;
                 let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -32120,21 +32302,79 @@ impl Parser {
     /// Parse multiplication/division
     #[inline(always)]
     fn parse_multiplication(&mut self) -> Result<Expression> {
-        let left = self.parse_power()?;
+        let left = self.parse_multiplicative_operand()?;
         self.parse_multiplication_tail(left)
+    }
+
+    #[inline(always)]
+    fn parse_multiplicative_operand(&mut self) -> Result<Expression> {
+        if self.config.dialect == Some(crate::dialects::DialectType::SQLite) {
+            self.parse_sqlite_concat()
+        } else {
+            self.parse_power()
+        }
+    }
+
+    /// SQLite's concatenation and JSON arrows share a left-associative tier
+    /// above multiplication and below unary operators and COLLATE.
+    #[inline(never)]
+    fn parse_sqlite_concat(&mut self) -> Result<Expression> {
+        let mut left = self.parse_power()?;
+        loop {
+            let left_comments = self.previous_trailing_comments().to_vec();
+            if self.match_token(TokenType::DPipe) {
+                let operator_comments = self.previous_trailing_comments().to_vec();
+                let right = self.parse_power()?;
+                let trailing_comments = self.previous_trailing_comments().to_vec();
+                left = Expression::Concat(Box::new(BinaryOp {
+                    left,
+                    right,
+                    left_comments,
+                    operator_comments,
+                    trailing_comments,
+                    inferred_type: None,
+                }));
+            } else if self.check(TokenType::Arrow) || self.check(TokenType::DArrow) {
+                let scalar = self.match_token(TokenType::DArrow);
+                if !scalar {
+                    self.skip();
+                }
+                let path = self.parse_power()?;
+                let extract = Box::new(JsonExtractFunc {
+                    this: left,
+                    path,
+                    arrow_syntax: true,
+                    source_dialect: None,
+                    options: None,
+                    returning: None,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                });
+                left = if scalar {
+                    Expression::JsonExtractScalar(extract)
+                } else {
+                    Expression::JsonExtract(extract)
+                };
+            } else {
+                return Ok(left);
+            }
+        }
     }
 
     #[inline(never)]
     fn parse_multiplication_tail(&mut self, mut left: Expression) -> Result<Expression> {
         loop {
             let expr = if self.match_token(TokenType::Star) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Slash) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Div(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Percent) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Mod(Box::new(BinaryOp::new(left, right)))
             } else if !self.check(TokenType::QuotedIdentifier)
                 && (self.match_identifier("MOD") || self.match_token(TokenType::Mod))
@@ -32444,9 +32684,7 @@ impl Parser {
                     | TokenType::Tilde
                     | TokenType::DPipeSlash
                     | TokenType::PipeSlash
-            ) && !(token == TokenType::Not
-                && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse))
-            {
+            ) {
                 break;
             }
             let _scope = self.enter_parser_depth(prefixes.len() + 1)?;
@@ -32482,6 +32720,14 @@ impl Parser {
 
     #[inline(never)]
     fn parse_unary_operand(&mut self) -> Result<Expression> {
+        // ClickHouse also permits NOT where an arithmetic/comparison operand is
+        // expected. It still binds below comparisons: 1 + NOT a = b means
+        // 1 + (NOT (a = b)), so do not collect it as a high-precedence prefix.
+        if self.check(TokenType::Not)
+            && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+        {
+            return self.with_parser_depth(|parser| parser.parse_not_prefixes());
+        }
         // IF cannot be a type literal or a low-precedence prefix operator. Keep
         // its recursive descent out of the large special-operator frame.
         if self.check(TokenType::If) {
@@ -33389,7 +33635,9 @@ impl Parser {
         if self.check(TokenType::RParen) {
             self.skip(); // consume )
                          // Check for lambda: () -> body
-            if self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow) {
+            if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && (self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow))
+            {
                 let body = self.parse_expression()?;
                 return Ok(Expression::Lambda(Box::new(LambdaExpr {
                     parameters: Vec::new(),
@@ -33490,6 +33738,7 @@ impl Parser {
                 }
             }
             if is_tuple_lambda
+                && self.config.dialect != Some(crate::dialects::DialectType::SQLite)
                 && param_count >= 1
                 && look < self.tokens.len()
                 && self.tokens[look].token_type == TokenType::Arrow
@@ -33773,7 +34022,9 @@ impl Parser {
 
             self.expect(TokenType::RParen)?;
 
-            if self.match_token(TokenType::Arrow) {
+            if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && self.match_token(TokenType::Arrow)
+            {
                 let expression_count = expressions.len();
                 let parameters: Vec<Identifier> = expressions
                     .into_iter()
@@ -33861,7 +34112,11 @@ impl Parser {
         let mut paren_comments = lparen_comments.clone();
         paren_comments.extend_from_slice(self.previous_trailing_comments());
 
-        if self.match_token(TokenType::Arrow) {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+        ) && self.match_token(TokenType::Arrow)
+        {
             let parameters = if let Expression::Column(c) = first_expr {
                 vec![c.name]
             } else if let Expression::Identifier(id) = first_expr {
@@ -34176,7 +34431,7 @@ impl Parser {
                 let args = if self.check(TokenType::RParen) {
                     Vec::new()
                 } else {
-                    self.parse_function_arguments()?
+                    self.parse_method_arguments_for(&col_ident.name)?
                 };
                 self.expect(TokenType::RParen)?;
                 let this = Self::parsed_column(Column {
@@ -34221,6 +34476,8 @@ impl Parser {
                 self.config.dialect,
                 Some(crate::dialects::DialectType::PostgreSQL)
                     | Some(crate::dialects::DialectType::Redshift)
+                    | Some(crate::dialects::DialectType::SQLite)
+                    | Some(crate::dialects::DialectType::DuckDB)
             )
             && !self
                 .peek_nth(1)
@@ -35565,6 +35822,8 @@ impl Parser {
                             trailing_comments: Vec::new(),
                             span: None,
                         })
+                    } else if let Some(lambda) = self.parse_function_lambda()? {
+                        lambda
                     } else {
                         self.parse_expression()?
                     };
@@ -36279,7 +36538,7 @@ impl Parser {
                     let args = if self.check(TokenType::RParen) {
                         Vec::new()
                     } else {
-                        self.parse_expression_list()?
+                        self.parse_method_arguments_for(&col_ident.name)?
                     };
                     self.expect(TokenType::RParen)?;
                     let method_call = self.parse_method_call_expression(
@@ -41180,7 +41439,7 @@ impl Parser {
                     .unwrap_or(false)
             {
                 // Parse *COLUMNS(...) as a function argument
-                (self.parse_function_arguments()?, false)
+                (self.parse_function_arguments_for(Some(name))?, false)
             } else {
                 // Regular star: parse star modifiers like EXCLUDE/EXCEPT/REPLACE/RENAME
                 // e.g., COLUMNS(* EXCLUDE (empid, dept))
@@ -41189,7 +41448,7 @@ impl Parser {
                 let mut args = vec![Expression::Star(star)];
                 // ClickHouse: func(*, col1, col2) — star followed by more args
                 if self.match_token(TokenType::Comma) {
-                    let rest = self.parse_function_arguments()?;
+                    let rest = self.parse_function_arguments_for(Some(name))?;
                     args.extend(rest);
                 }
                 (args, false)
@@ -41201,12 +41460,12 @@ impl Parser {
             // DISTINCT as aggregate modifier: func(DISTINCT expr)
             // Not when followed by comma or rparen — then DISTINCT is used as an identifier value
             self.skip(); // consume DISTINCT
-            (self.parse_function_arguments()?, true)
+            (self.parse_function_arguments_for(Some(name))?, true)
         } else if is_known_agg && self.match_token(TokenType::All) {
             // ALL is the default quantifier, just consume it
-            (self.parse_function_arguments()?, false)
+            (self.parse_function_arguments_for(Some(name))?, false)
         } else {
-            (self.parse_function_arguments()?, false)
+            (self.parse_function_arguments_for(Some(name))?, false)
         };
 
         // For known aggregate functions, check for IGNORE NULLS, ORDER BY, LIMIT inside parens
@@ -41497,7 +41756,11 @@ impl Parser {
                     self.current = saved_pos;
                     self.parse_expression()?
                 }
-            } else if self.match_token(TokenType::Arrow) {
+            } else if !matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+            ) && self.match_token(TokenType::Arrow)
+            {
                 let body = self.parse_expression()?;
                 Expression::Lambda(Box::new(LambdaExpr {
                     parameters: vec![Self::identifier_from_token(ident_token, quoted)],
@@ -41608,6 +41871,63 @@ impl Parser {
     /// Parse function arguments, handling named arguments (name => value, name := value)
     /// and TABLE/MODEL prefixed arguments (BigQuery)
     fn parse_function_arguments(&mut self) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_for(None)
+    }
+
+    fn parse_function_arguments_for(&mut self, function: Option<&str>) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_in_context(function, false)
+    }
+
+    fn parse_method_arguments_for(&mut self, method: &str) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_in_context(Some(method), true)
+    }
+
+    fn lambda_argument(mut expression: &Expression) -> Option<&LambdaExpr> {
+        while let Expression::Paren(paren) = expression {
+            expression = &paren.this;
+        }
+        match expression {
+            Expression::Lambda(lambda) => Some(lambda),
+            _ => None,
+        }
+    }
+
+    fn parse_function_arguments_in_context(
+        &mut self,
+        function: Option<&str>,
+        receiver: bool,
+    ) -> Result<Vec<Expression>> {
+        // DuckDB uses -> for both JSON paths and function lambdas. A dot call
+        // can supply the list as its receiver instead of its first argument.
+        let lambda_index = if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+            function.and_then(|name| {
+                if name.eq_ignore_ascii_case("COLUMNS") {
+                    Some(0)
+                } else if [
+                    "APPLY",
+                    "ARRAY_APPLY",
+                    "ARRAY_FILTER",
+                    "ARRAY_REDUCE",
+                    "ARRAY_TRANSFORM",
+                    "FILTER",
+                    "LIST_APPLY",
+                    "LIST_FILTER",
+                    "LIST_REDUCE",
+                    "LIST_TRANSFORM",
+                    "REDUCE",
+                ]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let start = self.current;
         let mut args = Vec::new();
 
         loop {
@@ -41639,7 +41959,22 @@ impl Parser {
                 continue;
             }
 
-            args.push(self.parse_single_function_argument()?);
+            let receiver_reduction = receiver
+                && args
+                    .first()
+                    .and_then(Self::lambda_argument)
+                    .is_some_and(|lambda| lambda.parameters.len() > 1);
+            let lambda = if (lambda_index == Some(args.len()) && !receiver_reduction)
+                || (receiver && lambda_index == Some(1) && args.is_empty())
+            {
+                self.parse_function_lambda()?
+            } else {
+                None
+            };
+            args.push(match lambda {
+                Some(lambda) => lambda,
+                None => self.parse_single_function_argument()?,
+            });
 
             if !self.match_token(TokenType::Comma) {
                 break;
@@ -41675,6 +42010,17 @@ impl Parser {
                     break;
                 }
             }
+        }
+
+        // In schema.fn(json -> path, x -> body), the first arrow is JSON.
+        // Reparse without a receiver once the second argument proves that form.
+        if receiver
+            && lambda_index == Some(1)
+            && args.first().and_then(Self::lambda_argument).is_some()
+            && args.get(1).and_then(Self::lambda_argument).is_some()
+        {
+            self.current = start;
+            return self.parse_function_arguments_for(function);
         }
 
         Ok(args)
@@ -42489,7 +42835,7 @@ impl Parser {
                         let args = if self.check(TokenType::RParen) {
                             Vec::new()
                         } else {
-                            self.parse_function_arguments()?
+                            self.parse_method_arguments_for(&ident.name)?
                         };
                         self.expect(TokenType::RParen)?;
                         // Create a method call expression (DotAccess with function call)
@@ -42728,7 +43074,11 @@ impl Parser {
             } else if self.check(TokenType::Arrow)
                 && !matches!(
                     self.config.dialect,
-                    Some(crate::dialects::DialectType::ClickHouse)
+                    Some(
+                        crate::dialects::DialectType::ClickHouse
+                            | crate::dialects::DialectType::SQLite
+                            | crate::dialects::DialectType::DuckDB
+                    )
                 )
             {
                 self.skip(); // consume ->
@@ -42749,7 +43099,11 @@ impl Parser {
                     on_scalar_string: false,
                     on_error: None,
                 }));
-            } else if self.match_token(TokenType::DArrow) {
+            } else if !matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+            ) && self.match_token(TokenType::DArrow)
+            {
                 // JSON extract text operator: expr ->> path (PostgreSQL, MySQL, DuckDB)
                 // Use parse_json_path_operand to get only the immediate operand for proper left-to-right associativity
                 let path = self.parse_json_path_operand()?;
@@ -43936,14 +44290,21 @@ impl Parser {
         })))
     }
 
+    /// Parse a cast operand without consuming its AS/type separator. A cast
+    /// starts a nested expression context even when it occurs inside a JSON
+    /// path, so its arrows must not continue the surrounding extraction chain.
+    fn parse_cast_operand(&mut self) -> Result<Expression> {
+        let outer_path = std::mem::take(&mut self.parsing_duckdb_json_path);
+        let result = self.with_recursive_stack(|parser| parser.parse_duckdb_json_arrow());
+        self.parsing_duckdb_json_path = outer_path;
+        result
+    }
+
     /// Parse CAST expression
     fn parse_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::Cast)?;
         self.expect(TokenType::LParen)?;
-        // Use parse_or() instead of parse_expression() to avoid consuming AS
-        // as an alias (e.g. CAST((1, 2) AS Tuple(a Int8, b Int16)))
-        // Python sqlglot uses _parse_disjunction() here, which is equivalent.
-        let expr = self.parse_or()?;
+        let expr = self.parse_cast_operand()?;
 
         // ClickHouse: ternary operator inside CAST: CAST(cond ? true_val : false_val AS Type)
         let expr = if matches!(
@@ -44113,7 +44474,7 @@ impl Parser {
     fn parse_try_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::TryCast)?;
         self.expect(TokenType::LParen)?;
-        let expr = self.parse_or()?;
+        let expr = self.parse_cast_operand()?;
         self.expect(TokenType::As)?;
         let data_type = self.parse_data_type()?;
 
@@ -44142,7 +44503,7 @@ impl Parser {
     fn parse_safe_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::SafeCast)?;
         self.expect(TokenType::LParen)?;
-        let expr = self.parse_or()?;
+        let expr = self.parse_cast_operand()?;
         self.expect(TokenType::As)?;
         let data_type = self.parse_data_type()?;
 
@@ -49579,10 +49940,11 @@ impl Parser {
         Ok(identifiers)
     }
 
-    /// Parse a comma-separated list of identifiers for index columns.
-    /// Supports MySQL prefix lengths: col(16) and sort order: col DESC
-    fn parse_index_identifier_list(&mut self) -> Result<Vec<Identifier>> {
+    /// Keep literal constraint column names separate from prefix/order syntax.
+    /// Simple unquoted keys retain their established identifier-only JSON shape.
+    fn parse_constraint_index_columns(&mut self) -> Result<(Vec<Identifier>, Vec<IndexKeyPart>)> {
         let mut identifiers = Vec::new();
+        let mut key_parts = Vec::new();
 
         loop {
             let start = self.peek().span;
@@ -49590,36 +49952,47 @@ impl Parser {
             let name = self.expect_identifier_or_safe_keyword()?;
             let trailing_comments = self.previous_trailing_comments().to_vec();
 
-            // Check for prefix length: col(16)
-            let mut display_name = name.clone();
-            if self.match_token(TokenType::LParen) {
-                if self.check(TokenType::Number) {
-                    let len = self.advance_text()?;
-                    display_name = format!("{}({})", name, len);
-                }
-                self.expect(TokenType::RParen)?;
-            }
-
-            // Check for DESC/ASC sort order
-            if self.match_token(TokenType::Desc) {
-                display_name = format!("{} DESC", display_name);
-            } else if self.match_token(TokenType::Asc) {
-                display_name = format!("{} ASC", display_name);
-            }
-
-            identifiers.push(Identifier {
-                name: display_name,
+            let identifier = Identifier {
+                name,
                 quoted,
                 trailing_comments,
                 span: Some(start.through(self.previous().span)),
+            };
+            let prefix_length = if self.match_token(TokenType::LParen) {
+                if !self.check(TokenType::Number) {
+                    return Err(self.parse_error("Expected a numeric index prefix length"));
+                }
+                let length = self.advance_text()?;
+                self.expect(TokenType::RParen)?;
+                Some(length)
+            } else {
+                None
+            };
+            let desc = self.match_token(TokenType::Desc);
+            let asc = !desc && self.match_token(TokenType::Asc);
+            key_parts.push(IndexKeyPart {
+                expression: Box::new(Expression::Identifier(identifier.clone())),
+                prefix_length,
+                desc,
+                asc,
+                nulls_first: None,
+                opclass: None,
             });
+            identifiers.push(identifier);
 
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
 
-        Ok(identifiers)
+        if !identifiers.iter().any(|column| column.quoted)
+            && key_parts
+                .iter()
+                .all(|part| part.prefix_length.is_none() && !part.desc && !part.asc)
+        {
+            key_parts.clear();
+        }
+        Ok((identifiers, key_parts))
     }
 
     /// Parse MySQL index key parts.
@@ -56638,6 +57011,34 @@ impl Parser {
         Ok(None)
     }
 
+    fn parse_function_lambda(&mut self) -> Result<Option<Expression>> {
+        let start = self.current;
+        let mut parentheses: Vec<Vec<String>> = Vec::new();
+        let mut depths = Vec::new();
+        loop {
+            if let Some(mut expression) = self.parse_lambda()? {
+                for mut comments in parentheses.into_iter().rev() {
+                    if !self.match_token(TokenType::RParen) {
+                        self.current = start;
+                        return Ok(None);
+                    }
+                    comments.extend_from_slice(self.previous_trailing_comments());
+                    expression = Expression::Paren(Box::new(Paren {
+                        this: expression,
+                        trailing_comments: comments,
+                    }));
+                }
+                return Ok(Some(expression));
+            }
+            if !self.match_token(TokenType::LParen) {
+                self.current = start;
+                return Ok(None);
+            }
+            depths.push(self.enter_parser_depth(1)?);
+            parentheses.push(self.previous_trailing_comments().to_vec());
+        }
+    }
+
     /// parse_lambda - Ported from Python _parse_lambda
     /// Parses lambda expressions: x -> x + 1 or (x, y) -> x + y
     /// Also supports DuckDB syntax: LAMBDA x : x + 1
@@ -56687,41 +57088,24 @@ impl Parser {
             }))));
         }
 
-        // Try to parse lambda parameters
-        let parameters = if self.match_token(TokenType::LParen) {
-            // Parenthesized parameters: (x, y) -> ...
-            let mut params = Vec::new();
-            if !self.check(TokenType::RParen) {
-                loop {
-                    if let Some(ident) = self.parse_identifier()? {
-                        if let Expression::Identifier(id) = ident {
-                            params.push(id);
-                        }
-                    }
-                    if !self.match_token(TokenType::Comma) {
-                        break;
-                    }
-                }
-            }
-            if !self.match_token(TokenType::RParen) {
-                // Not a lambda, retreat
+        let parenthesized = self.match_token(TokenType::LParen);
+        let mut parameters = Vec::new();
+        while !(parenthesized && self.check(TokenType::RParen)) {
+            if !self.is_identifier_token() {
                 self.current = start_index;
                 return Ok(None);
             }
-            params
-        } else {
-            // Single parameter: x -> ...
-            if let Some(ident) = self.parse_identifier()? {
-                if let Expression::Identifier(id) = ident {
-                    vec![id]
-                } else {
-                    self.current = start_index;
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
+            let token = self.advance()?;
+            let quoted = token.token_type == TokenType::QuotedIdentifier;
+            parameters.push(Self::identifier_from_token(token, quoted));
+            if !parenthesized || !self.match_token(TokenType::Comma) {
+                break;
             }
-        };
+        }
+        if parenthesized && !self.match_token(TokenType::RParen) {
+            self.current = start_index;
+            return Ok(None);
+        }
 
         // Check for arrow operator
         if self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow) {
@@ -56778,22 +57162,28 @@ impl Parser {
 
         // Parse optional alias
         let alias = if self.match_token(TokenType::As) {
-            Some(self.expect_identifier()?)
-        } else if self.check(TokenType::Identifier) && !self.check_keyword() {
-            Some(self.expect_identifier()?)
+            Some(self.expect_identifier_or_keyword_with_quoted()?)
+        } else if (self.check(TokenType::Identifier) && !self.check_keyword())
+            || self.check(TokenType::QuotedIdentifier)
+        {
+            Some(self.expect_identifier_or_keyword_with_quoted()?)
         } else {
             None
         };
+        let alias_quoted = alias.as_ref().is_some_and(|alias| alias.quoted);
+        let alias = alias.map(|alias| alias.name);
 
         // Parse optional column aliases: AS alias(col1, col2, ...)
+        let mut column_aliases_quoted = Vec::new();
         let column_aliases = if alias.is_some() && self.match_token(TokenType::LParen) {
             let mut cols = Vec::new();
             loop {
                 if self.check(TokenType::RParen) {
                     break;
                 }
-                let col = self.expect_identifier()?;
-                cols.push(col);
+                let column = self.expect_identifier_or_keyword_with_quoted()?;
+                column_aliases_quoted.push(column.quoted);
+                cols.push(column.name);
                 if !self.match_token(TokenType::Comma) {
                     break;
                 }
@@ -56803,6 +57193,9 @@ impl Parser {
         } else {
             Vec::new()
         };
+        if !column_aliases_quoted.iter().any(|quoted| *quoted) {
+            column_aliases_quoted.clear();
+        }
 
         Ok(Some(Expression::Lateral(Box::new(Lateral {
             this: Box::new(this),
@@ -56821,10 +57214,11 @@ impl Parser {
                 None
             },
             alias,
-            alias_quoted: false,
+            alias_quoted,
             cross_apply: None,
             ordinality: None,
             column_aliases,
+            column_aliases_quoted,
         }))))
     }
 
@@ -62895,7 +63289,11 @@ impl Parser {
         if self.match_text_seq(&["COLUMNS"]) && self.check(TokenType::LParen) {
             // Parse the COLUMNS function arguments
             self.expect(TokenType::LParen)?;
-            let this = self.parse_expression()?;
+            let this = if let Some(lambda) = self.parse_function_lambda()? {
+                lambda
+            } else {
+                self.parse_expression()?
+            };
             self.expect(TokenType::RParen)?;
 
             // Return a Columns expression with unpack=true (since it came from * COLUMNS())
@@ -67407,6 +67805,228 @@ mod tests {
         let select = result[0].as_select().unwrap();
         // Should parse as 1 + (2 * 3) due to precedence
         assert!(matches!(select.expressions[0], Expression::Add(_)));
+    }
+
+    #[test]
+    fn test_sqlite_concat_precedence() {
+        use crate::DialectType;
+        use Expression::{Add, BitwiseAnd, Concat, Div, Mod, Mul, Sub};
+
+        fn binary(
+            kind: fn(Box<BinaryOp>) -> Expression,
+            l: Expression,
+            r: Expression,
+        ) -> Expression {
+            kind(Box::new(BinaryOp::new(l, r)))
+        }
+        let n = Expression::number;
+        let cases = [
+            ("1 || 2 * 3", binary(Mul, binary(Concat, n(1), n(2)), n(3))),
+            ("1 * 2 || 3", binary(Mul, n(1), binary(Concat, n(2), n(3)))),
+            ("1 + 2 || 3", binary(Add, n(1), binary(Concat, n(2), n(3)))),
+            ("1 || 2 + 3", binary(Add, binary(Concat, n(1), n(2)), n(3))),
+            ("1 - 2 || 3", binary(Sub, n(1), binary(Concat, n(2), n(3)))),
+            (
+                "12 || 3 / 3",
+                binary(Div, binary(Concat, n(12), n(3)), n(3)),
+            ),
+            ("1 || 2 % 5", binary(Mod, binary(Concat, n(1), n(2)), n(5))),
+            (
+                "1 || 2 & 4",
+                binary(BitwiseAnd, binary(Concat, n(1), n(2)), n(4)),
+            ),
+            (
+                "1 || 2 || 3 * 4",
+                binary(Mul, binary(Concat, binary(Concat, n(1), n(2)), n(3)), n(4)),
+            ),
+            (
+                "-1 || 2 * 3",
+                binary(
+                    Mul,
+                    binary(Concat, Expression::Neg(Box::new(UnaryOp::new(n(1)))), n(2)),
+                    n(3),
+                ),
+            ),
+        ];
+        for (sql, expected) in cases {
+            let parsed = crate::parse_one(&format!("SELECT {sql}"), DialectType::SQLite).unwrap();
+            assert_eq!(
+                parsed.as_select().unwrap().expressions[0],
+                expected,
+                "{sql}"
+            );
+        }
+
+        let parsed =
+            crate::parse_one("SELECT 1 || 2 COLLATE NOCASE * 3", DialectType::SQLite).unwrap();
+        let Expression::Mul(mul) = &parsed.as_select().unwrap().expressions[0] else {
+            panic!("expected multiplication")
+        };
+        let Expression::Concat(concat) = &mul.left else {
+            panic!("expected concatenation")
+        };
+        assert!(matches!(&concat.right, Expression::Collation(c) if c.this == n(2)));
+
+        // Dialects with lower-precedence concatenation retain their parsing.
+        for dialect in [DialectType::PostgreSQL, DialectType::DuckDB] {
+            let parsed = crate::parse_one("SELECT 1 || 2 * 3", dialect).unwrap();
+            assert_eq!(
+                parsed.as_select().unwrap().expressions[0],
+                binary(Concat, n(1), binary(Mul, n(2), n(3)))
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqlite_concat_json_precedence() {
+        use crate::DialectType;
+        for sql in [
+            "SELECT '[' || 1 || ']' ->> 0",
+            "SELECT '[' || 1 || ']' -> 0 ->> 0",
+        ] {
+            let parsed = crate::parse_one(sql, DialectType::SQLite).unwrap();
+            let Expression::JsonExtractScalar(extract) =
+                &parsed.as_select().unwrap().expressions[0]
+            else {
+                panic!("expected JSON extraction: {sql}")
+            };
+            let document = if let Expression::JsonExtract(inner) = &extract.this {
+                &inner.this
+            } else {
+                &extract.this
+            };
+            assert!(matches!(document, Expression::Concat(_)), "{sql}");
+            assert_eq!(extract.path, Expression::number(0));
+        }
+        for sql in [
+            "SELECT j -> i || 'x'",
+            "SELECT (j) -> i || 'x'",
+            "SELECT '[1]' ->> 0 || 'x'",
+        ] {
+            let parsed = crate::parse_one(sql, DialectType::SQLite).unwrap();
+            let Expression::Concat(concat) = &parsed.as_select().unwrap().expressions[0] else {
+                panic!("expected concatenation: {sql}")
+            };
+            assert!(
+                matches!(
+                    &concat.left,
+                    Expression::JsonExtract(_) | Expression::JsonExtractScalar(_)
+                ),
+                "{sql}"
+            );
+        }
+        let parsed =
+            crate::parse_one("SELECT ('[' || 1 || ']') -> 0", DialectType::SQLite).unwrap();
+        assert!(
+            matches!(&parsed.as_select().unwrap().expressions[0], Expression::JsonExtract(f) if matches!(&f.this, Expression::Paren(_)))
+        );
+        let parsed = crate::parse_one("SELECT ABS(j -> i || 'x')", DialectType::SQLite).unwrap();
+        let Expression::Abs(abs) = &parsed.as_select().unwrap().expressions[0] else {
+            panic!("expected ABS");
+        };
+        assert!(
+            matches!(&abs.this, Expression::Concat(c) if matches!(&c.left, Expression::JsonExtract(_)))
+        );
+    }
+
+    #[test]
+    fn test_bitwise_precedence_sqlite_and_postgres() {
+        use crate::DialectType;
+        use Expression::{BitwiseAnd, BitwiseLeftShift, BitwiseOr, BitwiseRightShift};
+
+        fn binary(
+            kind: fn(Box<BinaryOp>) -> Expression,
+            left: Expression,
+            right: Expression,
+        ) -> Expression {
+            kind(Box::new(BinaryOp::new(left, right)))
+        }
+        let n = Expression::number;
+        let cases = [
+            (
+                "1 | 2 & 4",
+                binary(BitwiseAnd, binary(BitwiseOr, n(1), n(2)), n(4)),
+            ),
+            (
+                "1 | 2 << 1",
+                binary(BitwiseLeftShift, binary(BitwiseOr, n(1), n(2)), n(1)),
+            ),
+            (
+                "8 | 1 >> 1",
+                binary(BitwiseRightShift, binary(BitwiseOr, n(8), n(1)), n(1)),
+            ),
+            (
+                "8 & 3 << 1",
+                binary(BitwiseLeftShift, binary(BitwiseAnd, n(8), n(3)), n(1)),
+            ),
+            (
+                "8 >> 1 & 3",
+                binary(BitwiseAnd, binary(BitwiseRightShift, n(8), n(1)), n(3)),
+            ),
+            (
+                "1 | 2 & 4 << 1",
+                binary(
+                    BitwiseLeftShift,
+                    binary(BitwiseAnd, binary(BitwiseOr, n(1), n(2)), n(4)),
+                    n(1),
+                ),
+            ),
+            (
+                "1 + 2 | 4 * 3",
+                binary(
+                    BitwiseOr,
+                    binary(Expression::Add, n(1), n(2)),
+                    binary(Expression::Mul, n(4), n(3)),
+                ),
+            ),
+        ];
+        for dialect in [DialectType::SQLite, DialectType::PostgreSQL] {
+            for (sql, expected) in &cases {
+                let tokens = Tokenizer::default()
+                    .tokenize(&format!("SELECT {sql}"))
+                    .unwrap();
+                let result = Parser::with_config(
+                    tokens,
+                    ParserConfig {
+                        dialect: Some(dialect),
+                        ..Default::default()
+                    },
+                )
+                .parse()
+                .unwrap();
+                assert_eq!(
+                    &result[0].as_select().unwrap().expressions[0],
+                    expected,
+                    "{dialect:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitwise_precedence_postgres_xor_and_power() {
+        let tokens = Tokenizer::default()
+            .tokenize("SELECT 1 | 2 # 3, 1 # 2 & 4, 1 | 2 ^ 3")
+            .unwrap();
+        let result = Parser::with_config(
+            tokens,
+            ParserConfig {
+                dialect: Some(crate::DialectType::PostgreSQL),
+                ..Default::default()
+            },
+        )
+        .parse()
+        .unwrap();
+        let expressions = &result[0].as_select().unwrap().expressions;
+        assert!(
+            matches!(&expressions[0], Expression::BitwiseXor(op) if matches!(&op.left, Expression::BitwiseOr(_)))
+        );
+        assert!(
+            matches!(&expressions[1], Expression::BitwiseAnd(op) if matches!(&op.left, Expression::BitwiseXor(_)))
+        );
+        assert!(
+            matches!(&expressions[2], Expression::BitwiseOr(op) if matches!(&op.right, Expression::Power(_)))
+        );
     }
 
     #[test]

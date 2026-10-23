@@ -147,22 +147,65 @@ enum InfixOperator {
     Or,
     Xor,
     And,
+    Comparison,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAnd,
+    BitwiseLeftShift,
+    BitwiseRightShift,
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    Concat,
+    JsonExtract,
 }
 
 impl InfixOperator {
-    fn precedence(self) -> u8 {
+    fn precedence(self, dialect: Option<DialectType>) -> u8 {
+        if self.is_bitwise() {
+            match dialect {
+                Some(DialectType::SQLite | DialectType::PostgreSQL | DialectType::DuckDB) => {
+                    return 5;
+                }
+                // TSQL's bitwise operators share the additive tier.
+                Some(DialectType::TSQL | DialectType::Fabric) => return 9,
+                // MySQL's XOR binds more tightly than multiplication.
+                Some(DialectType::MySQL) if self == Self::BitwiseXor => return 11,
+                _ => {}
+            }
+        }
         match self {
             Self::Or => 1,
             Self::Xor => 2,
             Self::And => 3,
-            Self::Add | Self::Sub => 4,
-            Self::Mul | Self::Div | Self::Mod => 5,
+            Self::Comparison => 4,
+            Self::BitwiseOr => 5,
+            Self::BitwiseXor => 6,
+            Self::BitwiseAnd => 7,
+            Self::BitwiseLeftShift | Self::BitwiseRightShift => 8,
+            Self::Add | Self::Sub => 9,
+            Self::Mul | Self::Div | Self::Mod => 10,
+            Self::Concat => match dialect {
+                Some(DialectType::SQLite) => 11,
+                Some(DialectType::PostgreSQL | DialectType::DuckDB) => 5,
+                _ => 9,
+            },
+            // Only SQLite arrows participate in this precedence table.
+            Self::JsonExtract => 11,
         }
+    }
+
+    fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            Self::BitwiseOr
+                | Self::BitwiseXor
+                | Self::BitwiseAnd
+                | Self::BitwiseLeftShift
+                | Self::BitwiseRightShift
+        )
     }
 
     fn is_arithmetic(self) -> bool {
@@ -3400,7 +3443,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "<<")
+                    self.generate_precedence_binary_op(op, "<<", InfixOperator::BitwiseLeftShift)
                 }
             }
             Expression::BitwiseRightShift(op) => {
@@ -3427,7 +3470,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, ">>")
+                    self.generate_precedence_binary_op(op, ">>", InfixOperator::BitwiseRightShift)
                 }
             }
             Expression::BitwiseAndAgg(f) => self.generate_agg_func("BIT_AND", f),
@@ -3517,12 +3560,24 @@ impl Generator {
                     self.generate_precedence_binary_op(op, "%", InfixOperator::Mod)
                 }
             }
-            Expression::Eq(op) => self.generate_binary_op(op, "="),
-            Expression::Neq(op) => self.generate_binary_op(op, "<>"),
-            Expression::Lt(op) => self.generate_binary_op(op, "<"),
-            Expression::Lte(op) => self.generate_binary_op(op, "<="),
-            Expression::Gt(op) => self.generate_binary_op(op, ">"),
-            Expression::Gte(op) => self.generate_binary_op(op, ">="),
+            Expression::Eq(op) => {
+                self.generate_precedence_binary_op(op, "=", InfixOperator::Comparison)
+            }
+            Expression::Neq(op) => {
+                self.generate_precedence_binary_op(op, "<>", InfixOperator::Comparison)
+            }
+            Expression::Lt(op) => {
+                self.generate_precedence_binary_op(op, "<", InfixOperator::Comparison)
+            }
+            Expression::Lte(op) => {
+                self.generate_precedence_binary_op(op, "<=", InfixOperator::Comparison)
+            }
+            Expression::Gt(op) => {
+                self.generate_precedence_binary_op(op, ">", InfixOperator::Comparison)
+            }
+            Expression::Gte(op) => {
+                self.generate_precedence_binary_op(op, ">=", InfixOperator::Comparison)
+            }
             Expression::Like(op) => self.generate_like_op(op, "LIKE"),
             Expression::ILike(op) => self.generate_like_op(op, "ILIKE"),
             Expression::Match(op) => self.generate_binary_op(op, "MATCH"),
@@ -3533,7 +3588,7 @@ impl Generator {
                 } else if self.config.dialect == Some(DialectType::MySQL) {
                     self.generate_mysql_concat_from_concat(op)
                 } else {
-                    self.generate_binary_op(op, "||")
+                    self.generate_precedence_binary_op(op, "||", InfixOperator::Concat)
                 }
             }
             Expression::BitwiseAnd(op) => {
@@ -3550,7 +3605,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "&")
+                    self.generate_precedence_binary_op(op, "&", InfixOperator::BitwiseAnd)
                 }
             }
             Expression::BitwiseOr(op) => {
@@ -3567,7 +3622,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "|")
+                    self.generate_precedence_binary_op(op, "|", InfixOperator::BitwiseOr)
                 }
             }
             Expression::BitwiseXor(op) => {
@@ -3584,9 +3639,9 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else if matches!(self.config.dialect, Some(DialectType::PostgreSQL)) {
-                    self.generate_binary_op(op, "#")
+                    self.generate_precedence_binary_op(op, "#", InfixOperator::BitwiseXor)
                 } else {
-                    self.generate_binary_op(op, "^")
+                    self.generate_precedence_binary_op(op, "^", InfixOperator::BitwiseXor)
                 }
             }
             Expression::Adjacent(op) => self.generate_binary_op(op, "-|-"),
@@ -9240,9 +9295,20 @@ impl Generator {
             Some(crate::dialects::DialectType::SQLite)
         ) {
             for constraint in &ct.constraints {
-                if let TableConstraint::PrimaryKey { columns, name, .. } = constraint {
+                if let TableConstraint::PrimaryKey {
+                    columns,
+                    key_parts,
+                    name,
+                    ..
+                } = constraint
+                {
                     // Only inline if: single column, no constraint name, and column exists in table
-                    if columns.len() == 1 && name.is_none() {
+                    if columns.len() == 1
+                        && name.is_none()
+                        && key_parts
+                            .iter()
+                            .all(|part| part.prefix_length.is_none() && !part.desc && !part.asc)
+                    {
                         let pk_col_name = columns[0].name.to_ascii_lowercase();
                         // Check if this column exists in the table
                         if ct
@@ -10729,6 +10795,7 @@ impl Generator {
             TableConstraint::PrimaryKey {
                 name,
                 columns,
+                key_parts,
                 timeseries_columns,
                 include_columns,
                 modifiers,
@@ -10756,18 +10823,7 @@ impl Generator {
                     }
                 }
                 self.write(" (");
-                for (i, col) in columns.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_identifier(col)?;
-                    if matches!(self.config.dialect, Some(DialectType::Databricks))
-                        && timeseries_columns.iter().any(|candidate| candidate == col)
-                    {
-                        self.write_space();
-                        self.write_keyword("TIMESERIES");
-                    }
-                }
+                self.generate_constraint_index_columns(columns, key_parts, timeseries_columns)?;
                 self.write(")");
                 if !include_columns.is_empty() {
                     self.write_space();
@@ -10786,6 +10842,7 @@ impl Generator {
             TableConstraint::Unique {
                 name,
                 columns,
+                key_parts,
                 columns_parenthesized,
                 modifiers,
                 has_constraint_keyword,
@@ -10818,12 +10875,7 @@ impl Generator {
                 }
                 if *columns_parenthesized {
                     self.write(" (");
-                    for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.generate_identifier(col)?;
-                    }
+                    self.generate_constraint_index_columns(columns, key_parts, &[])?;
                     self.write(")");
                 } else {
                     // UNIQUE without parentheses (e.g., UNIQUE idx_name)
@@ -12664,6 +12716,42 @@ impl Generator {
             self.write(on_fg);
         }
 
+        Ok(())
+    }
+
+    fn generate_constraint_index_columns(
+        &mut self,
+        columns: &[Identifier],
+        key_parts: &[IndexKeyPart],
+        timeseries_columns: &[Identifier],
+    ) -> Result<()> {
+        let count = if key_parts.is_empty() {
+            columns.len()
+        } else {
+            key_parts.len()
+        };
+        for i in 0..count {
+            if i > 0 {
+                self.write(", ");
+            }
+            let column = if let Some(part) = key_parts.get(i) {
+                self.generate_index_key_parts(std::slice::from_ref(part))?;
+                match part.expression.as_ref() {
+                    Expression::Identifier(column) => Some(column),
+                    _ => None,
+                }
+            } else {
+                // Legacy ASTs stored prefix/order syntax in the identifier text.
+                self.generate_index_identifier(&columns[i])?;
+                Some(&columns[i])
+            };
+            if self.config.dialect == Some(DialectType::Databricks)
+                && column.is_some_and(|column| timeseries_columns.contains(column))
+            {
+                self.write_space();
+                self.write_keyword("TIMESERIES");
+            }
+        }
         Ok(())
     }
 
@@ -17145,6 +17233,18 @@ impl Generator {
     }
 
     fn generate_identifier(&mut self, id: &Identifier) -> Result<()> {
+        self.generate_identifier_with_index_suffix(id, false)
+    }
+
+    fn generate_index_identifier(&mut self, id: &Identifier) -> Result<()> {
+        self.generate_identifier_with_index_suffix(id, true)
+    }
+
+    fn generate_identifier_with_index_suffix(
+        &mut self,
+        id: &Identifier,
+        index_suffix: bool,
+    ) -> Result<()> {
         use crate::dialects::DialectType;
 
         let name = &id.name;
@@ -17191,7 +17291,7 @@ impl Generator {
 
         // Check for MySQL index column prefix length: name(16) or name(16) ASC/DESC
         // When quoted, we need to output `name`(16) not `name(16)`
-        let (base_name, suffix) = if needs_quoting {
+        let (base_name, suffix) = if index_suffix && needs_quoting {
             // Try to extract prefix length from identifier: name(number) or name(number) ASC/DESC
             if let Some(paren_pos) = name.find('(') {
                 let base = &name[..paren_pos];
@@ -24887,13 +24987,13 @@ impl Generator {
 
         if use_arrow {
             // Output arrow syntax: expr -> path or expr ->> path
-            self.generate_expression(&f.this)?;
+            self.generate_json_arrow_operand(&f.this, OperandSide::Left)?;
             if name == "JSON_EXTRACT_SCALAR" || name == "JSON_EXTRACT_PATH_TEXT" {
                 self.write(" ->> ");
             } else {
                 self.write(" -> ");
             }
-            self.generate_expression(&f.path)?;
+            self.generate_json_arrow_operand(&f.path, OperandSide::Right)?;
             return Ok(());
         }
 
@@ -24997,6 +25097,28 @@ impl Generator {
         }
 
         self.write(")");
+        Ok(())
+    }
+
+    fn generate_json_arrow_operand(
+        &mut self,
+        expression: &Expression,
+        side: OperandSide,
+    ) -> Result<()> {
+        if self.config.dialect == Some(DialectType::SQLite) {
+            return self.generate_infix_operand(InfixOperator::JsonExtract, expression, side);
+        }
+        // Arrow precedence varies by dialect. Explicitly retain a concatenated
+        // document or path when leaving SQLite's shared operator tier.
+        let wrap =
+            Self::infix_operator(self.config.dialect, expression) == Some(InfixOperator::Concat);
+        if wrap {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if wrap {
+            self.write(")");
+        }
         Ok(())
     }
 
@@ -25723,6 +25845,23 @@ impl Generator {
         Ok(())
     }
 
+    fn is_low_precedence_json_arrow(dialect: Option<DialectType>, expression: &Expression) -> bool {
+        dialect == Some(DialectType::DuckDB)
+            && matches!(expression, Expression::JsonExtract(f) | Expression::JsonExtractScalar(f) if f.arrow_syntax)
+    }
+
+    fn generate_duckdb_json_arrow_operand(&mut self, expression: &Expression) -> Result<()> {
+        let wrap = Self::is_low_precedence_json_arrow(self.config.dialect, expression);
+        if wrap {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if wrap {
+            self.write(")");
+        }
+        Ok(())
+    }
+
     fn generate_binary_op(&mut self, op: &BinaryOp, operator: &str) -> Result<()> {
         self.generate_binary_op_with_precedence(op, operator, None)
     }
@@ -25742,14 +25881,15 @@ impl Generator {
         operator: &str,
         infix_operator: Option<InfixOperator>,
     ) -> Result<()> {
-        let wrap_left = infix_operator.is_some_and(|parent| {
-            Self::infix_operand_needs_parentheses(
-                self.config.dialect,
-                parent,
-                &op.left,
-                OperandSide::Left,
-            )
-        });
+        let wrap_left = Self::is_low_precedence_json_arrow(self.config.dialect, &op.left)
+            || infix_operator.is_some_and(|parent| {
+                Self::infix_operand_needs_parentheses(
+                    self.config.dialect,
+                    parent,
+                    &op.left,
+                    OperandSide::Left,
+                )
+            });
         if wrap_left {
             self.write("(");
         }
@@ -25776,6 +25916,9 @@ impl Generator {
                         self.write_formatted_comment(comment);
                     }
                 }
+            }
+            Expression::Concat(inner_op) if self.config.dialect == Some(DialectType::MySQL) => {
+                self.generate_mysql_concat_from_concat(inner_op)?;
             }
             Expression::Add(inner_op)
             | Expression::Sub(inner_op)
@@ -25825,14 +25968,15 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         self.write_space();
-        let wrap_right = infix_operator.is_some_and(|parent| {
-            Self::infix_operand_needs_parentheses(
-                self.config.dialect,
-                parent,
-                &op.right,
-                OperandSide::Right,
-            )
-        });
+        let wrap_right = Self::is_low_precedence_json_arrow(self.config.dialect, &op.right)
+            || infix_operator.is_some_and(|parent| {
+                Self::infix_operand_needs_parentheses(
+                    self.config.dialect,
+                    parent,
+                    &op.right,
+                    OperandSide::Right,
+                )
+            });
         if wrap_right {
             self.write("(");
         }
@@ -25944,7 +26088,30 @@ impl Generator {
         dialect: Option<DialectType>,
         expression: &Expression,
     ) -> Option<InfixOperator> {
+        // These dialects render bitwise nodes as function calls, which are atomic.
+        if matches!(dialect, Some(DialectType::Presto | DialectType::Trino))
+            && matches!(
+                expression,
+                Expression::BitwiseAnd(_)
+                    | Expression::BitwiseOr(_)
+                    | Expression::BitwiseXor(_)
+                    | Expression::BitwiseLeftShift(_)
+                    | Expression::BitwiseRightShift(_)
+            )
+        {
+            return None;
+        }
         match expression {
+            Expression::Concat(_) | Expression::DPipe(_) => match dialect {
+                Some(DialectType::MySQL) => None,
+                Some(DialectType::Solr) => Some(InfixOperator::Or),
+                _ => Some(InfixOperator::Concat),
+            },
+            Expression::JsonExtract(f) | Expression::JsonExtractScalar(f)
+                if dialect == Some(DialectType::SQLite) && f.arrow_syntax =>
+            {
+                Some(InfixOperator::JsonExtract)
+            }
             // `MOD(x, y)` lowered to `x % y` binds like the infix operator, so as an
             // operand it needs the same parentheses (`2 * MOD(5, 3)` -> `2 * (5 % 3)`).
             Expression::ModFunc(_) if Self::mod_func_uses_percent_for(dialect) => {
@@ -25969,6 +26136,19 @@ impl Generator {
             Expression::Or(_) => Some(InfixOperator::Or),
             Expression::Xor(_) => Some(InfixOperator::Xor),
             Expression::And(_) => Some(InfixOperator::And),
+            Expression::BitwiseAnd(_) => Some(InfixOperator::BitwiseAnd),
+            Expression::BitwiseOr(_) => Some(InfixOperator::BitwiseOr),
+            Expression::BitwiseXor(_) => Some(InfixOperator::BitwiseXor),
+            Expression::BitwiseLeftShift(_)
+                if !matches!(dialect, Some(DialectType::Spark | DialectType::Databricks)) =>
+            {
+                Some(InfixOperator::BitwiseLeftShift)
+            }
+            Expression::BitwiseRightShift(_)
+                if !matches!(dialect, Some(DialectType::Spark | DialectType::Databricks)) =>
+            {
+                Some(InfixOperator::BitwiseRightShift)
+            }
             Expression::Add(_) => Some(InfixOperator::Add),
             Expression::Sub(_) => Some(InfixOperator::Sub),
             Expression::Mul(_) => Some(InfixOperator::Mul),
@@ -25995,7 +26175,10 @@ impl Generator {
                 },
                 Some(InfixOperator::Mod),
             ),
-            Expression::Concat(_) => ("||", None),
+            Expression::Concat(_) if self.config.dialect == Some(DialectType::Solr) => {
+                ("OR", Some(InfixOperator::Or))
+            }
+            Expression::Concat(_) => ("||", Some(InfixOperator::Concat)),
             _ => unreachable!("nested binary expression variant was checked by the caller"),
         }
     }
@@ -26008,6 +26191,28 @@ impl Generator {
     ) -> bool {
         if matches!(child, Expression::Paren(_)) {
             return false;
+        }
+
+        // Outside SQLite, keep arrow operands of concatenation explicit rather
+        // than assuming the two operators share SQLite's precedence.
+        if parent == InfixOperator::Concat
+            && dialect != Some(DialectType::SQLite)
+            && matches!(child, Expression::JsonExtract(f) | Expression::JsonExtractScalar(f) if f.arrow_syntax)
+        {
+            return true;
+        }
+
+        // Prefix NOT binds below comparisons; transformed function operands may
+        // contain it without the explicit parentheses a SQL parser would retain.
+        if matches!(child, Expression::Not(_))
+            && (parent == InfixOperator::Comparison || parent.is_arithmetic())
+        {
+            return true;
+        }
+
+        // DuckDB JSON -> binds below comparison and boolean operators.
+        if Self::is_low_precedence_json_arrow(dialect, child) {
+            return true;
         }
 
         // Bitwise precedence differs between dialects. Group these operands
@@ -26029,17 +26234,52 @@ impl Generator {
             return false;
         };
 
-        match child_operator.precedence().cmp(&parent.precedence()) {
+        if parent == InfixOperator::Concat
+            && child_operator == InfixOperator::Concat
+            && matches!(side, OperandSide::Right)
+        {
+            // Concatenation is associative, but flattening its right subtree
+            // must not capture the document of a same-tier JSON extraction:
+            // a || (b ->> p || c) is not a || b ->> p || c in SQLite.
+            let mut first = child;
+            loop {
+                first = match first {
+                    Expression::Concat(op) => &op.left,
+                    Expression::DPipe(op) => &op.this,
+                    _ => break,
+                };
+            }
+            if Self::infix_operator(dialect, first)
+                .is_some_and(|op| op.precedence(dialect) == parent.precedence(dialect))
+            {
+                return true;
+            }
+        }
+
+        match child_operator
+            .precedence(dialect)
+            .cmp(&parent.precedence(dialect))
+        {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Greater => false,
             std::cmp::Ordering::Equal => {
                 matches!(side, OperandSide::Right)
-                    && parent.is_arithmetic()
-                    && child_operator.is_arithmetic()
+                    && ((parent.is_arithmetic() && child_operator.is_arithmetic())
+                        || parent.is_bitwise()
+                        || child_operator.is_bitwise()
+                        || matches!(parent, InfixOperator::Concat | InfixOperator::JsonExtract)
+                        || matches!(
+                            child_operator,
+                            InfixOperator::Concat | InfixOperator::JsonExtract
+                        ))
                     && !matches!(
                         (parent, child_operator),
                         (InfixOperator::Add, InfixOperator::Add)
                             | (InfixOperator::Mul, InfixOperator::Mul)
+                            | (InfixOperator::BitwiseAnd, InfixOperator::BitwiseAnd)
+                            | (InfixOperator::BitwiseOr, InfixOperator::BitwiseOr)
+                            | (InfixOperator::BitwiseXor, InfixOperator::BitwiseXor)
+                            | (InfixOperator::Concat, InfixOperator::Concat)
                     )
             }
         }
@@ -26203,7 +26443,7 @@ impl Generator {
     /// MySQL uses <=>, other dialects use IS NOT DISTINCT FROM
     fn generate_null_safe_eq(&mut self, op: &BinaryOp) -> Result<()> {
         use crate::dialects::DialectType;
-        self.generate_expression(&op.left)?;
+        self.generate_is_operand(&op.left)?;
         self.write_space();
         if matches!(self.config.dialect, Some(DialectType::MySQL)) {
             self.write("<=>");
@@ -26211,17 +26451,17 @@ impl Generator {
             self.write_keyword("IS NOT DISTINCT FROM");
         }
         self.write_space();
-        self.generate_expression(&op.right)?;
+        self.generate_is_operand(&op.right)?;
         Ok(())
     }
 
     /// Generate IS DISTINCT FROM (null-safe inequality)
     fn generate_null_safe_neq(&mut self, op: &BinaryOp) -> Result<()> {
-        self.generate_expression(&op.left)?;
+        self.generate_is_operand(&op.left)?;
         self.write_space();
         self.write_keyword("IS DISTINCT FROM");
         self.write_space();
-        self.generate_expression(&op.right)?;
+        self.generate_is_operand(&op.right)?;
         Ok(())
     }
 
@@ -26255,6 +26495,9 @@ impl Generator {
                 if col.join_mark && self.config.supports_column_join_marks {
                     self.write(" (+)");
                 }
+            }
+            Expression::Concat(inner_op) if self.config.dialect == Some(DialectType::MySQL) => {
+                self.generate_mysql_concat_from_concat(inner_op)?;
             }
             Expression::Add(inner_op)
             | Expression::Sub(inner_op)
@@ -26343,8 +26586,9 @@ impl Generator {
         }
         // Function-like AST nodes such as MOD and DIV can render as infix
         // operators. Preserve their grouping under a symbolic unary operator.
-        let needs_parens = matches!(operator, "-" | "~")
-            && Self::infix_operator(self.config.dialect, &op.this).is_some();
+        let needs_parens = Self::is_low_precedence_json_arrow(self.config.dialect, &op.this)
+            || (matches!(operator, "-" | "~")
+                && Self::infix_operator(self.config.dialect, &op.this).is_some());
         if needs_parens {
             self.write("(");
         }
@@ -26367,7 +26611,7 @@ impl Generator {
             self.write_keyword("NOT");
             self.write_space();
         }
-        self.generate_expression(&in_expr.this)?;
+        self.generate_duckdb_json_arrow_operand(&in_expr.this)?;
         if in_expr.global {
             self.write_space();
             self.write_keyword("GLOBAL");
@@ -26497,7 +26741,7 @@ impl Generator {
             self.write_keyword("NOT");
             self.write_space();
         }
-        self.generate_expression(&between.this)?;
+        self.generate_duckdb_json_arrow_operand(&between.this)?;
         if between.not && !use_prefix_not {
             self.write_space();
             self.write_keyword("NOT");
@@ -26513,11 +26757,28 @@ impl Generator {
             }
         }
         self.write_space();
-        self.generate_expression(&between.low)?;
+        self.generate_duckdb_json_arrow_operand(&between.low)?;
         self.write_space();
         self.write_keyword("AND");
         self.write_space();
-        self.generate_expression(&between.high)
+        self.generate_duckdb_json_arrow_operand(&between.high)
+    }
+
+    fn generate_is_operand(&mut self, expression: &Expression) -> Result<()> {
+        // IS binds more tightly than boolean connectors, prefix NOT and DuckDB JSON arrows.
+        let grouped = Self::is_low_precedence_json_arrow(self.config.dialect, expression)
+            || matches!(
+                expression,
+                Expression::And(_) | Expression::Or(_) | Expression::Xor(_) | Expression::Not(_)
+            );
+        if grouped {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if grouped {
+            self.write(")");
+        }
+        Ok(())
     }
 
     fn generate_is_null(&mut self, is_null: &IsNull) -> Result<()> {
@@ -26530,13 +26791,13 @@ impl Generator {
             // NOT x IS NULL (generic normalization and NOTNULL postfix form)
             self.write_keyword("NOT");
             self.write_space();
-            self.generate_expression(&is_null.this)?;
+            self.generate_is_operand(&is_null.this)?;
             self.write_space();
             self.write_keyword("IS");
             self.write_space();
             self.write_keyword("NULL");
         } else {
-            self.generate_expression(&is_null.this)?;
+            self.generate_is_operand(&is_null.this)?;
             self.write_space();
             self.write_keyword("IS");
             if is_null.not {
@@ -26550,7 +26811,7 @@ impl Generator {
     }
 
     fn generate_is_true(&mut self, is_true: &IsTrueFalse) -> Result<()> {
-        self.generate_expression(&is_true.this)?;
+        self.generate_is_operand(&is_true.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_true.not {
@@ -26563,7 +26824,7 @@ impl Generator {
     }
 
     fn generate_is_false(&mut self, is_false: &IsTrueFalse) -> Result<()> {
-        self.generate_expression(&is_false.this)?;
+        self.generate_is_operand(&is_false.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_false.not {
@@ -26576,7 +26837,7 @@ impl Generator {
     }
 
     fn generate_is_json(&mut self, is_json: &IsJson) -> Result<()> {
-        self.generate_expression(&is_json.this)?;
+        self.generate_is_operand(&is_json.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_json.negated {
@@ -26613,11 +26874,11 @@ impl Generator {
     }
 
     fn generate_is(&mut self, is_expr: &BinaryOp) -> Result<()> {
-        self.generate_expression(&is_expr.left)?;
+        self.generate_is_operand(&is_expr.left)?;
         self.write_space();
         self.write_keyword("IS");
         self.write_space();
-        self.generate_expression(&is_expr.right)
+        self.generate_is_operand(&is_expr.right)
     }
 
     fn generate_exists(&mut self, exists: &Exists) -> Result<()> {
@@ -32885,9 +33146,9 @@ impl Generator {
             self.generate_mysql_concat_from_dpipe(e)?;
         } else {
             // String concatenation: this || expression
-            self.generate_expression(&e.this)?;
+            self.generate_infix_operand(InfixOperator::Concat, &e.this, OperandSide::Left)?;
             self.write(" || ");
-            self.generate_expression(&e.expression)?;
+            self.generate_infix_operand(InfixOperator::Concat, &e.expression, OperandSide::Right)?;
         }
         Ok(())
     }
@@ -36086,14 +36347,21 @@ impl Generator {
             self.generate_expression(&e.this)?;
             if let Some(alias) = &e.alias {
                 self.write_space();
-                self.write(alias);
+                self.generate_alias_identifier(&Identifier {
+                    quoted: e.alias_quoted,
+                    ..Identifier::new(alias)
+                })?;
             }
         } else {
             // LATERAL subquery/function [WITH ORDINALITY] [AS alias(columns)]
             self.write_keyword("LATERAL");
             self.write_space();
             self.generate_expression(&e.this)?;
-            if e.ordinality.is_some() {
+            // UNNEST renders its own ordinality (or target-specific OFFSET).
+            // The wrapper flag can also be present in parsed and legacy ASTs.
+            if e.ordinality.is_some()
+                && !matches!(e.this.as_ref(), Expression::Unnest(unnest) if unnest.with_ordinality)
+            {
                 self.write_space();
                 self.write_keyword("WITH ORDINALITY");
             }
@@ -36101,14 +36369,20 @@ impl Generator {
                 self.write_space();
                 self.write_keyword("AS");
                 self.write_space();
-                self.write(alias);
+                self.generate_alias_identifier(&Identifier {
+                    quoted: e.alias_quoted,
+                    ..Identifier::new(alias)
+                })?;
                 if !e.column_aliases.is_empty() {
                     self.write("(");
                     for (i, col) in e.column_aliases.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
                         }
-                        self.write(col);
+                        self.generate_alias_identifier(&Identifier {
+                            quoted: e.column_aliases_quoted.get(i).copied().unwrap_or(false),
+                            ..Identifier::new(col)
+                        })?;
                     }
                     self.write(")");
                 }
@@ -45582,6 +45856,159 @@ mod tests {
 
         for (expression, expected) in cases {
             assert_eq!(Generator::sql(&expression).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_concat_precedence_programmatic_ast() {
+        fn concat(l: Expression, r: Expression) -> Expression {
+            Expression::Concat(Box::new(BinaryOp::new(l, r)))
+        }
+        fn dpipe(l: Expression, r: Expression) -> Expression {
+            Expression::DPipe(Box::new(DPipe {
+                this: Box::new(l),
+                expression: Box::new(r),
+                safe: None,
+            }))
+        }
+        let n = Expression::number;
+        for concatenate in [concat, dpipe] {
+            let cases = [
+                (
+                    concatenate(n(1), Expression::Mul(Box::new(BinaryOp::new(n(2), n(3))))),
+                    "1 || (2 * 3)",
+                    "1 || 2 * 3",
+                    "CONCAT(1, 2 * 3)",
+                ),
+                (
+                    concatenate(Expression::Add(Box::new(BinaryOp::new(n(1), n(2)))), n(3)),
+                    "(1 + 2) || 3",
+                    "1 + 2 || 3",
+                    "CONCAT(1 + 2, 3)",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(concatenate(n(1), n(2)), n(3)))),
+                    "1 || 2 * 3",
+                    "(1 || 2) * 3",
+                    "CONCAT(1, 2) * 3",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(n(1), concatenate(n(2), n(3))))),
+                    "1 * 2 || 3",
+                    "1 * (2 || 3)",
+                    "1 * CONCAT(2, 3)",
+                ),
+                (
+                    Expression::Neg(Box::new(UnaryOp::new(concatenate(n(1), n(2))))),
+                    "-(1 || 2)",
+                    "-(1 || 2)",
+                    "-CONCAT(1, 2)",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(
+                        Expression::Add(Box::new(BinaryOp::new(concatenate(n(1), n(2)), n(3)))),
+                        n(4),
+                    ))),
+                    "(1 || 2 + 3) * 4",
+                    "((1 || 2) + 3) * 4",
+                    "(CONCAT(1, 2) + 3) * 4",
+                ),
+            ];
+            for (expr, sqlite, low_precedence, mysql) in cases {
+                for (dialect, expected) in [
+                    (DialectType::SQLite, sqlite),
+                    (DialectType::PostgreSQL, low_precedence),
+                    (DialectType::DuckDB, low_precedence),
+                    (DialectType::MySQL, mysql),
+                ] {
+                    assert_eq!(
+                        crate::generate(&expr, dialect).unwrap(),
+                        expected,
+                        "{dialect:?}: {expr:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_concat_preserves_nested_json_grouping() {
+        let parsed = crate::parse_one("SELECT '[1]' ->> 0", DialectType::SQLite).unwrap();
+        let extract = parsed.as_select().unwrap().expressions[0].clone();
+        let nested = Expression::Concat(Box::new(BinaryOp::new(extract, Expression::string("y"))));
+        for right in [
+            nested.clone(),
+            Expression::Concat(Box::new(BinaryOp::new(nested, Expression::string("z")))),
+        ] {
+            let expr = Expression::Concat(Box::new(BinaryOp::new(Expression::string("x"), right)));
+            let sql = crate::generate(&expr, DialectType::SQLite).unwrap();
+            assert!(sql.starts_with("'x' || ('[1]' ->> 0 || 'y'"), "{sql}");
+            assert!(sql.ends_with(')'), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_bitwise_precedence_programmatic_ast() {
+        let n = Expression::number;
+        let cases = [
+            (
+                Expression::BitwiseAnd(Box::new(BinaryOp::new(
+                    Expression::BitwiseOr(Box::new(BinaryOp::new(n(1), n(2)))),
+                    n(4),
+                ))),
+                "1 | 2 & 4",
+                "(1 | 2) & 4",
+            ),
+            (
+                Expression::BitwiseOr(Box::new(BinaryOp::new(
+                    n(1),
+                    Expression::BitwiseAnd(Box::new(BinaryOp::new(n(2), n(4)))),
+                ))),
+                "1 | (2 & 4)",
+                "1 | 2 & 4",
+            ),
+            (
+                Expression::BitwiseLeftShift(Box::new(BinaryOp::new(
+                    Expression::BitwiseOr(Box::new(BinaryOp::new(n(1), n(2)))),
+                    n(1),
+                ))),
+                "1 | 2 << 1",
+                "(1 | 2) << 1",
+            ),
+            (
+                Expression::BitwiseOr(Box::new(BinaryOp::new(
+                    n(1),
+                    Expression::BitwiseLeftShift(Box::new(BinaryOp::new(n(2), n(1)))),
+                ))),
+                "1 | (2 << 1)",
+                "1 | 2 << 1",
+            ),
+            (
+                Expression::BitwiseRightShift(Box::new(BinaryOp::new(
+                    n(8),
+                    Expression::BitwiseRightShift(Box::new(BinaryOp::new(n(2), n(1)))),
+                ))),
+                "8 >> (2 >> 1)",
+                "8 >> (2 >> 1)",
+            ),
+        ];
+        for (expr, shared_tier_sql, mysql_sql) in cases {
+            for (dialect, expected) in [
+                (DialectType::SQLite, shared_tier_sql),
+                (DialectType::PostgreSQL, shared_tier_sql),
+                (DialectType::DuckDB, shared_tier_sql),
+                (DialectType::MySQL, mysql_sql),
+            ] {
+                let config = GeneratorConfig {
+                    dialect: Some(dialect),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Generator::with_config(config).generate(&expr).unwrap(),
+                    expected,
+                    "{dialect:?}: {expr:?}"
+                );
+            }
         }
     }
 

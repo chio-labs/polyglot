@@ -111,6 +111,9 @@ impl DialectImpl for ClickHouseDialect {
 
         let wrap_not_target = |expr: Expression| -> Expression {
             match expr {
+                // The generator emits typed negated LIKE predicates directly.
+                // Keep that form stable when reparsing lowered notLike calls.
+                Expression::Like(_) | Expression::ILike(_) => expr,
                 Expression::Paren(_) => expr,
                 Expression::In(_)
                 | Expression::Between(_)
@@ -119,8 +122,6 @@ impl DialectImpl for ClickHouseDialect {
                 | Expression::IsTrue(_)
                 | Expression::IsFalse(_)
                 | Expression::IsJson(_)
-                | Expression::Like(_)
-                | Expression::ILike(_)
                 | Expression::SimilarTo(_)
                 | Expression::Glob(_)
                 | Expression::RegexpLike(_)

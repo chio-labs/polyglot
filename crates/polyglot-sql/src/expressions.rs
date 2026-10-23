@@ -8505,6 +8505,11 @@ pub enum TableConstraint {
     PrimaryKey {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Structured quoted, prefixed or ordered keys. When present these are
+        /// authoritative for rendering; `columns` retains the column names.
+        /// Older ASTs can encode prefix/order syntax directly in `columns`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key_parts: Vec<IndexKeyPart>,
         /// Databricks primary-key columns marked with the TIMESERIES attribute.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         timeseries_columns: Vec<Identifier>,
@@ -8520,6 +8525,9 @@ pub enum TableConstraint {
     Unique {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Structured quoted, prefixed or ordered keys, as for `PrimaryKey`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key_parts: Vec<IndexKeyPart>,
         /// Whether columns are parenthesized (false for UNIQUE idx_name without parens)
         #[serde(default)]
         columns_parenthesized: bool,
@@ -11676,6 +11684,9 @@ pub struct Lateral {
     /// Column aliases for the lateral expression (e.g., LATERAL func() AS alias(col1, col2))
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_aliases: Vec<String>,
+    /// Quoting of each column alias, parallel to `column_aliases`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_aliases_quoted: Vec<bool>,
 }
 
 /// TableFromRows

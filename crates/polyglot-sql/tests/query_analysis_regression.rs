@@ -27,6 +27,36 @@ fn parse_one_statement(sql: &str, dialect: DialectType) -> Expression {
     expressions.remove(0)
 }
 
+#[test]
+fn clickhouse_negated_like_retains_filter_column_references() {
+    use polyglot_sql::{ColumnUseContext, ReferenceConfidence};
+
+    for operator in ["LIKE", "ILIKE"] {
+        for (identifier, column) in [("a", "a"), ("`a b`", "a b")] {
+            let sql = format!("SELECT id FROM t WHERE NOT {identifier} {operator} '%x%'");
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::ClickHouse,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let filters: Vec<_> = analysis
+                .column_uses
+                .iter()
+                .filter(|fact| fact.context == ColumnUseContext::Filter)
+                .collect();
+            assert_eq!(filters.len(), 1, "{sql}");
+            assert_eq!(filters[0].references.len(), 1, "{sql}");
+            let reference = &filters[0].references[0].reference;
+            assert_eq!(reference.column, column, "{sql}");
+            assert_eq!(reference.table.as_deref(), Some("t"), "{sql}");
+            assert_eq!(reference.confidence, ReferenceConfidence::Resolved, "{sql}");
+        }
+    }
+}
+
 fn assert_postgres_command(sql: &str, expected: &str) {
     let expr = parse_one_statement(sql, DialectType::PostgreSQL);
     let Expression::Command(command) = &expr else {

@@ -25,6 +25,144 @@ fn transpile_succeeds(sql: &str, from: DialectType, to: DialectType) -> bool {
     source_dialect.transpile(sql, to).is_ok()
 }
 
+mod concat_precedence {
+    use super::*;
+    use DialectType::{DuckDB, MySQL, PostgreSQL, SQLite};
+
+    #[test]
+    fn sqlite_concat_keeps_grouping_when_transpiled() {
+        for (sql, expected) in [
+            ("SELECT 1 || 2 * 3", "SELECT CONCAT(1, 2) * 3"),
+            ("SELECT 1 * 2 || 3", "SELECT 1 * CONCAT(2, 3)"),
+            ("SELECT 1 + 2 || 3", "SELECT 1 + CONCAT(2, 3)"),
+            ("SELECT 1 || 2 + 3", "SELECT CONCAT(1, 2) + 3"),
+            ("SELECT 1 || 2 % 5", "SELECT CONCAT(1, 2) % 5"),
+            ("SELECT 1 || 2 || 3 * 4", "SELECT CONCAT(1, 2, 3) * 4"),
+            ("SELECT 1 || (2 * 3)", "SELECT CONCAT(1, (2 * 3))"),
+            ("SELECT (1 || 2) * 3", "SELECT (CONCAT(1, 2)) * 3"),
+            ("SELECT -1 || 2 * 3", "SELECT CONCAT(-1, 2) * 3"),
+            ("SELECT 1 || -2 * 3", "SELECT CONCAT(1, -2) * 3"),
+        ] {
+            assert_eq!(transpile(sql, SQLite, MySQL), expected, "{sql}");
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+        assert_eq!(
+            transpile("SELECT 1 || 2 * 3", SQLite, DuckDB),
+            "SELECT (1 || 2) * 3"
+        );
+        assert_eq!(
+            transpile("SELECT 1 + 2 || 3", SQLite, PostgreSQL),
+            "SELECT 1 + (2 || 3)"
+        );
+    }
+
+    #[test]
+    fn sqlite_target_groups_arithmetic_inside_concat() {
+        for source in [PostgreSQL, DuckDB] {
+            for (sql, expected) in [
+                ("SELECT '1' || 2 * 3", "SELECT '1' || (2 * 3)"),
+                ("SELECT 1 + 2 || '3'", "SELECT (1 + 2) || '3'"),
+                ("SELECT '1' || 2 % 5", "SELECT '1' || (2 % 5)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, SQLite),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_concat_and_json_arrows_share_precedence() {
+        assert_eq!(
+            transpile("SELECT '[' || 1 || ']' ->> 0", SQLite, DuckDB),
+            "SELECT ('[' || 1 || ']') ->> '$[0]'"
+        );
+        assert_eq!(
+            transpile("SELECT 'x' || '[1]' ->> 0", PostgreSQL, SQLite),
+            "SELECT 'x' || ('[1]' ->> 0)"
+        );
+        for sql in [
+            "SELECT '[' || 1 || ']' ->> 0",
+            "SELECT '[1]' ->> 0 || 'x'",
+            "SELECT j -> i || 'x'",
+            "SELECT (j) -> i || 'x'",
+            "SELECT ('[' || 1 || ']') -> 0",
+            "SELECT '[1]' ->> (0 || '')",
+            "SELECT 1 || 2 COLLATE NOCASE * 3",
+        ] {
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+    }
+}
+
+mod bitwise_precedence {
+    use super::*;
+    use DialectType::{MySQL, PostgreSQL, SQLite, Snowflake};
+
+    #[test]
+    fn same_tier_bitwise_operators_keep_source_grouping() {
+        for source in [SQLite, PostgreSQL] {
+            for (sql, expected) in [
+                (
+                    "SELECT 1 | 2 & 4 AS v",
+                    "SELECT BITAND(BITOR(1, 2), 4) AS v",
+                ),
+                (
+                    "SELECT 1 | 2 << 1 AS v",
+                    "SELECT BITSHIFTLEFT(BITOR(1, 2), 1) AS v",
+                ),
+                (
+                    "SELECT 8 | 1 >> 1 AS v",
+                    "SELECT BITSHIFTRIGHT(BITOR(8, 1), 1) AS v",
+                ),
+                ("SELECT 1 | 2 & 4 = 0", "SELECT BITAND(BITOR(1, 2), 4) = 0"),
+                ("SELECT 1 | (2 & 4)", "SELECT BITOR(1, (BITAND(2, 4)))"),
+                ("SELECT (1 | 2) & 4", "SELECT BITAND((BITOR(1, 2)), 4)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, Snowflake),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            transpile("SELECT 1 | 2 # 3", PostgreSQL, Snowflake),
+            "SELECT BITXOR(BITOR(1, 2), 3)"
+        );
+        assert_eq!(
+            transpile("SELECT 1 | 2 & 4", MySQL, Snowflake),
+            "SELECT BITOR(1, BITAND(2, 4))"
+        );
+    }
+
+    #[test]
+    fn bitwise_transpilation_preserves_grouping_in_both_directions() {
+        for shared_tier in [SQLite, PostgreSQL] {
+            for (source, target, sql, expected) in [
+                (shared_tier, MySQL, "SELECT 1 | 2 & 4", "SELECT (1 | 2) & 4"),
+                (MySQL, shared_tier, "SELECT 1 | 2 & 4", "SELECT 1 | (2 & 4)"),
+                (
+                    shared_tier,
+                    MySQL,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT (1 | 2) << 1",
+                ),
+                (
+                    MySQL,
+                    shared_tier,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT 1 | (2 << 1)",
+                ),
+            ] {
+                assert_eq!(transpile(sql, source, target), expected);
+            }
+        }
+    }
+}
+
 mod strict_unsupported_regressions {
     use super::*;
 

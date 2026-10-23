@@ -4,6 +4,89 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.13.4] - Unreleased
+
+### Changed
+
+- Public Rust AST types now include `Lateral.column_aliases_quoted` and
+  `key_parts` on `TableConstraint::PrimaryKey` and `TableConstraint::Unique`.
+  Callers constructing these types directly may need to update struct literals
+  or exhaustive matches. Older serialized ASTs remain readable; unquoted
+  LATERAL aliases and simple unquoted constraint keys retain their existing
+  JSON shape.
+- Shared Rust verification and CI now run dedicated regression suites for
+  DuckDB relation aliases, numeric exponent boundaries, query analysis,
+  predicate grouping, DuckDB JSON arrows and lambdas, and quoted relation
+  columns. Coverage also includes ordinality, quoted constraint keys, legacy
+  AST JSON, and parser depth limits.
+
+### Fixed
+
+- Query analysis includes every base table in parenthesized join groups,
+  including nested joins, CTE-backed members, and subqueries in join predicates.
+  Aliased and re-aliased groups retain their scope boundaries and column aliases,
+  without leaking internal relation names or duplicating predicate references.
+  ([#491](https://github.com/tobilg/polyglot/pull/491))
+- DuckDB accepts unreserved words such as `owned`, `match`, and `final` as
+  explicit or implicit relation aliases on tables, subqueries, and table
+  functions. Column alias lists, joins, correlated queries, and following
+  clauses remain intact; ClickHouse still treats `FINAL` as a table modifier.
+  ([#493](https://github.com/tobilg/polyglot/pull/493))
+- Numeric tokenization only consumes an exponent marker and optional sign when
+  exponent digits follow. Compact expressions such as `CASE WHEN TRUE THEN
+  13END` no longer lose the start of `END`, while valid scientific notation
+  continues to parse correctly.
+  ([#495](https://github.com/tobilg/polyglot/pull/495))
+- SQLite and PostgreSQL bitwise operators use their shared left-associative
+  precedence tier, including PostgreSQL `#` XOR while retaining `^` as
+  exponentiation. Cross-dialect generation groups operands where precedence
+  differs, and bitwise shifts participate in dialect transformations.
+  ([#500](https://github.com/tobilg/polyglot/issues/500))
+- SQLite concatenation and JSON arrows (`||`, `->`, and `->>`) share the correct
+  precedence above multiplication. Parsing and cross-dialect generation preserve
+  their grouping with arithmetic, unary operators, `COLLATE`, and other JSON
+  extractions, without interpreting SQLite JSON arrows as lambdas.
+  ([#501](https://github.com/tobilg/polyglot/issues/501))
+- SQL generation preserves boolean operand grouping in comparisons, `IS NULL`,
+  truth tests, `IS JSON`, and `IS [NOT] DISTINCT FROM`, including expressions
+  constructed through the AST builder. Prefix `NOT` and nested boolean
+  connectors no longer change the meaning of the generated predicate.
+  ([#497](https://github.com/tobilg/polyglot/pull/497))
+- ClickHouse accepts operand-position `NOT` with its native comparison
+  precedence, preserving surrounding operands and following clauses. Negated
+  `LIKE`/`ILIKE` predicates retain quoted identifiers and query-analysis
+  references, and transformed `notLike` expressions round-trip consistently.
+- DuckDB distinguishes JSON extraction arrows from lambdas using the function
+  argument context. Dynamic and list-valued paths, nested lambdas, `COLUMNS`,
+  schema-qualified calls, and receiver-style list operations retain their
+  meaning. JSON `->` and scalar `->>` keep their distinct precedence, computed
+  paths and mixed extraction chains; generation groups arrow operands where
+  needed. Parenthesized lambdas respect parser depth limits.
+  ([#499](https://github.com/tobilg/polyglot/pull/499))
+- DuckDB casts accept JSON-arrow operands, including computed paths and nested
+  casts. Nested cast expressions isolate and restore the surrounding JSON-path
+  context, preserving the `AS` type separator, subsequent arrows, and following
+  query clauses.
+- LATERAL relation and column aliases preserve spaces, case, escaped quotes,
+  and explicit or implicit `AS` through parsing, generation, and AST JSON
+  round trips. Complete quoted names such as `"items(1)"`, `"items DESC"`, and
+  `"value ASC"` remain single identifiers in declarations and references rather
+  than being interpreted as index-prefix or ordering syntax.
+  ([#506](https://github.com/tobilg/polyglot/pull/506))
+- `LATERAL UNNEST ... WITH ORDINALITY` emits ordinality only once when both the
+  LATERAL wrapper and the inner function carry the flag, including older ASTs.
+- Quoted `PRIMARY KEY` and `UNIQUE` column names remain separate from index
+  prefix lengths and sort modifiers. Names containing parentheses or ending in
+  `ASC`/`DESC` retain their full spelling, while MySQL prefix/order syntax,
+  SQLite primary-key ordering, Spark/Hive normalization, and Databricks
+  `TIMESERIES` keys preserve their behavior. Legacy ASTs with encoded index
+  suffixes remain supported.
+- TypeScript SDK `addWhere`, numeric `setLimit`, and numeric `setOffset` throw
+  operation-specific errors when WASM cannot deserialize or transform the AST,
+  instead of silently returning the original query without the requested
+  clause. Failed mutations leave the input AST unchanged.
+  ([#503](https://github.com/tobilg/polyglot/pull/503))
+
 ## [0.13.3] - 2026-10-09
 
 ### Added
@@ -2099,6 +2182,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.13.4]: https://github.com/tobilg/polyglot/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/tobilg/polyglot/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/tobilg/polyglot/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/tobilg/polyglot/compare/v0.13.0...v0.13.1
