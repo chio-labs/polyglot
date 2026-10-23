@@ -291,6 +291,7 @@ test-rust-verify-core:
 	@cargo test -p polyglot-sql --test duckdb_order_by_all
 	@cargo test -p polyglot-sql --test duckdb_integer_division
 	@cargo test -p polyglot-sql --test mod_precedence
+	@cargo test -p polyglot-sql --test duckdb_unreserved_relation_aliases
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture
