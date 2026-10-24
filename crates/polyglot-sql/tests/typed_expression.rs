@@ -1,6 +1,6 @@
 //! The analysis-only type assertion `__polyglot_typed(expr, 'TYPE')`.
 
-use polyglot_sql::expressions::{Annotated, Select};
+use polyglot_sql::expressions::{Annotated, Select, StructField};
 use polyglot_sql::{parse_one, DataType, Dialect, DialectType, Expression};
 
 fn first_projection(sql: &str, dialect: DialectType) -> Expression {
@@ -134,9 +134,46 @@ fn type_assertions_apply_only_where_the_inferred_type_is_unknown() {
         type_assertion_result(Some(&DataType::Unknown), &varchar),
         &varchar
     );
+    let bigint_array = DataType::Array {
+        element_type: Box::new(bigint.clone()),
+        dimension: None,
+    };
     assert_eq!(
         type_assertion_result(Some(&unknown_array), &varchar),
-        &varchar
+        &unknown_array
+    );
+    assert_eq!(
+        type_assertion_result(Some(&unknown_array), &bigint_array),
+        &bigint_array
+    );
+    let partial_struct = DataType::Struct {
+        fields: vec![
+            StructField::new("a".into(), bigint.clone()),
+            StructField::new("b".into(), DataType::Unknown),
+        ],
+        nested: true,
+    };
+    let full_struct = DataType::Struct {
+        fields: vec![
+            StructField::new("a".into(), bigint.clone()),
+            StructField::new("b".into(), varchar.clone()),
+        ],
+        nested: true,
+    };
+    let other_struct = DataType::Struct {
+        fields: vec![
+            StructField::new("a".into(), varchar.clone()),
+            StructField::new("b".into(), varchar.clone()),
+        ],
+        nested: true,
+    };
+    assert_eq!(
+        type_assertion_result(Some(&partial_struct), &full_struct),
+        &full_struct
+    );
+    assert_eq!(
+        type_assertion_result(Some(&partial_struct), &other_struct),
+        &partial_struct
     );
     assert_eq!(type_assertion_result(Some(&bigint), &varchar), &bigint);
     assert_eq!(
@@ -382,11 +419,35 @@ mod analysis {
     }
 
     #[test]
-    fn partly_unknown_inferred_types_take_the_assertion() {
+    fn partly_unknown_inferred_types_take_an_assertion_of_their_shape() {
         let sql = "SELECT __polyglot_typed([bar(amount, 0)], 'VARCHAR[]') AS x FROM orders";
         assert_eq!(
             output_type(sql, DialectType::DuckDB).as_deref(),
             Some("TEXT[]")
+        );
+        for (body, asserted) in [
+            ("[]", "BIGINT"),
+            ("[NULL]", "BIGINT"),
+            ("[]", "MAP(VARCHAR, INT)"),
+        ] {
+            for template in [
+                "SELECT {m} AS x FROM orders",
+                "WITH c AS (SELECT {m} AS x FROM orders) SELECT x FROM c",
+                "SELECT CAST(NULL AS BIGINT) AS x FROM orders UNION ALL SELECT {m} AS x FROM orders",
+            ] {
+                let typed = template.replace("{m}", &format!("__polyglot_typed({body}, '{asserted}')"));
+                let plain = template.replace("{m}", body);
+                assert_eq!(
+                    output_type(&typed, DialectType::DuckDB),
+                    output_type(&plain, DialectType::DuckDB),
+                    "{typed}"
+                );
+            }
+        }
+        let refined = "SELECT __polyglot_typed([], 'BIGINT[]') AS x FROM orders";
+        assert_eq!(
+            output_type(refined, DialectType::DuckDB).as_deref(),
+            Some("BIGINT[]")
         );
     }
 

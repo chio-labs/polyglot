@@ -279,7 +279,15 @@ fn projection_output(expr: &Expression, dialect: DialectType) -> QueryOutput {
         },
         _ => inferred_output(expr, inner, dialect),
     };
+    let partly_known = inner
+        .inferred_type()
+        .filter(|t| contains_unknown(t) && **t != DataType::Unknown);
     let value = match (asserted, value) {
+        (Some(asserted), OutputType::Unknown)
+            if partly_known.is_some_and(|partial| !partial.is_refined_by(asserted)) =>
+        {
+            OutputType::Unknown
+        }
         (Some(asserted), OutputType::Unknown | OutputType::Null) => {
             OutputType::Known(canonical(asserted, dialect))
         }

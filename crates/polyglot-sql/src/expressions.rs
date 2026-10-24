@@ -6489,6 +6489,55 @@ impl DataType {
         }
     }
 
+    /// Whether `refined` fills this type's unknown components without changing its shape.
+    ///
+    /// [`DataType::Unknown`] is refined by every type. A partly unknown type is refined by a
+    /// type of the same shape, such as `UNKNOWN[]` by `BIGINT[]` or a struct with unknown
+    /// fields by the same struct with those fields typed, whose other components agree.
+    /// A fully known type is refined by nothing.
+    pub fn is_refined_by(&self, refined: &DataType) -> bool {
+        self.contains_unknown() && self.matches_shape_of(refined)
+    }
+
+    fn matches_shape_of(&self, refined: &DataType) -> bool {
+        if !self.contains_unknown() {
+            return self == refined;
+        }
+        match (self, refined) {
+            (DataType::Unknown, _) => true,
+            (DataType::Nullable { inner }, other) => inner.matches_shape_of(other),
+            (this, DataType::Nullable { inner }) => this.matches_shape_of(inner),
+            (
+                DataType::Array { element_type, .. } | DataType::List { element_type },
+                DataType::Array {
+                    element_type: other,
+                    ..
+                }
+                | DataType::List {
+                    element_type: other,
+                },
+            ) => element_type.matches_shape_of(other),
+            (
+                DataType::Map {
+                    key_type,
+                    value_type,
+                },
+                DataType::Map {
+                    key_type: other_key,
+                    value_type: other_value,
+                },
+            ) => key_type.matches_shape_of(other_key) && value_type.matches_shape_of(other_value),
+            (DataType::Struct { fields, .. }, DataType::Struct { fields: other, .. }) => {
+                fields.len() == other.len()
+                    && fields.iter().zip(other).all(|(field, other)| {
+                        field.name.eq_ignore_ascii_case(&other.name)
+                            && field.data_type.matches_shape_of(&other.data_type)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Canonical unsigned names and their bit-width aliases. Parser entry points
     /// and legacy Custom-type normalization share this mapping.
     pub(crate) fn from_unsigned_name(name: &str) -> Option<Self> {
@@ -10808,16 +10857,19 @@ pub const TYPED_LIKE_EXPRESSION_FUNCTION: &str = "__polyglot_typed_like";
 
 /// Type of an expression carrying a type assertion.
 ///
-/// The asserted type applies only where the inferred type is absent or has an unknown
-/// component. A known inferred type stands, including when it disagrees with the
-/// assertion, so callers can report the disagreement.
+/// The asserted type applies where the inferred type is absent or unknown, and where a
+/// partly unknown inferred type has the asserted type's shape (see
+/// [`DataType::is_refined_by`]). A known inferred type, or a partly unknown one of
+/// another shape, stands, including when it disagrees with the assertion, so callers
+/// can report the disagreement.
 pub fn type_assertion_result<'a>(
     inferred: Option<&'a DataType>,
     asserted: &'a DataType,
 ) -> &'a DataType {
     match inferred {
-        Some(inferred) if !inferred.contains_unknown() => inferred,
-        _ => asserted,
+        Some(inferred) if inferred.is_refined_by(asserted) => asserted,
+        Some(inferred) => inferred,
+        None => asserted,
     }
 }
 
