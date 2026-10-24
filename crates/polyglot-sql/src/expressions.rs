@@ -10763,12 +10763,23 @@ pub struct Paren {
     pub trailing_comments: Vec<String>,
 }
 
+/// Name of the analysis-only type assertion function.
+///
+/// The parser lowers `__polyglot_typed(expr, 'TYPE')` into an [`Annotated`] node whose
+/// `type_assertion` is `TYPE`. The node is transparent for every analysis except typing:
+/// it takes the asserted type only where the type of `expr` is unknown.
+pub const TYPED_EXPRESSION_FUNCTION: &str = "__polyglot_typed";
+
 /// Expression annotated with trailing comments (for round-trip preservation)
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Annotated {
     pub this: Expression,
     pub trailing_comments: Vec<String>,
+    /// Type asserted by a lowered [`TYPED_EXPRESSION_FUNCTION`] call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub type_assertion: Option<DataType>,
 }
 
 // === BATCH GENERATED STRUCT DEFINITIONS ===
