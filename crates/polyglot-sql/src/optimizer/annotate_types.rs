@@ -2961,6 +2961,12 @@ pub fn annotate_types(
     annotate_scoped_expression(expr, schema, dialect);
 }
 
+/// Whether type annotation knows the result type of `func` in `dialect`, rather than only
+/// guessing it, as it does for an unmodelled function in some dialects.
+pub fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
+    TypeAnnotator::function_result_is_known(func, dialect)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

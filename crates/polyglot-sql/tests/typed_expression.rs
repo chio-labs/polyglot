@@ -722,3 +722,24 @@ fn typed_like_expressions_lower_and_round_trip() {
     ));
     assert!(matches!(three, Expression::Function(_)));
 }
+
+#[test]
+fn guessed_function_results_are_not_known() {
+    use polyglot_sql::optimizer::annotate_types::function_result_is_known;
+    for (dialect, sql) in [
+        (DialectType::BigQuery, "my_udf(x)"),
+        (DialectType::BigQuery, "REGEXP_CONTAINS(x, 'a')"),
+        (DialectType::Databricks, "my_udf(x, 'a')"),
+        (DialectType::DuckDB, "my_udf(x)"),
+    ] {
+        let Expression::Function(function) =
+            unaliased(first_projection(&format!("SELECT {sql}"), dialect))
+        else {
+            panic!("{dialect:?}: {sql} is not a generic function");
+        };
+        assert!(
+            !function_result_is_known(&function, dialect),
+            "{dialect:?}: {sql}"
+        );
+    }
+}
