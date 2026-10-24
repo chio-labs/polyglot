@@ -10798,6 +10798,14 @@ pub struct Paren {
 /// it takes the asserted type only where the type of `expr` is unknown.
 pub const TYPED_EXPRESSION_FUNCTION: &str = "__polyglot_typed";
 
+/// Name of the analysis-only type assertion function that asserts another expression's type.
+///
+/// The parser lowers `__polyglot_typed_like(expr, like)` into an [`Annotated`] node whose
+/// `type_like` is `like`. Type annotation resolves the type of `like` into the node's
+/// `type_assertion`, which then applies as for [`TYPED_EXPRESSION_FUNCTION`]; an unknown
+/// type of `like` asserts nothing. Like `type_assertion`, `like` is not a child of the node.
+pub const TYPED_LIKE_EXPRESSION_FUNCTION: &str = "__polyglot_typed_like";
+
 /// Type of an expression carrying a type assertion.
 ///
 /// The asserted type applies only where the inferred type is absent or has an unknown
@@ -10823,6 +10831,10 @@ pub struct Annotated {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ast(skip)]
     pub type_assertion: Option<DataType>,
+    /// Expression whose type a lowered [`TYPED_LIKE_EXPRESSION_FUNCTION`] call asserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub type_like: Option<Box<Expression>>,
 }
 
 // === BATCH GENERATED STRUCT DEFINITIONS ===

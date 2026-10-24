@@ -989,6 +989,7 @@ impl Parser {
                         this: stmt,
                         trailing_comments: semi_comments,
                         type_assertion: None,
+                        type_like: None,
                     }));
                 }
             }
@@ -2191,6 +2192,7 @@ impl Parser {
                                     this: expr,
                                     trailing_comments: pre_alias_comments,
                                     type_assertion: None,
+                                    type_like: None,
                                 },
                             )))
                         }
@@ -2205,6 +2207,7 @@ impl Parser {
                             this: expr,
                             trailing_comments: leading_comments,
                             type_assertion: None,
+                            type_like: None,
                         },
                     )))
                 } else {
@@ -4017,6 +4020,7 @@ impl Parser {
                                     this: expr,
                                     trailing_comments: comments,
                                     type_assertion: None,
+                                    type_like: None,
                                 }))
                             }
                         } else {
@@ -4127,6 +4131,7 @@ impl Parser {
                             this: expr,
                             trailing_comments: pre_alias_comments,
                             type_assertion: None,
+                            type_like: None,
                         }))
                     }
                 } else if !leading_comments.is_empty() {
@@ -4135,6 +4140,7 @@ impl Parser {
                         this: expr,
                         trailing_comments: leading_comments,
                         type_assertion: None,
+                        type_like: None,
                     }))
                 } else {
                     expr
@@ -11769,6 +11775,7 @@ impl Parser {
                     this: result,
                     trailing_comments: set_op_leading_comments,
                     type_assertion: None,
+                    type_like: None,
                 }))
             } else {
                 result
@@ -30557,6 +30564,7 @@ impl Parser {
                     this: right,
                     trailing_comments: pending,
                     type_assertion: None,
+                    type_like: None,
                 }));
             }
             left = Expression::Or(Box::new(BinaryOp {
@@ -30647,6 +30655,7 @@ impl Parser {
                     this: right,
                     trailing_comments: pending,
                     type_assertion: None,
+                    type_like: None,
                 }));
             }
             left = Expression::And(Box::new(BinaryOp {
@@ -30862,6 +30871,7 @@ impl Parser {
                             this: left,
                             trailing_comments: pre_left_comments,
                             type_assertion: None,
+                            type_like: None,
                         }));
                     }
                 }
@@ -35771,6 +35781,7 @@ impl Parser {
                     this: first_literal,
                     trailing_comments: token.trailing_comments,
                     type_assertion: None,
+                    type_like: None,
                 }))
             };
 
@@ -35788,6 +35799,7 @@ impl Parser {
                             this: literal,
                             trailing_comments: next_token.trailing_comments,
                             type_assertion: None,
+                            type_like: None,
                         }))
                     };
                     expressions.push(literal);
@@ -41712,9 +41724,25 @@ impl Parser {
                             this,
                             trailing_comments,
                             type_assertion: Some(type_assertion),
+                            type_like: None,
                         },
                     )));
                 }
+            }
+            if !distinct
+                && args.len() == 2
+                && name.eq_ignore_ascii_case(crate::expressions::TYPED_LIKE_EXPRESSION_FUNCTION)
+            {
+                let like = args.pop().map(Box::new);
+                let this = args.swap_remove(0);
+                return Ok(Expression::Annotated(Box::new(
+                    crate::expressions::Annotated {
+                        this,
+                        trailing_comments,
+                        type_assertion: None,
+                        type_like: like,
+                    },
+                )));
             }
             self.normalize_date_part_arg(name, &mut args);
             let mut func = Function::new(name.to_string(), args);
@@ -41981,6 +42009,7 @@ impl Parser {
                         this: arg,
                         trailing_comments,
                         type_assertion: None,
+                        type_like: None,
                     }))
                 }
                 _ => arg,
@@ -49723,6 +49752,7 @@ impl Parser {
                             this: expr,
                             trailing_comments,
                             type_assertion: None,
+                            type_like: None,
                         }))
                     }
                     // For expressions that already capture trailing_comments, don't double-wrap
@@ -49939,6 +49969,7 @@ impl Parser {
                             this: expr,
                             trailing_comments,
                             type_assertion: None,
+                            type_like: None,
                         }))
                     }
                     _ => expr,

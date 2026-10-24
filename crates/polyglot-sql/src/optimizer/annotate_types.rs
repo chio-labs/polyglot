@@ -495,7 +495,13 @@ impl<'a> TypeAnnotator<'a> {
             Expression::Paren(paren) => self.annotate(&paren.this),
             Expression::Annotated(annotated) => {
                 let inferred = self.annotate(&annotated.this);
-                match &annotated.type_assertion {
+                let like = match (&annotated.type_assertion, &annotated.type_like) {
+                    (None, Some(like)) => {
+                        self.annotate(like).filter(|like| !like.contains_unknown())
+                    }
+                    _ => None,
+                };
+                match annotated.type_assertion.as_ref().or(like.as_ref()) {
                     Some(asserted) => {
                         let inferred =
                             inferred.filter(|_| !self.is_unknown_function_result(&annotated.this));
@@ -930,6 +936,11 @@ impl<'a> TypeAnnotator<'a> {
             }
             Expression::Annotated(annotated) => {
                 self.annotate_in_place(&mut annotated.this);
+                if let Some(like) = &mut annotated.type_like {
+                    self.annotate_in_place(like);
+                    let resolved = self.annotate(like).filter(|like| !like.contains_unknown());
+                    annotated.type_assertion = resolved;
+                }
             }
 
             // Case

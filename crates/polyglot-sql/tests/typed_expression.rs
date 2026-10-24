@@ -108,6 +108,7 @@ fn comment_annotations_serialize_without_a_type_assertion() {
         this: Expression::Null(polyglot_sql::expressions::Null),
         trailing_comments: vec!["c".into()],
         type_assertion: None,
+        type_like: None,
     };
     let mut json = serde_json::to_value(&annotated).unwrap();
     assert!(json.get("type_assertion").is_none());
