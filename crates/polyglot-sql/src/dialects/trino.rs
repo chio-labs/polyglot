@@ -474,6 +474,8 @@ impl TrinoDialect {
             // VAR -> VAR_POP in Trino
             "VAR" if !f.args.is_empty() => {
                 Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    source_dialect: None,
+
                     name: "VAR_POP".to_string(),
                     args: f.args,
                     distinct: f.distinct,
@@ -488,6 +490,8 @@ impl TrinoDialect {
             // VARIANCE -> VAR_SAMP in Trino
             "VARIANCE" if !f.args.is_empty() => {
                 Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    source_dialect: None,
+
                     name: "VAR_SAMP".to_string(),
                     args: f.args,
                     distinct: f.distinct,

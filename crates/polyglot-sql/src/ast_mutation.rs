@@ -93,6 +93,8 @@ pub(crate) fn binary(kind: BinaryKind, left: Expression, right: Expression) -> E
             inferred_type: None,
         })),
         BinaryKind::RLike => Expression::RegexpLike(Box::new(RegexpFunc {
+            options: None,
+
             this: operation.left,
             pattern: operation.right,
             flags: None,
@@ -412,6 +414,7 @@ pub(crate) fn append_window(
 
 pub(crate) fn append_lock(expression: &mut Expression, kind: LockKind) -> Result<()> {
     as_select_mut(expression, "lock")?.locks.push(Lock {
+        ignore_locked: false,
         update: match kind {
             LockKind::Update => Some(Box::new(Expression::Boolean(BooleanLiteral {
                 value: true,
@@ -430,6 +433,8 @@ pub(crate) fn append_hint(expression: &mut Expression, text: String) -> Result<(
     select
         .hint
         .get_or_insert_with(|| Hint {
+            source_dialect: None,
+
             expressions: Vec::new(),
         })
         .expressions
@@ -455,6 +460,7 @@ pub(crate) fn create_table_as(
         temporary,
         or_replace: replace,
         table_modifier: None,
+        source_dialect: None,
         as_select: Some(query),
         as_select_parenthesized: false,
         on_commit: None,
@@ -516,19 +522,13 @@ pub(crate) fn set_case_else(expression: &mut Expression, result: Expression) -> 
     Ok(())
 }
 
-pub(crate) fn subquery(
-    query: Expression,
-    alias: Option<Identifier>,
-    modifiers_inside: bool,
-) -> Result<Expression> {
-    if !is_query(&query) {
-        return Err(invalid_method("subquery", &query));
-    }
-    Ok(Expression::Subquery(Box::new(Subquery {
-        this: query,
+/// Wrap an expression in a derived table with an explicit AS alias.
+pub(crate) fn derived_table(this: Expression, alias: Option<Identifier>) -> Expression {
+    Expression::Subquery(Box::new(Subquery {
+        this,
         alias,
         column_aliases: Vec::new(),
-        alias_explicit_as: false,
+        alias_explicit_as: true,
         alias_keyword: None,
         order_by: None,
         limit: None,
@@ -537,10 +537,35 @@ pub(crate) fn subquery(
         sort_by: None,
         cluster_by: None,
         lateral: false,
-        modifiers_inside,
+        modifiers_inside: true,
         trailing_comments: Vec::new(),
         inferred_type: None,
-    })))
+    }))
+}
+
+/// Qualify a column without losing the output identifier's quoting.
+pub(crate) fn qualified_column(table: &str, name: &Identifier) -> Expression {
+    let Expression::Column(mut c) = Expression::qualified_column(table, &name.name) else {
+        unreachable!()
+    };
+    c.name = name.clone();
+    Expression::Column(c)
+}
+
+pub(crate) fn subquery(
+    query: Expression,
+    alias: Option<Identifier>,
+    modifiers_inside: bool,
+) -> Result<Expression> {
+    if !is_query(&query) {
+        return Err(invalid_method("subquery", &query));
+    }
+    let Expression::Subquery(mut subquery) = derived_table(query, alias) else {
+        unreachable!()
+    };
+    subquery.alias_explicit_as = false;
+    subquery.modifiers_inside = modifiers_inside;
+    Ok(Expression::Subquery(subquery))
 }
 
 pub(crate) fn merge(target: Expression) -> Expression {

@@ -119,30 +119,8 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
         expr
     };
 
-    // Oracle: LIMIT -> FETCH FIRST, OFFSET -> OFFSET ROWS
-    let expr = if matches!(target, DialectType::Oracle) {
-        if let Expression::Select(mut select) = expr {
-            if let Some(limit) = select.limit.take() {
-                // Convert LIMIT to FETCH FIRST n ROWS ONLY
-                select.fetch = Some(crate::expressions::Fetch {
-                    direction: "FIRST".to_string(),
-                    count: Some(limit.this),
-                    percent: false,
-                    rows: true,
-                    with_ties: false,
-                });
-            }
-            // Add ROWS to OFFSET if present
-            if let Some(ref mut offset) = select.offset {
-                offset.rows = Some(true);
-            }
-            Expression::Select(select)
-        } else {
-            expr
-        }
-    } else {
-        expr
-    };
+    // Oracle LIMIT/OFFSET -> OFFSET n ROWS FETCH FIRST m ROWS ONLY is rendered by the
+    // generator (`LimitFetchStyle::FetchFirst`), so it also applies to nested queries.
 
     // Handle CreateTable WITH properties transformation before recursive transforms
     let expr = if let Expression::CreateTable(mut ct) = expr {
@@ -255,15 +233,27 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
             });
             for constraint in &mut ct.constraints {
                 if let crate::expressions::TableConstraint::PrimaryKey {
-                    columns, modifiers, ..
+                    columns,
+                    key_parts,
+                    modifiers,
+                    ..
                 } = constraint
                 {
-                    // Strip ASC/DESC from column names
-                    for col in columns.iter_mut() {
-                        if col.name.ends_with(" ASC") {
-                            col.name = col.name[..col.name.len() - 4].to_string();
-                        } else if col.name.ends_with(" DESC") {
-                            col.name = col.name[..col.name.len() - 5].to_string();
+                    if key_parts.is_empty() {
+                        // Older ASTs encoded order modifiers in column names.
+                        for col in columns.iter_mut() {
+                            if col.name.ends_with(" ASC") {
+                                col.name = col.name[..col.name.len() - 4].to_string();
+                            } else if col.name.ends_with(" DESC") {
+                                col.name = col.name[..col.name.len() - 5].to_string();
+                            }
+                        }
+                    } else {
+                        // Structured key names are literal; only remove the
+                        // sort modifiers, including for names ending in DESC.
+                        for part in key_parts.iter_mut() {
+                            part.asc = false;
+                            part.desc = false;
                         }
                     }
                     // Strip TSQL-specific modifiers
@@ -908,6 +898,7 @@ pub(super) fn transform_select_into(
                         temporary: is_temp,
                         or_replace: false,
                         table_modifier: None,
+                        source_dialect: None,
                         as_select: Some(Expression::Select(new_select)),
                         as_select_parenthesized: false,
                         on_commit: None,

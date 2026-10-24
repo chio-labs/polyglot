@@ -374,6 +374,8 @@ pub(super) fn rewrite(
                                 };
                                 Ok(Expression::RegexpLike(Box::new(
                                     crate::expressions::RegexpFunc {
+                                        options: None,
+
                                         this,
                                         pattern,
                                         flags,
@@ -396,6 +398,8 @@ pub(super) fn rewrite(
                                 };
                                 Ok(Expression::RegexpLike(Box::new(
                                     crate::expressions::RegexpFunc {
+                                        options: None,
+
                                         this,
                                         pattern,
                                         flags,
@@ -1126,6 +1130,7 @@ pub(super) fn rewrite(
                                         crate::expressions::WithinGroup {
                                             this: inner,
                                             order_by: vec![crate::expressions::Ordered {
+                                                nulls_auto: false,
                                                 this: column,
                                                 desc: false,
                                                 nulls_first: None,
@@ -1169,6 +1174,7 @@ pub(super) fn rewrite(
                                         crate::expressions::WithinGroup {
                                             this: inner,
                                             order_by: vec![crate::expressions::Ordered {
+                                                nulls_auto: false,
                                                 this: column,
                                                 desc: false,
                                                 nulls_first: None,
@@ -1395,6 +1401,9 @@ pub(super) fn rewrite(
                                     if is_text {
                                         Ok(Expression::JsonExtractScalar(Box::new(
                                             crate::expressions::JsonExtractFunc {
+                                                options: None,
+                                                source_dialect: None,
+
                                                 this: json_expr,
                                                 path: Expression::string(&json_path),
                                                 returning: None,
@@ -1409,6 +1418,9 @@ pub(super) fn rewrite(
                                     } else {
                                         Ok(Expression::JsonExtract(Box::new(
                                             crate::expressions::JsonExtractFunc {
+                                                options: None,
+                                                source_dialect: None,
+
                                                 this: json_expr,
                                                 path: Expression::string(&json_path),
                                                 returning: None,
@@ -1554,6 +1566,8 @@ pub(super) fn rewrite(
                                     // Convert to RegexpLike which generates as RLIKE/~/REGEXP_LIKE per dialect
                                     Ok(Expression::RegexpLike(Box::new(
                                         crate::expressions::RegexpFunc {
+                                            options: None,
+
                                             this: str_expr,
                                             pattern,
                                             flags: None,
@@ -2427,6 +2441,9 @@ pub(super) fn rewrite(
                                     let path = args.remove(0);
                                     Ok(Expression::JsonExtract(Box::new(
                                         crate::expressions::JsonExtractFunc {
+                                            options: None,
+                                            source_dialect: None,
+
                                             this: json_expr,
                                             path,
                                             returning: None,
@@ -2570,6 +2587,10 @@ pub(super) fn rewrite(
                         // ARRAY_SUM(lambda, array) from Doris -> ClickHouse arraySum
                         "ARRAY_SUM" if matches!(target, DialectType::ClickHouse) => {
                             Ok(Expression::Function(Box::new(Function {
+                                on_error: None,
+                                qualified_name: Vec::new(),
+                                source_dialect: None,
+
                                 name: "arraySum".to_string(),
                                 args: f.args,
                                 distinct: f.distinct,
@@ -3475,6 +3496,8 @@ pub(super) fn rewrite(
                                 {
                                     operators::snowflake_regexp_like_to_clickhouse(
                                         crate::expressions::RegexpFunc {
+                                            options: None,
+
                                             this: str_expr,
                                             pattern,
                                             flags,
@@ -3505,6 +3528,8 @@ pub(super) fn rewrite(
                                 }
                                 _ => Ok(Expression::RegexpLike(Box::new(
                                     crate::expressions::RegexpFunc {
+                                        options: None,
+
                                         this: str_expr,
                                         pattern,
                                         flags,
@@ -5579,7 +5604,7 @@ pub(super) fn rewrite(
                                         ))))
                                     }
                                 }
-                                DialectType::Redshift => {
+                                DialectType::Redshift | DialectType::Vertica => {
                                     let unit = Expression::Identifier(Identifier::new("DAY"));
                                     Ok(Expression::Function(Box::new(Function::new(
                                         "DATEDIFF".to_string(),
@@ -6832,9 +6857,12 @@ pub(super) fn rewrite(
                         // GETDATE() -> CURRENT_TIMESTAMP for non-TSQL targets
                         "GETDATE" if f.args.is_empty() => match target {
                             DialectType::TSQL => Ok(Expression::Function(f)),
-                            DialectType::Redshift => Ok(Expression::Function(Box::new(
-                                Function::new("GETDATE".to_string(), vec![]),
-                            ))),
+                            DialectType::Redshift | DialectType::Vertica => {
+                                Ok(Expression::Function(Box::new(Function::new(
+                                    "GETDATE".to_string(),
+                                    vec![],
+                                ))))
+                            }
                             _ => Ok(Expression::CurrentTimestamp(
                                 crate::expressions::CurrentTimestamp {
                                     precision: None,
@@ -6977,6 +7005,9 @@ pub(super) fn rewrite(
                             let this = args.remove(0);
                             Ok(Expression::JsonExtract(Box::new(
                                 crate::expressions::JsonExtractFunc {
+                                    options: None,
+                                    source_dialect: None,
+
                                     this,
                                     path,
                                     returning: None,
@@ -7098,6 +7129,10 @@ pub(super) fn rewrite(
                                 DialectType::Oracle | DialectType::Redshift => {
                                     Ok(Expression::Function(f))
                                 }
+                                // Vertica: SYSDATE is a synonym for GETDATE()
+                                DialectType::Vertica => Ok(Expression::Function(Box::new(
+                                    Function::new("GETDATE".to_string(), vec![]),
+                                ))),
                                 DialectType::Snowflake => {
                                     // Snowflake uses SYSDATE() with parens
                                     let mut f = *f;
@@ -9604,6 +9639,10 @@ pub(super) fn rewrite(
                                 DialectType::PostgreSQL => {
                                     // PostgreSQL: CURRENT_SCHEMA (no parens)
                                     Ok(Expression::Function(Box::new(Function {
+                                        on_error: None,
+                                        qualified_name: Vec::new(),
+                                        source_dialect: None,
+
                                         name: "CURRENT_SCHEMA".to_string(),
                                         args: vec![],
                                         distinct: false,
@@ -10094,6 +10133,7 @@ pub(super) fn rewrite(
                                     | DialectType::Teradata
                                     | DialectType::Spark
                                     | DialectType::Databricks
+                                    | DialectType::Vertica
                             );
                             if keep_as_decode {
                                 return Ok(Expression::Function(f));
@@ -10995,6 +11035,8 @@ pub(super) fn rewrite(
                             }
                             Ok(Expression::AggregateFunction(Box::new(
                                 crate::expressions::AggregateFunction {
+                                    source_dialect: None,
+
                                     name: "JSON_AGG".to_string(),
                                     args: vec![*ja.this],
                                     distinct: false,
@@ -11078,9 +11120,11 @@ pub(super) fn rewrite(
                                     let this = cpa.expressions[0].clone();
                                     let separator = cpa.params.first().cloned();
                                     crate::expressions::ListAggFunc {
+                                        source_dialect: None,
                                         this,
                                         separator,
                                         on_overflow: None,
+                                        max_length: None,
                                         order_by: None,
                                         distinct: false,
                                         filter: None,
@@ -11231,6 +11275,7 @@ pub(super) fn rewrite(
                                 inferred_type: None,
                             }));
                             new_order_by.push(crate::expressions::Ordered {
+                                nulls_auto: false,
                                 this: case_expr,
                                 desc: false,
                                 nulls_first: None,
@@ -11676,6 +11721,7 @@ pub(super) fn rewrite(
                         | DialectType::Teradata
                         | DialectType::Spark
                         | DialectType::Databricks
+                        | DialectType::Vertica
                 );
                 let (a, b, c) = if let Expression::Nvl2(nvl2) = e {
                     if nvl2_native {
@@ -11763,6 +11809,8 @@ pub(super) fn rewrite(
                             Ok(Expression::Paren(Box::new(Paren {
                                 this: Expression::RegexpLike(Box::new(
                                     crate::expressions::RegexpFunc {
+                                        options: None,
+
                                         this: arg,
                                         pattern: Expression::Literal(Box::new(Literal::String(
                                             "^[[:ascii:]]*$".to_string(),
@@ -12719,6 +12767,12 @@ pub(super) fn normalize_bigquery_function(
     }
 
     match name.as_str() {
+        "DATE" if target == DialectType::DuckDB && args.len() == 2 => {
+            let value = args.remove(0);
+            let zone = args.remove(0);
+            temporal::bigquery_date_to_duckdb(value, zone)
+        }
+
         // TIMESTAMP_DIFF(date1, date2, unit) -> TIMESTAMPDIFF(unit, date2, date1)
         // (BigQuery: result = date1 - date2, Standard: result = end - start)
         "TIMESTAMP_DIFF" | "DATETIME_DIFF" | "TIME_DIFF" if args.len() == 3 => {
@@ -14615,6 +14669,8 @@ pub(super) fn normalize_bigquery_function(
             let pattern = args.remove(0);
             Ok(Expression::RegexpLike(Box::new(
                 crate::expressions::RegexpFunc {
+                    options: None,
+
                     this: str_expr,
                     pattern,
                     flags: None,
@@ -15684,7 +15740,8 @@ pub(super) fn normalize_bigquery_function(
                 | DialectType::Athena
                 | DialectType::Snowflake
                 | DialectType::TSQL
-                | DialectType::Fabric => {
+                | DialectType::Fabric
+                | DialectType::DataFusion => {
                     let x = args.remove(0);
                     let y = args.remove(0);
                     // Wrap complex expressions in parens to preserve precedence
@@ -16468,6 +16525,9 @@ pub(super) fn normalize_bigquery_function(
                     let path = args.remove(0);
                     Ok(Expression::JsonExtract(Box::new(
                         crate::expressions::JsonExtractFunc {
+                            options: None,
+                            source_dialect: None,
+
                             this: json_expr,
                             path,
                             returning: None,
@@ -16505,6 +16565,9 @@ pub(super) fn normalize_bigquery_function(
                     let path = args.remove(0);
                     let arrow =
                         Expression::JsonExtract(Box::new(crate::expressions::JsonExtractFunc {
+                            options: None,
+                            source_dialect: None,
+
                             this: json_expr,
                             path,
                             returning: None,
@@ -16665,6 +16728,10 @@ pub(super) fn normalize_bigquery_function(
                         }
                     } else {
                         Ok(Expression::Function(Box::new(Function {
+                            on_error: None,
+                            qualified_name: Vec::new(),
+                            source_dialect: None,
+
                             name: f.name,
                             args,
                             distinct: f.distinct,
@@ -16688,6 +16755,10 @@ pub(super) fn normalize_bigquery_function(
                     // For other targets (Hive/Spark/BigQuery): pass through as-is
                     // BigQuery's default group behavior matches Hive/Spark for 2-arg case
                     Ok(Expression::Function(Box::new(Function {
+                        on_error: None,
+                        qualified_name: Vec::new(),
+                        source_dialect: None,
+
                         name: f.name,
                         args,
                         distinct: f.distinct,
@@ -17070,6 +17141,10 @@ pub(super) fn normalize_bigquery_function(
 
         // All others: pass through
         _ => Ok(Expression::Function(Box::new(Function {
+            on_error: None,
+            qualified_name: Vec::new(),
+            source_dialect: None,
+
             name: f.name,
             args,
             distinct: f.distinct,

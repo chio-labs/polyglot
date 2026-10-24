@@ -333,6 +333,7 @@ impl<'a> Resolver<'a> {
                     &subquery.column_aliases,
                 )
             }
+            Expression::Values(values) => self.get_values_column_names(values),
             Expression::Select(select) => {
                 // For derived tables that are SELECT expressions
                 self.get_select_column_names(select)
@@ -366,7 +367,6 @@ impl<'a> Resolver<'a> {
             Expression::Unnest(unnest) => unnest_output_columns(unnest),
             Expression::Lateral(lateral) => lateral_output_columns(lateral),
             Expression::LateralView(lateral_view) => lateral_view_output_columns(lateral_view),
-            Expression::Values(values) => values_output_columns(values),
             Expression::Paren(paren) => self.get_source_columns_for_expression(&paren.this)?,
             _ => Vec::new(),
         };
@@ -396,7 +396,7 @@ impl<'a> Resolver<'a> {
                 self.get_named_selects(&subquery.this),
                 &subquery.column_aliases,
             ),
-            Expression::Values(values) => values_output_columns(values),
+            Expression::Values(values) => self.get_values_column_names(values),
             Expression::Alias(alias) => {
                 let columns = self.get_named_selects(&alias.this);
                 apply_alias_columns(columns, &alias.column_aliases)
@@ -481,6 +481,26 @@ impl<'a> Resolver<'a> {
                 columns
             })
             .collect()
+    }
+
+    fn get_values_column_names(&self, values: &crate::expressions::Values) -> Vec<String> {
+        let width = values
+            .expressions
+            .first()
+            .map_or(0, |row| row.expressions.len());
+        let prefix = match self.dialect {
+            Some(DialectType::Snowflake) => Some("COLUMN"),
+            Some(DialectType::PostgreSQL) => Some("column"),
+            // Default VALUES names are not standardized. Keep each unnamed
+            // ordinal open, so an alias list still renames it by position.
+            _ => None,
+        };
+        apply_alias_columns(
+            (1..=width)
+                .map(|ordinal| prefix.map_or_else(|| "*".to_owned(), |p| format!("{p}{ordinal}")))
+                .collect(),
+            &values.column_aliases,
+        )
     }
 
     /// Get the alias or name for a select expression
@@ -571,7 +591,7 @@ impl<'a> Resolver<'a> {
                 self.get_named_selects(&subquery.this),
                 &subquery.column_aliases,
             ),
-            Expression::Values(values) => values_output_columns(values),
+            Expression::Values(values) => self.get_values_column_names(values),
             Expression::Select(select) => self.get_select_column_names(select),
             Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => self
                 .get_source_columns_from_set_op(source)
@@ -746,21 +766,6 @@ impl<'a> Resolver<'a> {
             None
         }
     }
-}
-
-fn values_output_columns(values: &crate::expressions::Values) -> Vec<String> {
-    if !values.column_aliases.is_empty() {
-        return values
-            .column_aliases
-            .iter()
-            .map(|column| column.name.clone())
-            .collect();
-    }
-    let width = values
-        .expressions
-        .first()
-        .map_or(0, |row| row.expressions.len());
-    (1..=width).map(|index| format!("column{index}")).collect()
 }
 
 fn normalize_column_name(name: &str, dialect: Option<DialectType>) -> String {

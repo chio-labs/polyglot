@@ -4,6 +4,294 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.13.4] - Unreleased
+
+### Changed
+
+- Public Rust AST types now include `Lateral.column_aliases_quoted` and
+  `key_parts` on `TableConstraint::PrimaryKey` and `TableConstraint::Unique`.
+  Callers constructing these types directly may need to update struct literals
+  or exhaustive matches. Older serialized ASTs remain readable; unquoted
+  LATERAL aliases and simple unquoted constraint keys retain their existing
+  JSON shape.
+- Shared Rust verification and CI now run dedicated regression suites for
+  DuckDB relation aliases, numeric exponent boundaries, query analysis,
+  predicate grouping, DuckDB JSON arrows and lambdas, and quoted relation
+  columns. Coverage also includes ordinality, quoted constraint keys, legacy
+  AST JSON, and parser depth limits.
+
+### Fixed
+
+- Query analysis includes every base table in parenthesized join groups,
+  including nested joins, CTE-backed members, and subqueries in join predicates.
+  Aliased and re-aliased groups retain their scope boundaries and column aliases,
+  without leaking internal relation names or duplicating predicate references.
+  ([#491](https://github.com/tobilg/polyglot/pull/491))
+- DuckDB accepts unreserved words such as `owned`, `match`, and `final` as
+  explicit or implicit relation aliases on tables, subqueries, and table
+  functions. Column alias lists, joins, correlated queries, and following
+  clauses remain intact; ClickHouse still treats `FINAL` as a table modifier.
+  ([#493](https://github.com/tobilg/polyglot/pull/493))
+- Numeric tokenization only consumes an exponent marker and optional sign when
+  exponent digits follow. Compact expressions such as `CASE WHEN TRUE THEN
+  13END` no longer lose the start of `END`, while valid scientific notation
+  continues to parse correctly.
+  ([#495](https://github.com/tobilg/polyglot/pull/495))
+- SQLite and PostgreSQL bitwise operators use their shared left-associative
+  precedence tier, including PostgreSQL `#` XOR while retaining `^` as
+  exponentiation. Cross-dialect generation groups operands where precedence
+  differs, and bitwise shifts participate in dialect transformations.
+  ([#500](https://github.com/tobilg/polyglot/issues/500))
+- SQLite concatenation and JSON arrows (`||`, `->`, and `->>`) share the correct
+  precedence above multiplication. Parsing and cross-dialect generation preserve
+  their grouping with arithmetic, unary operators, `COLLATE`, and other JSON
+  extractions, without interpreting SQLite JSON arrows as lambdas.
+  ([#501](https://github.com/tobilg/polyglot/issues/501))
+- SQL generation preserves boolean operand grouping in comparisons, `IS NULL`,
+  truth tests, `IS JSON`, and `IS [NOT] DISTINCT FROM`, including expressions
+  constructed through the AST builder. Prefix `NOT` and nested boolean
+  connectors no longer change the meaning of the generated predicate.
+  ([#497](https://github.com/tobilg/polyglot/pull/497))
+- ClickHouse accepts operand-position `NOT` with its native comparison
+  precedence, preserving surrounding operands and following clauses. Negated
+  `LIKE`/`ILIKE` predicates retain quoted identifiers and query-analysis
+  references, and transformed `notLike` expressions round-trip consistently.
+- DuckDB distinguishes JSON extraction arrows from lambdas using the function
+  argument context. Dynamic and list-valued paths, nested lambdas, `COLUMNS`,
+  schema-qualified calls, and receiver-style list operations retain their
+  meaning. JSON `->` and scalar `->>` keep their distinct precedence, computed
+  paths and mixed extraction chains; generation groups arrow operands where
+  needed. Parenthesized lambdas respect parser depth limits.
+  ([#499](https://github.com/tobilg/polyglot/pull/499))
+- DuckDB casts accept JSON-arrow operands, including computed paths and nested
+  casts. Nested cast expressions isolate and restore the surrounding JSON-path
+  context, preserving the `AS` type separator, subsequent arrows, and following
+  query clauses.
+- LATERAL relation and column aliases preserve spaces, case, escaped quotes,
+  and explicit or implicit `AS` through parsing, generation, and AST JSON
+  round trips. Complete quoted names such as `"items(1)"`, `"items DESC"`, and
+  `"value ASC"` remain single identifiers in declarations and references rather
+  than being interpreted as index-prefix or ordering syntax.
+  ([#506](https://github.com/tobilg/polyglot/pull/506))
+- `LATERAL UNNEST ... WITH ORDINALITY` emits ordinality only once when both the
+  LATERAL wrapper and the inner function carry the flag, including older ASTs.
+- Quoted `PRIMARY KEY` and `UNIQUE` column names remain separate from index
+  prefix lengths and sort modifiers. Names containing parentheses or ending in
+  `ASC`/`DESC` retain their full spelling, while MySQL prefix/order syntax,
+  SQLite primary-key ordering, Spark/Hive normalization, and Databricks
+  `TIMESERIES` keys preserve their behavior. Legacy ASTs with encoded index
+  suffixes remain supported.
+- TypeScript SDK `addWhere`, numeric `setLimit`, and numeric `setOffset` throw
+  operation-specific errors when WASM cannot deserialize or transform the AST,
+  instead of silently returning the original query without the requested
+  clause. Failed mutations leave the input AST unchanged.
+  ([#503](https://github.com/tobilg/polyglot/pull/503))
+
+## [0.13.3] - 2026-10-09
+
+### Added
+
+- Optional Python integration tests compare DuckDB integer-division queries
+  with generated DataFusion SQL in both engines, in default and strict modes.
+  Coverage includes nested expressions, decimal operands, large integers,
+  numeric casts, zero divisors, and NULL values.
+
+### Changed
+
+- Routine Rust verification now runs the MOD precedence regression suite.
+
+### Fixed
+
+- DuckDB integer `//` now lowers for the DataFusion target as
+  `a / NULLIF(b, 0)`. DataFusion's `/` already truncates integer operands
+  toward zero and performs float division on a floating operand, so the
+  result matches DuckDB, including `NULL` on a zero divisor, for resolved
+  numeric operands. Unresolved columns and function return types report an
+  error in both default and strict modes; explicit numeric casts remain
+  supported. Decimal operands use floating arithmetic. Nested DuckDB `/`
+  expressions retain floating division through functions, casts, and CASE,
+  including column operands and user-written `NULLIF` divisors. Numeric casts
+  from known fractional operands to integers inside `//` round as in DuckDB.
+- `MOD(a, b)` lowered to the infix `%` operator keeps the call's grouping
+  under arithmetic and unary operators, including nested calls and bitwise
+  arguments. DataFusion, which has no `MOD` function, renders `%` as well.
+- Infix integer division preserves operand grouping, including
+  `100 // MOD(7, 4)` and integer-division functions lowered to `//` or `DIV`.
+- Arithmetic expressions explicitly group bitwise operands to preserve
+  precedence across dialects.
+
+## [0.13.2] - 2026-10-08
+
+### Changed
+
+- Routine Rust verification now includes dedicated DuckDB integer-division and
+  `ORDER BY ALL` regression suites.
+- Changelog version headings now link to comparisons against the preceding
+  release tag.
+
+### Fixed
+
+- DuckDB `//` parses as a single integer-division operator with the correct
+  precedence and round-trips without becoming two division operators.
+  Cross-dialect conversions preserve integer truncation, fractional results
+  for floating-point and decimal operands, and `NULL` on division by zero,
+  including nested expressions and typed function arguments. SQLite uses
+  integer arithmetic and a truncating cast to preserve large-integer precision.
+  Unresolved operand types and unsupported integer-division targets report errors.
+  ([#484](https://github.com/tobilg/polyglot/pull/484))
+- `ORDER BY ALL` expands to positional sort keys for targets without native
+  support, including compound and parenthesized queries, while retaining native
+  syntax for supported DuckDB, Snowflake, ClickHouse, Spark, and Databricks
+  queries. Sort direction and NULL ordering are preserved. Conversions requiring
+  expansion reject unknown projection widths (`*`, nested `COLUMNS(...)`, or
+  `UNION BY NAME`) and incompatible MySQL NULL ordering. Snowflake aggregate projections
+  use positional ordering. The `ALL` keyword remains distinct from ordinary
+  identifiers through column renaming, identifier quoting, and AST JSON round
+  trips. Ordering on parenthesized queries now participates in dialect and
+  NULL-ordering transformations.
+  ([#485](https://github.com/tobilg/polyglot/pull/485))
+- `DISTINCT ON` emulation resolves positional sort keys to their projected
+  expressions before constructing the ranking window, including keys expanded
+  from `ORDER BY ALL` for targets with native `ALL` support. Sort keys that
+  would require nesting window functions report an unsupported conversion.
+  ([#485](https://github.com/tobilg/polyglot/pull/485))
+- macOS Python wheel builds no longer depend on successful `sccache` remote-cache
+  initialization. Explicit stable Rust setup and a best-effort Rust artifact
+  cache prevent cache failures from interrupting wheel builds.
+
+## [0.13.1] - 2026-09-30
+
+### Fixed
+
+- Compound queries now attach trailing `FETCH FIRST/NEXT` to the complete
+  `UNION`, `INTERSECT`, or `EXCEPT` result and preserve `PERCENT`, `WITH TIES`,
+  offsets, and branch-local limits through parsing and generation. Percentage
+  limits also survive set-operation wrapping for T-SQL. Existing bare-count
+  AST fields and JSON remain unchanged; metadata-bearing compound limits use
+  the existing `Limit` and `Fetch` expression variants. Unsupported percentage
+  and ties conversions are reported through the configured unsupported policy.
+
+- Oracle: `LIMIT` is now rendered as `[OFFSET n ROWS] FETCH FIRST m ROWS ONLY`
+  by the generator itself, driven by `GeneratorConfig::limit_fetch_style`
+  (Oracle now defaults to `LimitFetchStyle::FetchFirst`). This covers ASTs built
+  with the builder or generated without `transpile`, as well as subqueries, CTEs,
+  `INSERT ... SELECT`, and set operations that previously kept `LIMIT`.
+  `LIMIT ALL` / `LIMIT NULL` are dropped instead of becoming `FETCH FIRST ALL`,
+  and T-SQL `TOP n [PERCENT] [WITH TIES]` maps to the equivalent `FETCH FIRST`.
+  T-SQL's `limit_fetch_style` is now `Top`, matching its existing output.
+  An explicit `FetchFirst` config takes precedence over dialect-specific
+  LIMIT/OFFSET rendering (e.g. Presto/Trino `OFFSET n LIMIT m`), except on
+  T-SQL/Fabric, which keep their TOP / `OFFSET ... FETCH NEXT` output.
+  ([#480](https://github.com/tobilg/polyglot/issues/480))
+- Set operations: a branch-local row limit that renders as a trailing clause
+  (e.g. T-SQL `SELECT TOP 5 ...` in a `UNION` branch transpiled to `LIMIT` or
+  `FETCH FIRST`) is now parenthesized, so it no longer limits the whole set
+  operation. SQLite, which rejects parenthesized operands, gets
+  `SELECT * FROM (...)` instead. Operands wrapped in comments (e.g. a comment
+  before `UNION ALL`) are grouped the same way, with the comment kept outside
+  the parentheses.
+
+## [0.13.0] - 2026-09-24
+
+### Added
+
+- SAP HANA dialect support across Rust, TypeScript/WASM, Python, FFI, Go, and
+  the playground, with a `dialect-hana` feature included in `all-dialects`.
+  Native parsing and generation cover HANA types and functions, row/column
+  tables, partitioning and storage clauses, `UPSERT`, `CALL`, hierarchy queries,
+  JSON/XML result serialization, query hints, regex syntax, and locking clauses.
+  Shared AST nodes retain source semantics through traversal and JSON round trips;
+  cross-dialect conversions reject constructs whose semantics cannot be preserved.
+  ([#469](https://github.com/tobilg/polyglot/pull/469))
+- Vertica dialect support across the same APIs and playground, with a
+  `dialect-vertica` feature included in `all-dialects`. Native coverage includes
+  Vertica numeric defaults, arrays/sets/rows, zero-based subscripts,
+  `USING PARAMETERS`, `TIMESERIES`, `MATCH`, partitioned `LIMIT`, projections,
+  segmentation, `KSAFE`, epoch queries, and native casts and functions.
+  Supported conversions preserve array bounds, NULL ordering, aggregate filters,
+  and statement-clock semantics; unsupported conversions report errors instead
+  of silently changing behavior. ([#468](https://github.com/tobilg/polyglot/pull/468), [#467](https://github.com/tobilg/polyglot/issues/467))
+- Rust `transform_all` for complete, iterative, bottom-up AST transformation.
+  It visits every expression covered by the read-only walkers, including typed
+  function arguments and clause expressions, without cloning subtrees.
+  Each original node is visited once, and callback errors propagate immediately.
+  ([#475](https://github.com/tobilg/polyglot/issues/475))
+- Athena, Presto, and Trino `TO_ISO8601` conversion to DuckDB for verified input
+  types. Dates and supported unzoned Athena/Trino timestamp precisions have exact
+  translations; permissive mode also supports normalized timestamp formatting
+  and UTC output for zoned values. Strict mode rejects conversions that cannot
+  preserve source precision or time-zone semantics, and unresolved types or
+  unsupported precision still produce errors. ([#466](https://github.com/tobilg/polyglot/issues/466))
+- Python expression classes and stubs for `Upsert`, `StorageProperty`,
+  `Hierarchy`, `ViewParameter`, `Call`, and `Vertica`. The TypeScript SDK's
+  `isQuery` guard recognizes `UPSERT`.
+
+### Changed
+
+- Public Rust AST enums and structs include new dialect syntax, type variants,
+  and source-semantics fields. Callers using exhaustive enum matches or struct
+  literals may need to update them. Shared optimizers and AST helpers preserve
+  the new metadata and qualified function names.
+- AST rename and replacement helpers use complete expression traversal while
+  retaining their embedded-wrapper callbacks. Existing `transform`,
+  `transform_map`, and `transform_owned` keep their selective traversal behavior
+  for compatibility; use `transform_all` when complete coverage is required.
+  ([#475](https://github.com/tobilg/polyglot/issues/475))
+- Read-only AST walkers avoid constructing child paths, and dialect rewrites
+  share an iterative traversal engine for common nodes. HANA compatibility
+  checks inspect AST syntax and types directly, eliminating duplicate SQL
+  generation during validation.
+- Latency and allocation benchmarks share SQL inputs and cover nested HANA
+  parsing and HANA-to-DuckDB transpilation. A manual DuckDB execution benchmark
+  covers Vertica array conversion. Routine Rust verification now runs the dialect
+  matrix, and feature-gate checks cover both new dialects.
+- Three incorrect SQLGlot BigQuery-to-DuckDB expectations are narrowly excluded
+  because they narrow BigQuery `NUMERIC(38, 9)` to DuckDB's default
+  `DECIMAL(18, 3)`. Native execution regressions cover precision preservation
+  and both rounding modes. ([#479](https://github.com/tobilg/polyglot/issues/479))
+
+### Fixed
+
+- Snowflake `PIVOT`/`UNPIVOT` over CTEs no longer causes recursive lineage
+  analysis or stack overflow. Star expansion remains conservative when a source
+  changes its output columns. ([#470](https://github.com/tobilg/polyglot/issues/470))
+- Schema validation resolves `VALUES` sources, including Snowflake `COLUMN1`
+  and PostgreSQL `column1` defaults, explicit column aliases, and quoted names.
+  ([#471](https://github.com/tobilg/polyglot/issues/471))
+- `LATERAL` validation resolves preceding sources and chained lateral queries
+  without admitting forward references, self-references, or unrelated CTEs.
+  ([#472](https://github.com/tobilg/polyglot/issues/472))
+- CTE type inference only pre-binds recursive anchors when recursion is enabled
+  by the query or dialect. Non-recursive CTEs can reference a same-named physical
+  table without incorrectly narrowing the inferred output type.
+  ([#473](https://github.com/tobilg/polyglot/issues/473))
+- Schema validation checks `INSERT ... SELECT` source queries and their CTEs,
+  keeping source and target scopes separate and avoiding duplicate diagnostics
+  for leading CTEs. ([#474](https://github.com/tobilg/polyglot/issues/474))
+- AST column renaming and replacement reach arguments of typed functions such
+  as `INSTR`, `NVL2`, `LAST_DAY`, `YEAR`, and `STARTS_WITH`, including deeply
+  nested expressions. ([#475](https://github.com/tobilg/polyglot/issues/475))
+- BigQuery `DATE(timestamp, time_zone)` conversion to DuckDB preserves timestamp
+  instants, BigQuery's UTC default, named time zones, and literal numeric offsets
+  without depending on DuckDB's session time zone.
+  ([#476](https://github.com/tobilg/polyglot/issues/476))
+- BigQuery variable interval amounts generate valid parenthesized DuckDB SQL,
+  and functions inside intervals are transformed before the enclosing date
+  arithmetic. ([#477](https://github.com/tobilg/polyglot/issues/477))
+- BigQuery named query parameters parse as parameters rather than columns and
+  generate DuckDB `$name` placeholders instead of `ABS(name)`. Quoted names,
+  field access, array subscripts, and `IN UNNEST` are supported while retaining
+  other dialects' `@` absolute-value behavior.
+  ([#478](https://github.com/tobilg/polyglot/issues/478))
+- BigQuery-to-DuckDB transpilation preserves explicit decimal precision and
+  scale and maps bare `NUMERIC`/`DECIMAL` to `DECIMAL(38, 9)`, including in
+  `ROUND`, safe casts, nested types, and table definitions. BigQuery's restriction
+  on parameterized cast targets is applied during BigQuery SQL generation,
+  without discarding precision from the shared AST.
+  ([#479](https://github.com/tobilg/polyglot/issues/479))
+- CommonJS SDK builds defer the WASM startup call until after instantiation
+  and export binding, avoiding calls to unavailable `__wbindgen_start` exports.
+
 ## [0.12.2] - 2026-09-22 (Python fork)
 
 ### Fixed
@@ -1903,10 +2191,47 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.13.4]: https://github.com/tobilg/polyglot/compare/v0.13.3...v0.13.4
+[0.13.3]: https://github.com/tobilg/polyglot/compare/v0.13.2...v0.13.3
+[0.13.2]: https://github.com/tobilg/polyglot/compare/v0.13.1...v0.13.2
+[0.13.1]: https://github.com/tobilg/polyglot/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/tobilg/polyglot/compare/v0.12.1...v0.13.0
+[0.12.1]: https://github.com/tobilg/polyglot/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/tobilg/polyglot/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/tobilg/polyglot/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/tobilg/polyglot/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/tobilg/polyglot/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/tobilg/polyglot/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/tobilg/polyglot/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/tobilg/polyglot/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/tobilg/polyglot/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/tobilg/polyglot/compare/v0.6.3...v0.7.0
+[0.6.3]: https://github.com/tobilg/polyglot/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/tobilg/polyglot/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/tobilg/polyglot/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/tobilg/polyglot/compare/v0.5.16...v0.6.0
+[0.5.16]: https://github.com/tobilg/polyglot/compare/v0.5.15...v0.5.16
+[0.5.15]: https://github.com/tobilg/polyglot/compare/v0.5.14...v0.5.15
+[0.5.14]: https://github.com/tobilg/polyglot/compare/v0.5.13...v0.5.14
+[0.5.13]: https://github.com/tobilg/polyglot/compare/v0.5.12...v0.5.13
+[0.5.12]: https://github.com/tobilg/polyglot/compare/v0.5.11...v0.5.12
+[0.5.11]: https://github.com/tobilg/polyglot/compare/v0.5.10...v0.5.11
+[0.5.10]: https://github.com/tobilg/polyglot/compare/v0.5.9...v0.5.10
+[0.5.9]: https://github.com/tobilg/polyglot/compare/v0.5.8...v0.5.9
+[0.5.8]: https://github.com/tobilg/polyglot/compare/v0.5.7...v0.5.8
+[0.5.7]: https://github.com/tobilg/polyglot/compare/v0.5.6...v0.5.7
+[0.5.6]: https://github.com/tobilg/polyglot/compare/v0.5.5...v0.5.6
+[0.5.5]: https://github.com/tobilg/polyglot/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/tobilg/polyglot/compare/v0.5.3...v0.5.4
+[0.5.3]: https://github.com/tobilg/polyglot/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/tobilg/polyglot/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/tobilg/polyglot/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/tobilg/polyglot/compare/v0.4.4...v0.5.0
+[0.4.4]: https://github.com/tobilg/polyglot/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/tobilg/polyglot/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tobilg/polyglot/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tobilg/polyglot/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/tobilg/polyglot/compare/v0.3.12...v0.4.0
+[0.4.0]: https://github.com/tobilg/polyglot/compare/v0.3.11...v0.4.0
 [0.3.12]: https://github.com/tobilg/polyglot/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/tobilg/polyglot/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/tobilg/polyglot/compare/v0.3.9...v0.3.10
@@ -1919,7 +2244,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.3.3]: https://github.com/tobilg/polyglot/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/tobilg/polyglot/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/tobilg/polyglot/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/tobilg/polyglot/compare/v0.1.9...v0.3.0
+[0.3.0]: https://github.com/tobilg/polyglot/compare/v0.2.3...v0.3.0
 [0.1.9]: https://github.com/tobilg/polyglot/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/tobilg/polyglot/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/tobilg/polyglot/compare/v0.1.6...v0.1.7

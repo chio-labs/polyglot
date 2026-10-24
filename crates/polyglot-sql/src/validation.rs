@@ -791,6 +791,13 @@ fn type_issue(
 
 fn data_type_family(data_type: &DataType) -> TypeFamily {
     match data_type {
+        DataType::Vertica { vertica_type } => match vertica_type.as_ref() {
+            crate::expressions::VerticaDataType::Array { .. }
+            | crate::expressions::VerticaDataType::Set { .. } => TypeFamily::Array,
+            crate::expressions::VerticaDataType::Row { .. } => TypeFamily::Struct,
+            crate::expressions::VerticaDataType::LongVarBinary { .. } => TypeFamily::Binary,
+            crate::expressions::VerticaDataType::Interval { .. } => TypeFamily::Interval,
+        },
         DataType::Boolean => TypeFamily::Boolean,
         DataType::TinyInt { .. }
         | DataType::SmallInt { .. }
@@ -805,6 +812,17 @@ fn data_type_family(data_type: &DataType) -> TypeFamily {
         DataType::Float { .. } | DataType::Double { .. } | DataType::Decimal { .. } => {
             TypeFamily::Numeric
         }
+        DataType::Hana { hana_type } => match hana_type.name.as_str() {
+            "TINYINT" | "SMALLINT" | "INT" | "BIGINT" => TypeFamily::Integer,
+            "TIMESTAMP" | "SECONDDATE" => TypeFamily::Timestamp,
+            "TIME" => TypeFamily::Time,
+            "FLOAT" | "DECIMAL" | "SMALLDECIMAL" => TypeFamily::Numeric,
+            "BINTEXT" => TypeFamily::Binary,
+            "ALPHANUM" | "VARCHAR" | "NVARCHAR" | "CLOB" | "NCLOB" | "TEXT" | "SHORTTEXT" => {
+                TypeFamily::String
+            }
+            _ => TypeFamily::Unknown,
+        },
         DataType::Oracle { oracle_type } => match oracle_type {
             OracleDataType::Number { .. }
             | OracleDataType::BinaryFloat
@@ -3554,6 +3572,7 @@ fn source_output_identifiers(expression: &Expression) -> Vec<&crate::expressions
         Expression::Subquery(query) => &query.column_aliases,
         Expression::Alias(alias) => &alias.column_aliases,
         Expression::Table(table) => &table.column_aliases,
+        Expression::Values(values) => &values.column_aliases,
         Expression::Paren(paren) => return source_output_identifiers(&paren.this),
         _ => &[],
     };
@@ -3561,6 +3580,7 @@ fn source_output_identifiers(expression: &Expression) -> Vec<&crate::expressions
         return columns.iter().collect();
     }
     match scope_query(expression) {
+        Expression::Values(values) => values.column_aliases.iter().collect(),
         Expression::Select(select) => select
             .expressions
             .iter()
@@ -4199,6 +4219,19 @@ impl ValidationScope<'_> {
     }
 }
 
+/// Members of an unaliased parenthesized join group are bound in the
+/// containing FROM clause, so each is visible to following LATERAL relations.
+fn unaliased_join_group_members(relation: &Expression) -> Vec<&Expression> {
+    match relation {
+        Expression::Paren(paren) => unaliased_join_group_members(&paren.this),
+        Expression::JoinedTable(joined) if joined.alias.is_none() => std::iter::once(&joined.left)
+            .chain(joined.joins.iter().map(|join| &join.this))
+            .flat_map(unaliased_join_group_members)
+            .collect(),
+        _ => vec![relation],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_scope_tree(
     mut scope: ValidationScope<'_>,
@@ -4297,28 +4330,33 @@ fn validate_scope_tree(
                         lateral_outer = Some(visible);
                         break;
                     }
-                    let alias = match relation {
-                        Expression::Table(table) => {
-                            Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                    for relation in unaliased_join_group_members(relation) {
+                        let alias = match relation {
+                            Expression::Table(table) => {
+                                Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
+                            }
+                            Expression::Subquery(query) => {
+                                query.alias.as_ref().map(|alias| alias.name.as_str())
+                            }
+                            Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+                            Expression::Lateral(lateral) => lateral.alias.as_deref(),
+                            Expression::JoinedTable(joined) => {
+                                joined.alias.as_ref().map(|alias| alias.name.as_str())
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = alias
+                            .and_then(|name| resolve_scope_source_name(&selected, name))
+                            .or_else(|| {
+                                selected
+                                    .sources
+                                    .iter()
+                                    .find(|(_, source)| source.expression.as_ref() == relation)
+                                    .map(|(name, _)| name.clone())
+                            })
+                        {
+                            preceding.insert(name);
                         }
-                        Expression::Subquery(query) => {
-                            query.alias.as_ref().map(|alias| alias.name.as_str())
-                        }
-                        Expression::Alias(alias) => Some(alias.alias.name.as_str()),
-                        Expression::Lateral(lateral) => lateral.alias.as_deref(),
-                        _ => None,
-                    };
-                    if let Some(name) = alias
-                        .and_then(|name| resolve_scope_source_name(&selected, name))
-                        .or_else(|| {
-                            selected
-                                .sources
-                                .iter()
-                                .find(|(_, source)| source.expression.as_ref() == relation)
-                                .map(|(name, _)| name.clone())
-                        })
-                    {
-                        preceding.insert(name);
                     }
                 }
             }
@@ -4467,16 +4505,18 @@ fn validate_statement_with_schema(
                     }));
                 }
                 if let Some(query) = &insert.query {
-                    // A leading WITH belongs to both the INSERT and its source.
                     // Validate the source query as the scope root rather than
                     // wrapping it as a projection, which hides its columns from
-                    // ordinary source validation.
-                    let mut source = query.clone();
-                    attach_query_with_clause(&mut source, insert.with.as_ref());
-                    let mut scope = build_scope(&source);
+                    // ordinary source validation. The leading CTEs were already
+                    // checked in the DML scope; the source's own CTEs shadow them.
+                    let mut scope = crate::scope::build_scope_with_ctes(query, &scope.cte_sources);
+                    // INSERT does not expose its target columns to the source.
+                    // An empty enclosing scope also disables standalone-schema
+                    // fallback for source queries without a FROM clause.
+                    let outer = crate::scope::Scope::new(Expression::null());
                     validate_scope_tree(
                         ValidationScope::Owned(&mut scope),
-                        &[],
+                        &[&outer],
                         schema_map,
                         resolver_schema,
                         options,
@@ -4589,21 +4629,6 @@ fn validate_statement_with_schema(
         }
     }
     errors
-}
-
-fn attach_query_with_clause(query: &mut Expression, with: Option<&crate::expressions::With>) {
-    let Some(with) = with else {
-        return;
-    };
-    match query {
-        Expression::Select(select) => select.with = Some(with.clone()),
-        Expression::Union(set_operation) => set_operation.with = Some(with.clone()),
-        Expression::Intersect(set_operation) => set_operation.with = Some(with.clone()),
-        Expression::Except(set_operation) => set_operation.with = Some(with.clone()),
-        Expression::Subquery(subquery) => attach_query_with_clause(&mut subquery.this, Some(with)),
-        Expression::Paren(paren) => attach_query_with_clause(&mut paren.this, Some(with)),
-        _ => {}
-    }
 }
 
 /// Validate SQL using syntax + schema-aware checks, with optional semantic checks.

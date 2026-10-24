@@ -1162,6 +1162,7 @@ impl Expr {
     /// call default to ascending order when passed to [`SelectBuilder::order_by()`].
     pub fn asc(self) -> Expr {
         Expr(Expression::Ordered(Box::new(Ordered {
+            nulls_auto: false,
             this: self.0,
             desc: false,
             nulls_first: None,
@@ -1175,6 +1176,7 @@ impl Expr {
     /// Used in ORDER BY clauses.
     pub fn desc(self) -> Expr {
         Expr(Expression::Ordered(Box::new(Ordered {
+            nulls_auto: false,
             this: self.0,
             desc: true,
             nulls_first: None,
@@ -2278,6 +2280,7 @@ impl WindowDefBuilder {
                 match expr {
                     Expression::Ordered(o) => *o,
                     other => Ordered {
+                        nulls_auto: false,
                         this: other,
                         desc: false,
                         nulls_first: None,

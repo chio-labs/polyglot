@@ -1295,6 +1295,7 @@ pub fn eliminate_qualify(expr: Expression) -> Result<Expression> {
 
                     // Create the outer SELECT with alias-resolved expressions and WHERE _w <op> value
                     let outer_select = Select {
+                        vertica: None,
                         expressions: outer_exprs,
                         from: Some(From {
                             expressions: vec![Expression::Subquery(Box::new(subquery))],
@@ -1340,6 +1341,7 @@ pub fn eliminate_qualify(expr: Expression) -> Result<Expression> {
                     };
 
                     let outer_select = Select {
+                        vertica: None,
                         expressions: original_exprs,
                         from: Some(From {
                             expressions: vec![Expression::Subquery(Box::new(subquery))],
@@ -1672,12 +1674,49 @@ pub fn eliminate_distinct_on_for_dialect(
         _ => DistinctOnNullsMode::NullsFirst,
     };
 
-    transform_recursive(expr, &|expr| eliminate_distinct_on_select(expr, nulls_mode))
+    transform_recursive(expr, &|expr| {
+        eliminate_distinct_on_select(expr, nulls_mode, target)
+    })
+}
+
+/// Resolve positional `ORDER BY <n>` references against `select_exprs`,
+/// replacing each with the referenced projection's underlying expression
+/// (unaliased). Non-positional entries pass through unchanged.
+fn resolve_positional_order_by(
+    exprs: Vec<crate::expressions::Ordered>,
+    select_exprs: &[Expression],
+    target: Option<DialectType>,
+) -> Result<Vec<crate::expressions::Ordered>> {
+    exprs
+        .into_iter()
+        .map(|mut ord| {
+            if let Expression::Literal(lit) = &ord.this {
+                if let Literal::Number(n) = lit.as_ref() {
+                    if let Ok(idx) = n.parse::<usize>() {
+                        if idx >= 1 && idx <= select_exprs.len() {
+                            ord.this = match select_exprs[idx - 1].clone() {
+                                Expression::Alias(alias) => alias.this,
+                                other => other,
+                            };
+                        }
+                    }
+                }
+            }
+            if crate::dialects::contains_in_projection(&ord.this, |e| matches!(e, Expression::WindowFunction(_))) {
+                return Err(Error::unsupported(
+                    "DISTINCT ON ordering by a window expression requires an additional query layer",
+                    format!("{target:?}"),
+                ));
+            }
+            Ok(ord)
+        })
+        .collect()
 }
 
 fn eliminate_distinct_on_select(
     expr: Expression,
     nulls_mode: DistinctOnNullsMode,
+    target: Option<DialectType>,
 ) -> Result<Expression> {
     use crate::expressions::Case;
 
@@ -1690,7 +1729,16 @@ fn eliminate_distinct_on_select(
 
                     // Get order_by expressions, or use distinct_cols as default order
                     let order_exprs = if let Some(ref order_by) = select.order_by {
-                        let mut exprs = order_by.expressions.clone();
+                        // Positional references (`ORDER BY 1`, or DuckDB's
+                        // `ORDER BY ALL` already expanded to positions) mean
+                        // something different inside a window function's
+                        // ORDER BY than in the outer SELECT's, so resolve them
+                        // to the actual projected expression before reuse.
+                        let mut exprs = resolve_positional_order_by(
+                            order_by.expressions.clone(),
+                            &select.expressions,
+                            target,
+                        )?;
                         // Add NULL ordering based on target dialect
                         match nulls_mode {
                             DistinctOnNullsMode::NullsFirst => {
@@ -1728,6 +1776,7 @@ fn eliminate_distinct_on_select(
                                             inferred_type: None,
                                         }));
                                         new_exprs.push(crate::expressions::Ordered {
+                                            nulls_auto: false,
                                             this: null_check,
                                             desc: true,
                                             nulls_first: None,
@@ -1746,6 +1795,7 @@ fn eliminate_distinct_on_select(
                         distinct_cols
                             .iter()
                             .map(|e| crate::expressions::Ordered {
+                                nulls_auto: false,
                                 this: e.clone(),
                                 desc: false,
                                 nulls_first: None,
@@ -1870,6 +1920,7 @@ fn eliminate_distinct_on_select(
                     // Create outer SELECT with WHERE _row_number = 1
                     // No ORDER BY on outer query
                     let outer_select = Select {
+                        vertica: None,
                         expressions: outer_select_exprs,
                         from: Some(From {
                             expressions: vec![Expression::Subquery(Box::new(subquery))],
@@ -1924,6 +1975,7 @@ pub fn eliminate_semi_and_anti_joins(expr: Expression) -> Result<Expression> {
                         if let Some(on_condition) = join.on {
                             // Create: EXISTS (SELECT 1 FROM join_table WHERE on_condition)
                             let subquery_select = Select {
+                                vertica: None,
                                 expressions: vec![Expression::Literal(Box::new(Literal::Number(
                                     "1".to_string(),
                                 )))],
@@ -1962,6 +2014,7 @@ pub fn eliminate_semi_and_anti_joins(expr: Expression) -> Result<Expression> {
                         if let Some(on_condition) = join.on {
                             // Create: NOT EXISTS (SELECT 1 FROM join_table WHERE on_condition)
                             let subquery_select = Select {
+                                vertica: None,
                                 expressions: vec![Expression::Literal(Box::new(Literal::Number(
                                     "1".to_string(),
                                 )))],
@@ -2094,6 +2147,7 @@ pub fn eliminate_full_outer_join(expr: Expression) -> Result<Expression> {
                 if let (Some(ref from), Some(ref join_cond)) = (&select.from, &join_condition) {
                     if !from.expressions.is_empty() {
                         let anti_subquery = Expression::Select(Box::new(Select {
+                            vertica: None,
                             expressions: vec![Expression::Literal(Box::new(Literal::Number(
                                 "1".to_string(),
                             )))],
@@ -3165,6 +3219,7 @@ fn unqualify_columns_recursive(expr: Expression) -> Expression {
                     .expressions
                     .iter()
                     .map(|o| crate::expressions::Ordered {
+                        nulls_auto: o.nulls_auto,
                         this: unqualify_columns_recursive(o.this.clone()),
                         desc: o.desc,
                         nulls_first: o.nulls_first,
@@ -3460,6 +3515,7 @@ fn try_convert_generate_date_array_with_name(
 
             // Build base case: SELECT CAST(start AS DATE) AS date_value
             let base_select = Select {
+                vertica: None,
                 expressions: vec![Expression::Alias(Box::new(crate::expressions::Alias {
                     this: cast_to_date(start),
                     alias: column_name.clone(),
@@ -3533,6 +3589,7 @@ fn try_convert_generate_date_array_with_name(
             }));
 
             let recursive_select = Select {
+                vertica: None,
                 expressions: vec![cast_date_add.clone()],
                 from: Some(From {
                     expressions: vec![Expression::Table(Box::new(
@@ -3586,6 +3643,7 @@ fn try_convert_generate_date_array_with_name(
 
             // Create replacement: SELECT date_value FROM cte_name
             let replacement_select = Select {
+                vertica: None,
                 expressions: vec![Expression::Column(Box::new(crate::expressions::Column {
                     name: column_name,
                     table: None,
@@ -3749,6 +3807,10 @@ pub fn no_ilike_sql(expr: Expression) -> Result<Expression> {
         Expression::ILike(ilike) => {
             // Create LOWER(left) LIKE LOWER(right)
             let lower_left = Expression::Function(Box::new(crate::expressions::Function {
+                on_error: None,
+                qualified_name: Vec::new(),
+                source_dialect: None,
+
                 name: "LOWER".to_string(),
                 args: vec![ilike.left],
                 distinct: false,
@@ -3764,6 +3826,9 @@ pub fn no_ilike_sql(expr: Expression) -> Result<Expression> {
                 crate::dialects::lower_like_pattern(ilike.right, true)
             } else {
                 Expression::Function(Box::new(crate::expressions::Function {
+                    on_error: None,
+                    qualified_name: Vec::new(),
+                    source_dialect: None,
                     name: "LOWER".to_string(),
                     args: vec![ilike.right],
                     distinct: false,
@@ -5923,7 +5988,7 @@ fn make_unnest_subquery(unnest: UnnestFunc, alias: Option<Identifier>) -> Expres
 /// the Union (unlike Python sqlglot). This function handles both cases by checking
 /// the right-hand SELECT for trailing ORDER BY/LIMIT and moving them to the Union.
 pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
-    use crate::expressions::{Limit as LimitClause, Offset as OffsetClause, OrderBy, Star};
+    use crate::expressions::{split_set_limit, Limit, Offset as OffsetClause, OrderBy, Star};
 
     match expr {
         Expression::Union(mut u) => {
@@ -5938,7 +6003,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                     {
                         // Move ORDER BY/LIMIT from right Select to Union
                         u.order_by = right_select.order_by.take();
-                        u.limit = right_select.limit.take().map(|l| Box::new(l.this));
+                        u.limit = right_select.limit.take().map(Limit::into_set_limit);
                         u.offset = right_select.offset.take().map(|o| Box::new(o.this));
                     }
                 }
@@ -5952,12 +6017,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                 let union_limit: Option<Box<Expression>> = u.limit.take();
                 let union_offset: Option<Box<Expression>> = u.offset.take();
 
-                // Convert Union's limit (Box<Expression>) to Select's limit (Limit struct)
-                let select_limit: Option<LimitClause> = union_limit.map(|l| LimitClause {
-                    this: *l,
-                    percent: false,
-                    comments: Vec::new(),
-                });
+                let (select_limit, select_fetch) = split_set_limit(union_limit);
 
                 // Convert Union's offset (Box<Expression>) to Select's offset (Offset struct)
                 let select_offset: Option<OffsetClause> = union_offset.map(|o| OffsetClause {
@@ -5999,6 +6059,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                 });
                 select.order_by = order_by;
                 select.limit = select_limit;
+                select.fetch = select_fetch;
                 select.offset = select_offset;
 
                 Ok(Expression::Select(Box::new(select)))
@@ -6752,6 +6813,7 @@ mod tests {
 
         // Test that semi joins are converted to EXISTS
         let select = Expression::Select(Box::new(Select {
+            vertica: None,
             expressions: vec![Expression::boxed_column(Column {
                 name: Identifier::new("a".to_string()),
                 table: None,

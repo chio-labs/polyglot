@@ -63,6 +63,16 @@ function parseAstResult(json: string): Expression | null {
   return result.success ? JSON.parse(result.ast) : null;
 }
 
+function requireAstResult(json: string, operation: string): Expression {
+  const result = JSON.parse(json);
+  if (!result.success) {
+    throw new Error(
+      `${operation} failed: ${result.error ?? 'AST transformation failed'}`,
+    );
+  }
+  return JSON.parse(result.ast);
+}
+
 type QueryWithOuterClauses =
   | ExpressionByKey<'select'>
   | ExpressionByKey<'union'>
@@ -377,6 +387,8 @@ export function qualifyTables(
 /**
  * Add a condition to the WHERE clause of a SELECT (via WASM)
  *
+ * Throws when WASM cannot deserialize or transform the input AST.
+ *
  * @example
  * ```typescript
  * const newAst = addWhere(selectAst, eq('deleted', false), 'and');
@@ -387,10 +399,10 @@ export function addWhere(
   condition: Expression,
   operator: 'and' | 'or' = 'and',
 ): Expression {
-  const result = parseAstResult(
+  return requireAstResult(
     ast_add_where(exprToJson(node), exprToJson(condition), operator === 'or'),
+    'addWhere',
   );
-  return result ?? node;
 }
 
 /**
@@ -452,14 +464,14 @@ export function removeSelectColumns(
  *
  * When limit is a number, delegates to WASM. When limit is an Expression,
  * falls back to pure-TS manipulation.
+ * Throws when WASM rejects a numeric limit mutation.
  */
 export function setLimit(
   node: Expression,
   limit: number | Expression,
 ): Expression {
   if (typeof limit === 'number') {
-    const result = parseAstResult(ast_set_limit(exprToJson(node), limit));
-    return result ?? node;
+    return requireAstResult(ast_set_limit(exprToJson(node), limit), 'setLimit');
   }
 
   return applyLimitExpr(node, limit);
@@ -467,14 +479,17 @@ export function setLimit(
 
 /**
  * Set or update the OFFSET clause
+ * Throws when WASM rejects a numeric offset mutation.
  */
 export function setOffset(
   node: Expression,
   offset: number | Expression,
 ): Expression {
   if (typeof offset === 'number') {
-    const result = parseAstResult(ast_set_offset(exprToJson(node), offset));
-    return result ?? node;
+    return requireAstResult(
+      ast_set_offset(exprToJson(node), offset),
+      'setOffset',
+    );
   }
 
   return applyOffsetExpr(node, offset);

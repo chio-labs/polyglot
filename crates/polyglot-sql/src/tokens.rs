@@ -1551,6 +1551,8 @@ pub struct TokenizerConfig {
     /// end-of-input as the close. This is only enabled for ClickHouse fixture
     /// coverage, where some extracted corpus rows contain partial string probes.
     pub recover_unterminated_string: bool,
+    /// Whether `//` is the integer-division operator (Vertica).
+    pub double_slash_int_div: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -1584,6 +1586,7 @@ impl Default for TokenizerConfig {
             numbers_can_be_underscore_separated: false,
             recover_terminal_backslash_quote: false,
             recover_unterminated_string: false,
+            double_slash_int_div: false,
         }
     }
 }
@@ -2644,6 +2647,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
             ('>', '>') => Some(TokenType::GtGt),
             ('|', '|') => Some(TokenType::DPipe),
             ('|', '/') => Some(TokenType::PipeSlash), // Square root - PostgreSQL
+            ('/', '/') if self.config.double_slash_int_div => Some(TokenType::Div), // Vertica
             (':', ':') => Some(TokenType::DColon),
             (':', '=') => Some(TokenType::ColonEq), // := (assignment, named args)
             (':', '>') => Some(TokenType::ColonGt), // ::> (TSQL)
@@ -3011,6 +3015,14 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         Ok(())
     }
 
+    fn starts_numeric_exponent(&self) -> bool {
+        if !matches!(self.peek(), 'e' | 'E') {
+            return false;
+        }
+        let digits = self.current + 1 + usize::from(matches!(self.peek_next(), '+' | '-'));
+        digits < self.size && self.char_at(digits).is_ascii_digit()
+    }
+
     fn scan_number(&mut self) -> Result<()> {
         // Check for 0x/0X hex number prefix (SQLite-style)
         if self.config.hex_number_strings && self.peek() == '0' && !self.is_at_end() {
@@ -3158,7 +3170,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         }
 
         // Look for exponent
-        if self.peek() == 'e' || self.peek() == 'E' {
+        if self.starts_numeric_exponent() {
             self.advance();
             if self.peek() == '+' || self.peek() == '-' {
                 self.advance();
@@ -3300,7 +3312,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         }
 
         // Look for exponent
-        if self.peek() == 'e' || self.peek() == 'E' {
+        if self.starts_numeric_exponent() {
             self.advance();
             if self.peek() == '+' || self.peek() == '-' {
                 self.advance();

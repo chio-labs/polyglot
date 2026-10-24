@@ -238,6 +238,9 @@ test-rust-lib:
 
 # Check capabilities separately so Cargo feature unification cannot mask dependencies.
 test-rust-feature-gates:
+	cargo check -p polyglot-sql --no-default-features --features dialect-hana
+	cargo check -p polyglot-sql --no-default-features --features generate,dialect-hana
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-hana
 	cargo check -p polyglot-sql --no-default-features
 	@for feature in generate transpile builder ast-tools semantic openlineage diff planner time \
 		function-catalog-clickhouse function-catalog-duckdb function-catalog-all-dialects; do \
@@ -248,6 +251,7 @@ test-rust-feature-gates:
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-clickhouse,dialect-postgresql
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-tsql
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-fabric
+	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-vertica
 	cargo check -p polyglot-sql --no-default-features --features dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features generate,dialect-snowflake
 	cargo check -p polyglot-sql --no-default-features --features transpile,dialect-snowflake
@@ -282,6 +286,18 @@ test-rust-verify-core:
 	@echo "=== Lib unit tests ==="
 	@cargo test --lib -p polyglot-sql
 	@cargo test -p polyglot-sql --test deep_nesting_regression
+	@cargo test -p polyglot-sql --test transform_regression
+	@cargo test -p polyglot-sql --test dialect_matrix
+	@cargo test -p polyglot-sql --test duckdb_order_by_all
+	@cargo test -p polyglot-sql --test duckdb_integer_division
+	@cargo test -p polyglot-sql --test mod_precedence
+	@cargo test -p polyglot-sql --test duckdb_unreserved_relation_aliases
+	@cargo test -p polyglot-sql --test numeric_exponent_boundaries
+	@cargo test -p polyglot-sql --test query_analysis
+	@cargo test -p polyglot-sql --test query_analysis_regression
+	@cargo test -p polyglot-sql --test is_predicate_precedence
+	@cargo test -p polyglot-sql --test duckdb_json_arrow_context
+	@cargo test -p polyglot-sql --test quoted_relation_columns
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture

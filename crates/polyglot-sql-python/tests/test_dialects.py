@@ -17,6 +17,7 @@ EXPECTED_DIALECTS = {
     "exasol",
     "fabric",
     "generic",
+    "hana",
     "hive",
     "materialize",
     "mysql",
@@ -36,6 +37,7 @@ EXPECTED_DIALECTS = {
     "tidb",
     "trino",
     "tsql",
+    "vertica",
 }
 
 

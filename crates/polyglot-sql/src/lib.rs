@@ -231,6 +231,7 @@ pub use traversal::{
     is_window_function,
     is_with,
     transform,
+    transform_all,
     transform_map,
     BfsIter,
     DfsIter,
