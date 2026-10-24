@@ -1247,6 +1247,9 @@ impl MySQLDialect {
                     _ => path,
                 };
                 Ok(Expression::JsonExtract(Box::new(JsonExtractFunc {
+                    options: None,
+                    source_dialect: None,
+
                     this,
                     path: json_path,
                     returning: None,

@@ -52,6 +52,35 @@ struct Collector<'a> {
     guard: Option<ComplexityGuardOptions>,
 }
 
+fn join_has_predicate(join: &crate::expressions::Join) -> bool {
+    join.on.is_some()
+        || join.match_condition.is_some()
+        || !join.using.is_empty()
+        || matches!(
+            join.kind,
+            JoinKind::Natural
+                | JoinKind::NaturalLeft
+                | JoinKind::NaturalRight
+                | JoinKind::NaturalFull
+        )
+}
+
+/// Unaliased parenthesized join groups keep their predicates in this scope.
+fn join_group_has_predicate(relation: &Expression) -> bool {
+    match relation {
+        Expression::Paren(paren) => join_group_has_predicate(&paren.this),
+        Expression::JoinedTable(joined) if joined.alias.is_none() => {
+            joined.joins.iter().any(join_has_predicate)
+                || join_group_has_predicate(&joined.left)
+                || joined
+                    .joins
+                    .iter()
+                    .any(|join| join_group_has_predicate(&join.this))
+        }
+        _ => false,
+    }
+}
+
 fn scope_requires_lineage(query: &Expression, filter_branch: bool) -> bool {
     match query {
         Expression::Select(select) => {
@@ -71,18 +100,13 @@ fn scope_requires_lineage(query: &Expression, filter_branch: bool) -> bool {
                     .order_by
                     .as_ref()
                     .is_some_and(|order| !order.expressions.is_empty())
-                || select.joins.iter().any(|join| {
-                    join.on.is_some()
-                        || join.match_condition.is_some()
-                        || !join.using.is_empty()
-                        || matches!(
-                            join.kind,
-                            JoinKind::Natural
-                                | JoinKind::NaturalLeft
-                                | JoinKind::NaturalRight
-                                | JoinKind::NaturalFull
-                        )
-                })
+                || select.joins.iter().any(join_has_predicate)
+                || select
+                    .from
+                    .iter()
+                    .flat_map(|from| &from.expressions)
+                    .chain(select.joins.iter().map(|join| &join.this))
+                    .any(join_group_has_predicate)
                 || select.expressions.iter().any(|projection| {
                     projection.dfs().any(|node| {
                         matches!(
@@ -661,15 +685,23 @@ impl Collector<'_> {
 }
 
 fn query_boundary(expression: &Expression) -> bool {
-    matches!(
-        expression,
-        Expression::Select(_)
-            | Expression::Union(_)
-            | Expression::Intersect(_)
-            | Expression::Except(_)
-            | Expression::Cte(_)
-            | Expression::Subquery(_)
-    )
+    match expression {
+        Expression::JoinedTable(joined) => joined.alias.is_some(),
+        Expression::Alias(alias) => {
+            matches!(scope_query(&alias.this), Expression::JoinedTable(_))
+                || query_boundary(&alias.this)
+        }
+        Expression::Paren(paren) => query_boundary(&paren.this),
+        _ => matches!(
+            expression,
+            Expression::Select(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_)
+                | Expression::Cte(_)
+                | Expression::Subquery(_)
+        ),
+    }
 }
 
 fn append_path(prefix: &str, segments: &[ChildPathSegment]) -> String {

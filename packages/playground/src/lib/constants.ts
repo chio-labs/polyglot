@@ -13,6 +13,7 @@ export const DIALECT_DISPLAY_NAMES: Record<string, string> = {
   dune: "Dune SQL",
   exasol: "Exasol",
   fabric: "Microsoft Fabric",
+  hana: "SAP HANA",
   hive: "Apache Hive",
   materialize: "Materialize",
   mysql: "MySQL",
@@ -33,6 +34,7 @@ export const DIALECT_DISPLAY_NAMES: Record<string, string> = {
   tidb: "TiDB",
   trino: "Trino",
   tsql: "SQL Server (T-SQL)",
+  vertica: "Vertica",
 };
 
 export const DEFAULT_TRANSPILE_SQL = `SELECT

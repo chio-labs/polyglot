@@ -51,6 +51,8 @@ mod dune;
 mod exasol;
 #[cfg(feature = "dialect-fabric")]
 mod fabric;
+#[cfg(feature = "dialect-hana")]
+mod hana;
 #[cfg(feature = "dialect-hive")]
 mod hive;
 #[cfg(feature = "dialect-materialize")]
@@ -89,6 +91,8 @@ mod tidb;
 mod trino;
 #[cfg(any(feature = "dialect-tsql", feature = "dialect-fabric"))]
 mod tsql;
+#[cfg(feature = "dialect-vertica")]
+mod vertica;
 
 pub use generic::GenericDialect; // Always available
 
@@ -120,6 +124,8 @@ pub use dune::DuneDialect;
 pub use exasol::ExasolDialect;
 #[cfg(feature = "dialect-fabric")]
 pub use fabric::FabricDialect;
+#[cfg(feature = "dialect-hana")]
+pub use hana::HanaDialect;
 #[cfg(feature = "dialect-hive")]
 pub use hive::HiveDialect;
 #[cfg(feature = "dialect-materialize")]
@@ -158,6 +164,8 @@ pub use tidb::TiDBDialect;
 pub use trino::TrinoDialect;
 #[cfg(feature = "dialect-tsql")]
 pub use tsql::TSQLDialect;
+#[cfg(feature = "dialect-vertica")]
+pub use vertica::VerticaDialect;
 
 use crate::error::Result;
 #[cfg(feature = "transpile")]
@@ -204,6 +212,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 /// Dialect names are case-insensitive when parsed from strings via [`FromStr`].
 /// Some dialects accept aliases (e.g., "mssql" and "sqlserver" both resolve to [`TSQL`](DialectType::TSQL)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 pub enum DialectType {
     /// Standard SQL with no dialect-specific behavior (default).
@@ -274,6 +283,10 @@ pub enum DialectType {
     Exasol,
     /// Apache DataFusion -- Arrow-based query engine with modern SQL extensions.
     DataFusion,
+    /// SAP HANA Cloud and SAP HANA Platform SQL.
+    HANA,
+    /// Vertica (OpenText Analytics Database) -- columnar MPP analytic database.
+    Vertica,
 }
 
 impl DialectType {
@@ -284,6 +297,20 @@ impl DialectType {
             self,
             DialectType::TSQL | DialectType::Fabric | DialectType::MySQL | DialectType::SQLite
         ) || (matches!(self, DialectType::DuckDB) && explicit_as)
+    }
+
+    /// Whether this dialect natively accepts DuckDB-style `ORDER BY ALL`
+    /// (a bare `ALL` keyword meaning "every projected column, in order").
+    /// Other targets need it rewritten to positional `ORDER BY 1, 2, ...`.
+    pub(crate) const fn supports_order_by_all(self) -> bool {
+        matches!(
+            self,
+            DialectType::DuckDB
+                | DialectType::Snowflake
+                | DialectType::ClickHouse
+                | DialectType::Databricks
+                | DialectType::Spark
+        )
     }
 }
 
@@ -330,6 +357,8 @@ impl std::fmt::Display for DialectType {
             DialectType::Dremio => write!(f, "dremio"),
             DialectType::Exasol => write!(f, "exasol"),
             DialectType::DataFusion => write!(f, "datafusion"),
+            DialectType::HANA => write!(f, "hana"),
+            DialectType::Vertica => write!(f, "vertica"),
         }
     }
 }
@@ -373,6 +402,8 @@ impl std::str::FromStr for DialectType {
             "dremio" => Ok(DialectType::Dremio),
             "exasol" => Ok(DialectType::Exasol),
             "datafusion" | "arrow-datafusion" | "arrow_datafusion" => Ok(DialectType::DataFusion),
+            "hana" | "saphana" | "sap_hana" => Ok(DialectType::HANA),
+            "vertica" => Ok(DialectType::Vertica),
             _ => Err(crate::error::Error::parse(
                 format!("Unknown dialect: {}", s),
                 0,
@@ -463,7 +494,7 @@ pub trait DialectImpl {
     feature = "generate",
     feature = "semantic"
 ))]
-fn transform_data_type_recursive<F>(
+pub(crate) fn transform_data_type_recursive<F>(
     dt: crate::expressions::DataType,
     transform_fn: &F,
 ) -> Result<crate::expressions::DataType>
@@ -670,7 +701,190 @@ pub(crate) fn lower_like_pattern(pattern: Expression, quantified: bool) -> Expre
     Expression::Lower(Box::new(crate::expressions::UnaryFunc::new(pattern)))
 }
 
-/// Applies a transform function bottom-up through an entire expression tree.
+/// The parser marks the ORDER BY ALL keyword as a Var, never an identifier.
+#[cfg(feature = "generate")]
+pub(crate) fn is_order_by_all_marker(e: &Expression) -> bool {
+    matches!(e, Expression::Var(v) if v.this.eq_ignore_ascii_case("all"))
+}
+
+#[cfg(feature = "transpile")]
+fn is_order_by_all(order_by: &Option<crate::expressions::OrderBy>) -> bool {
+    order_by.as_ref().is_some_and(|ob| {
+        ob.expressions.len() == 1 && is_order_by_all_marker(&ob.expressions[0].this)
+    })
+}
+
+/// Whether `e` is a projection item that can produce more or fewer than one
+/// output column (`*`, or DuckDB's `COLUMNS(...)` macro), making the output
+/// column count unknowable from the AST alone.
+#[cfg(feature = "transpile")]
+fn has_unknown_column_count(e: &Expression) -> bool {
+    use crate::expressions::Expression as E;
+    let mut inner = e;
+    loop {
+        inner = match inner {
+            E::Alias(a) => &a.this,
+            E::Paren(p) => &p.this,
+            _ => break,
+        };
+    }
+    if matches!(inner, E::Star(_)) {
+        return true;
+    }
+    // COLUMNS still expands inside arithmetic, casts and aggregate/function
+    // arguments. COUNT(*) and scalar subqueries, however, produce one column.
+    contains_in_projection(inner, |node| match node {
+        E::Columns(_) => true,
+        E::Function(f) => {
+            !f.quoted && f.qualified_name.is_empty() && f.name.eq_ignore_ascii_case("COLUMNS")
+        }
+        E::MethodCall(m) => m.method.name.eq_ignore_ascii_case("COLUMNS"),
+        _ => false,
+    })
+}
+
+#[cfg(feature = "transpile")]
+pub(crate) fn contains_in_projection(
+    e: &Expression,
+    predicate: impl Fn(&Expression) -> bool,
+) -> bool {
+    let mut pending = vec![e];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node,
+            Expression::Subquery(_) | Expression::Select(_) | Expression::Exists(_)
+        ) {
+            continue;
+        }
+        if predicate(node) {
+            return true;
+        }
+        crate::ast_children::for_each_child_untracked(node, |child| pending.push(child));
+    }
+    false
+}
+
+/// The number of columns a query block projects, when that count is known
+/// statically from the AST. Compound queries (UNION/INTERSECT/EXCEPT) take
+/// their width from the left-hand operand, per standard SQL set-operation
+/// rules (both sides must already agree on column count).
+#[cfg(feature = "transpile")]
+fn query_output_width(e: &Expression) -> Option<usize> {
+    use crate::expressions::Expression as E;
+    match e {
+        E::Select(sel) => {
+            if sel.expressions.is_empty() || sel.expressions.iter().any(has_unknown_column_count) {
+                None
+            } else {
+                Some(sel.expressions.len())
+            }
+        }
+        E::Paren(p) => query_output_width(&p.this),
+        E::Subquery(s) => query_output_width(&s.this),
+        E::Union(u) if !u.by_name => query_output_width(&u.left),
+        E::Intersect(i) => query_output_width(&i.left),
+        E::Except(ex) => query_output_width(&ex.left),
+        _ => None,
+    }
+}
+
+/// Rewrite an `ORDER BY ALL` clause into positional `ORDER BY 1..n` over
+/// `width` columns, in place. No-op if `order_by` isn't the ALL marker.
+/// Errors if the marker is present but `width` is unknown (e.g. a `*` or
+/// `COLUMNS(...)` projection, where positional ordinals can't be derived).
+///
+/// The source's explicit direction and NULL order (if any) carry over to each
+/// positional entry unchanged; the later cross-dialect NULL-ordering pass
+/// fills in the source dialect's implied default where the target's differs.
+/// MySQL is the exception: it has no NULLS FIRST/LAST syntax and is skipped by
+/// that pass, so compare every supported source's default against MySQL here.
+#[cfg(feature = "transpile")]
+fn expand_order_by_all(
+    order_by: &mut Option<crate::expressions::OrderBy>,
+    width: Option<usize>,
+    source: DialectType,
+    target: DialectType,
+) -> Result<()> {
+    use crate::expressions::Expression as E;
+    if !is_order_by_all(order_by) {
+        return Ok(());
+    }
+    let Some(n) = width else {
+        return Err(crate::error::Error::unsupported(
+            "ORDER BY ALL over a projection with an unknown column count (*, COLUMNS(...), or UNION BY NAME) cannot be expanded to positional ORDER BY",
+            target.to_string(),
+        ));
+    };
+    let ob = order_by.as_mut().unwrap();
+    let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
+
+    // An ordinal cannot be used inside a CASE expression to emulate NULL
+    // placement: it would become a constant instead of a column reference.
+    if matches!(target, DialectType::MySQL) {
+        let required_nulls_first = nulls_first.unwrap_or(match source {
+            DialectType::DuckDB | DialectType::ClickHouse => false,
+            DialectType::Snowflake => desc,
+            DialectType::Spark | DialectType::Databricks => !desc,
+            _ => unreachable!("ORDER BY ALL source capability must be checked"),
+        });
+        if required_nulls_first != !desc {
+            return Err(crate::error::Error::unsupported(
+                "ORDER BY ALL's NULL ordering (MySQL's default NULL placement does not match and cannot be emulated with positional ordering)",
+                target.to_string(),
+            ));
+        }
+    }
+
+    ob.expressions = (1..=n as i64)
+        .map(|i| {
+            let mut o = ob.expressions[0].clone();
+            o.this = E::number(i);
+            if target == DialectType::MySQL {
+                // Matching explicit NULL placement is redundant and MySQL
+                // cannot print the NULLS FIRST/LAST syntax.
+                o.nulls_first = None;
+            }
+            o
+        })
+        .collect();
+    Ok(())
+}
+
+/// Expand when the target lacks ALL, or when a native target cannot use it
+/// for this query (aggregate projections in Snowflake, DISTINCT ON emulation).
+#[cfg(feature = "transpile")]
+fn expand_select_order_by_all(
+    mut sel: Box<crate::expressions::Select>,
+    source: DialectType,
+    target: DialectType,
+) -> Result<Box<crate::expressions::Select>> {
+    if !is_order_by_all(&sel.order_by) {
+        return Ok(sel);
+    }
+    let emulate_distinct = sel
+        .distinct_on
+        .as_ref()
+        .is_some_and(|cols| !cols.is_empty())
+        && !Dialect::target_supports_distinct_on(target);
+    let snowflake_aggregate = target == DialectType::Snowflake
+        && sel
+            .expressions
+            .iter()
+            .any(|e| contains_in_projection(e, crate::traversal::is_aggregate));
+    if target.supports_order_by_all() && !emulate_distinct && !snowflake_aggregate {
+        return Ok(sel);
+    }
+    let width =
+        if sel.expressions.is_empty() || sel.expressions.iter().any(has_unknown_column_count) {
+            None
+        } else {
+            Some(sel.expressions.len())
+        };
+    expand_order_by_all(&mut sel.order_by, width, source, target)?;
+    Ok(sel)
+}
+
+/// Applies a dialect transform bottom-up through selected syntax children.
 ///
 /// The public entrypoint uses an explicit task stack for the recursion-heavy shapes
 /// that dominate deeply nested SQL (nested SELECT/FROM/SUBQUERY chains, set-operation
@@ -714,19 +928,12 @@ fn transform_recursive_inner<F>(expr: Expression, transform_fn: &F) -> Result<Ex
 where
     F: Fn(Expression) -> Result<Expression>,
 {
-    enum Task {
-        Visit(Expression),
-        Finish {
-            shell: Expression,
-            child_count: usize,
-        },
-    }
-
     // These are the shapes handled by the former explicit-stack fast path. Other
     // nodes retain the reference transformer's selective and wrapper-aware child
     // semantics even though all physical children are visible to traversal APIs.
     fn uses_generated_dispatch(expression: &Expression) -> bool {
         match expression {
+            Expression::CreateTable(_) => true,
             Expression::Select(select) => {
                 select.joins.is_empty()
                     && select.with.is_none()
@@ -737,7 +944,9 @@ where
             Expression::Union(set_op) => set_op.with.is_none() && set_op.order_by.is_none(),
             Expression::Intersect(set_op) => set_op.with.is_none() && set_op.order_by.is_none(),
             Expression::Except(set_op) => set_op.with.is_none() && set_op.order_by.is_none(),
-            Expression::Literal(_)
+            Expression::Subquery(subquery) => subquery.order_by.is_none(),
+            Expression::Vertica(_)
+            | Expression::Literal(_)
             | Expression::Boolean(_)
             | Expression::Null(_)
             | Expression::Identifier(_)
@@ -745,6 +954,7 @@ where
             | Expression::Parameter(_)
             | Expression::Placeholder(_)
             | Expression::SessionParameter(_)
+            | Expression::Interval(_)
             | Expression::Alias(_)
             | Expression::Paren(_)
             | Expression::Not(_)
@@ -752,7 +962,6 @@ where
             | Expression::IsNull(_)
             | Expression::IsTrue(_)
             | Expression::IsFalse(_)
-            | Expression::Subquery(_)
             | Expression::Exists(_)
             | Expression::Any(_)
             | Expression::All(_)
@@ -763,6 +972,7 @@ where
             | Expression::Sub(_)
             | Expression::Mul(_)
             | Expression::Div(_)
+            | Expression::IntDiv(_)
             | Expression::Eq(_)
             | Expression::NullSafeEq(_)
             | Expression::NullSafeNeq(_)
@@ -776,6 +986,8 @@ where
             | Expression::BitwiseAnd(_)
             | Expression::BitwiseOr(_)
             | Expression::BitwiseXor(_)
+            | Expression::BitwiseLeftShift(_)
+            | Expression::BitwiseRightShift(_)
             | Expression::Is(_)
             | Expression::MemberOf(_)
             | Expression::ArrayContainsAll(_)
@@ -786,6 +998,25 @@ where
             | Expression::Like(_)
             | Expression::ILike(_)
             | Expression::Function(_)
+            | Expression::AggregateFunction(_)
+            | Expression::JSONValue(_)
+            | Expression::JSONTable(_)
+            | Expression::JSONColumnDef(_)
+            | Expression::JsonQuery(_)
+            | Expression::RegexpLike(_)
+            | Expression::RegexpReplace(_)
+            | Expression::RegexpExtract(_)
+            | Expression::RegexpInstr(_)
+            | Expression::RegexpCount(_)
+            | Expression::Cube(_)
+            | Expression::Rollup(_)
+            | Expression::GroupingSets(_)
+            | Expression::Hint(_)
+            | Expression::PartitionByProperty(_)
+            | Expression::StorageProperty(_)
+            | Expression::Hierarchy(_)
+            | Expression::ViewParameter(_)
+            | Expression::Call(_)
             | Expression::Lead(_)
             | Expression::Lag(_)
             | Expression::Array(_)
@@ -804,62 +1035,12 @@ where
         }
     }
 
-    let mut tasks = vec![Task::Visit(expr)];
-    let mut results = Vec::new();
-
-    while let Some(task) = tasks.pop() {
-        match task {
-            Task::Visit(mut expression) => {
-                if !uses_generated_dispatch(&expression) {
-                    results.push(transform_recursive_reference(expression, transform_fn)?);
-                    continue;
-                }
-
-                let mut children = Vec::new();
-                crate::ast_children::for_each_child_mut(&mut expression, |child| {
-                    children.push(std::mem::replace(child, Expression::Null(Null)));
-                });
-                let child_count = children.len();
-                tasks.push(Task::Finish {
-                    shell: expression,
-                    child_count,
-                });
-                for child in children.into_iter().rev() {
-                    tasks.push(Task::Visit(child));
-                }
-            }
-            Task::Finish {
-                mut shell,
-                child_count,
-            } => {
-                if results.len() < child_count {
-                    return Err(crate::error::Error::Internal(
-                        "transform result stack underflow".to_string(),
-                    ));
-                }
-                let transformed_children = results.split_off(results.len() - child_count);
-                let mut transformed_children = transformed_children.into_iter();
-                crate::ast_children::for_each_child_mut(&mut shell, |child| {
-                    *child = transformed_children
-                        .next()
-                        .expect("validated transform child count");
-                });
-                if transformed_children.next().is_some() {
-                    return Err(crate::error::Error::Internal(
-                        "transform child restoration mismatch".to_string(),
-                    ));
-                }
-                results.push(transform_fn(shell)?);
-            }
-        }
-    }
-
-    match results.len() {
-        1 => Ok(results.pop().expect("single transform result")),
-        _ => Err(crate::error::Error::Internal(
-            "unexpected transform result stack size".to_string(),
-        )),
-    }
+    crate::traversal::transform_with_dispatch(
+        expr,
+        transform_fn,
+        &uses_generated_dispatch,
+        &transform_recursive_reference,
+    )
 }
 
 #[cfg(any(
@@ -1087,6 +1268,27 @@ where
     // First recursively transform children, then apply the transform function
     let expr = match expr {
         Expression::Select(mut select) => {
+            select.query_hints = std::mem::take(&mut select.query_hints)
+                .into_iter()
+                .map(|hint| transform_recursive(hint, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(extension) = &mut select.vertica {
+                use crate::ast_children::AstNode;
+                let mut failure = None;
+                extension.visit_expressions_mut(&mut |child| {
+                    if failure.is_none() {
+                        let old =
+                            std::mem::replace(child, Expression::Null(crate::expressions::Null));
+                        match transform_recursive(old, transform_fn) {
+                            Ok(new) => *child = new,
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+            }
             select.expressions = select
                 .expressions
                 .into_iter()
@@ -1633,6 +1835,9 @@ where
         // ===== Subquery expressions =====
         Expression::Subquery(mut s) => {
             s.this = transform_recursive(s.this, transform_fn)?;
+            if let Some(order_by) = s.order_by.take() {
+                s.order_by = Some(transform_order_by_recursive(order_by, transform_fn)?);
+            }
             Expression::Subquery(s)
         }
         Expression::Exists(mut e) => {
@@ -1946,6 +2151,8 @@ where
         Expression::BitwiseAnd(op) => transform_binary!(BitwiseAnd, *op),
         Expression::BitwiseOr(op) => transform_binary!(BitwiseOr, *op),
         Expression::BitwiseXor(op) => transform_binary!(BitwiseXor, *op),
+        Expression::BitwiseLeftShift(op) => transform_binary!(BitwiseLeftShift, *op),
+        Expression::BitwiseRightShift(op) => transform_binary!(BitwiseRightShift, *op),
         Expression::Is(op) => transform_binary!(Is, *op),
 
         // ===== TryCast / SafeCast =====
@@ -2035,6 +2242,18 @@ where
         Expression::UnixToTime(mut e) => {
             e.this = Box::new(transform_recursive(*e.this, transform_fn)?);
             Expression::UnixToTime(e)
+        }
+
+        Expression::Upsert(mut upsert) => {
+            upsert.table = transform_table_ref_recursive(upsert.table, transform_fn)?;
+            upsert.source = transform_recursive(upsert.source, transform_fn)?;
+            if let Some(partition) = upsert.partition.take() {
+                upsert.partition = Some(transform_recursive(partition, transform_fn)?);
+            }
+            if let Some(condition) = upsert.condition.take() {
+                upsert.condition = Some(transform_recursive(condition, transform_fn)?);
+            }
+            Expression::Upsert(upsert)
         }
 
         // CreateTable: recurse into column defaults, on_update expressions, and data types
@@ -2426,6 +2645,8 @@ cached_dialect!(CACHED_DRILL, DrillDialect, "dialect-drill");
 cached_dialect!(CACHED_DREMIO, DremioDialect, "dialect-dremio");
 cached_dialect!(CACHED_EXASOL, ExasolDialect, "dialect-exasol");
 cached_dialect!(CACHED_DATAFUSION, DataFusionDialect, "dialect-datafusion");
+cached_dialect!(CACHED_HANA, HanaDialect, "dialect-hana");
+cached_dialect!(CACHED_VERTICA, VerticaDialect, "dialect-vertica");
 
 fn configs_for_dialect_type(dt: DialectType) -> DialectConfigs {
     /// Clone configs from a cached static and pair with a fresh transform closure.
@@ -2508,6 +2729,10 @@ fn configs_for_dialect_type(dt: DialectType) -> DialectConfigs {
         DialectType::Exasol => from_cache!(CACHED_EXASOL, ExasolDialect),
         #[cfg(feature = "dialect-datafusion")]
         DialectType::DataFusion => from_cache!(CACHED_DATAFUSION, DataFusionDialect),
+        #[cfg(feature = "dialect-hana")]
+        DialectType::HANA => from_cache!(CACHED_HANA, HanaDialect),
+        #[cfg(feature = "dialect-vertica")]
+        DialectType::Vertica => from_cache!(CACHED_VERTICA, VerticaDialect),
         _ => from_cache!(CACHED_GENERIC, GenericDialect),
     }
 }
@@ -3223,7 +3448,17 @@ impl Dialect {
         // Apply preprocessing transforms based on dialect
         let preprocessed = self.preprocess(expr)?;
         // Then apply recursive transformation
-        transform_recursive(preprocessed, &self.transformer)
+        transform_recursive(preprocessed, &|node| {
+            // Calls with retained source semantics are lowered by the generator;
+            // ordinary AST visitors and optimizer passes still see their shared node kind.
+            if node.source_dialect().is_some()
+                || matches!(&node, Expression::Function(f) if !f.qualified_name.is_empty())
+            {
+                Ok(node)
+            } else {
+                (self.transformer)(node)
+            }
+        })
     }
 
     /// Apply dialect-specific preprocessing transforms
@@ -3252,6 +3487,7 @@ impl Dialect {
             feature = "dialect-oracle",
             feature = "dialect-clickhouse",
             feature = "dialect-fabric",
+            feature = "dialect-vertica",
         ))]
         use crate::transforms;
 
@@ -3421,6 +3657,13 @@ impl Dialect {
             // DataFusion supports QUALIFY and semi/anti joins natively
             #[cfg(feature = "dialect-datafusion")]
             DialectType::DataFusion => Ok(expr),
+            // Vertica doesn't support QUALIFY or semi/anti join syntax
+            #[cfg(feature = "dialect-vertica")]
+            DialectType::Vertica => {
+                let expr = transforms::eliminate_qualify(expr)?;
+                let expr = transforms::eliminate_semi_and_anti_joins(expr)?;
+                Ok(expr)
+            }
             // Oracle doesn't support QUALIFY
             #[cfg(feature = "dialect-oracle")]
             DialectType::Oracle => {
@@ -3506,16 +3749,69 @@ impl Dialect {
         expressions
             .into_iter()
             .map(|expr| {
+                // Reject unsupported source semantics before normalization can
+                // erase them. This AST-only pass shares conversion decisions with
+                // the generator and never renders throwaway SQL.
+                Self::reject_hana_source_semantics(
+                    &expr,
+                    self.dialect_type,
+                    target_dialect.generator_config.dialect.unwrap_or_default(),
+                )?;
+
+                let expr =
+                    normalization::vertica::prepare_conversion(expr, self.dialect_type, target)?;
+                normalization::vertica::validate_conversion(&expr, self.dialect_type, target)?;
+                let expr = normalization::duckdb::prepare_integer_division(
+                    expr,
+                    self.dialect_type,
+                    target,
+                )?;
                 // DuckDB source: normalize VARCHAR/CHAR to TEXT (DuckDB doesn't support
                 // VARCHAR length constraints). This emulates Python sqlglot's DuckDB parser
                 // where VARCHAR_LENGTH = None and VARCHAR maps to TEXT.
-                let expr = if matches!(self.dialect_type, DialectType::DuckDB) {
+                //
+                // Any source with native `ORDER BY ALL`: expand it to positional
+                // `ORDER BY 1..n` for targets without it, on both plain SELECTs and
+                // compound queries (whose ORDER BY lives on the set-op node).
+                let source = self.dialect_type;
+                let is_duckdb = matches!(source, DialectType::DuckDB);
+                let expand_all = source.supports_order_by_all() && !target.supports_order_by_all();
+                let expr = if source.supports_order_by_all() {
                     use crate::expressions::DataType as DT;
                     transform_recursive(expr, &|e| match e {
-                        Expression::DataType(DT::VarChar { .. }) => {
+                        Expression::DataType(DT::VarChar { .. }) if is_duckdb => {
                             Ok(Expression::DataType(DT::Text))
                         }
-                        Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
+                        Expression::DataType(DT::Char { .. }) if is_duckdb => {
+                            Ok(Expression::DataType(DT::Text))
+                        }
+                        Expression::Select(sel) => {
+                            expand_select_order_by_all(sel, source, target).map(Expression::Select)
+                        }
+                        Expression::Subquery(mut subquery) if expand_all => {
+                            let width = query_output_width(&subquery.this);
+                            expand_order_by_all(&mut subquery.order_by, width, source, target)?;
+                            Ok(Expression::Subquery(subquery))
+                        }
+                        Expression::Union(mut u) if expand_all => {
+                            let width = if u.by_name {
+                                None
+                            } else {
+                                query_output_width(&u.left)
+                            };
+                            expand_order_by_all(&mut u.order_by, width, source, target)?;
+                            Ok(Expression::Union(u))
+                        }
+                        Expression::Intersect(mut i) if expand_all => {
+                            let width = query_output_width(&i.left);
+                            expand_order_by_all(&mut i.order_by, width, source, target)?;
+                            Ok(Expression::Intersect(i))
+                        }
+                        Expression::Except(mut ex) if expand_all => {
+                            let width = query_output_width(&ex.left);
+                            expand_order_by_all(&mut ex.order_by, width, source, target)?;
+                            Ok(Expression::Except(ex))
+                        }
                         _ => Ok(e),
                     })?
                 } else {
@@ -3649,6 +3945,10 @@ impl Dialect {
                                                 ));
                                                 return Ok(Expression::Function(Box::new(
                                                     crate::expressions::Function {
+                                                        on_error: None,
+                                                        qualified_name: Vec::new(),
+                                                        source_dialect: None,
+
                                                         name: f.name.clone(),
                                                         args: new_args,
                                                         distinct: f.distinct,
@@ -4020,6 +4320,8 @@ impl Dialect {
                             };
                             Ok(Expression::AggregateFunction(Box::new(
                                 crate::expressions::AggregateFunction {
+                                    source_dialect: None,
+
                                     name: "COUNT_BIG".to_string(),
                                     args,
                                     distinct: c.distinct,
@@ -4320,6 +4622,42 @@ impl Dialect {
             && select.fetch.is_none()
             && select.for_xml.is_empty()
             && select.for_json.is_empty()
+    }
+
+    fn reject_hana_source_semantics(
+        expression: &Expression,
+        source: DialectType,
+        target: DialectType,
+    ) -> Result<()> {
+        if source != DialectType::HANA || target == DialectType::HANA {
+            return Ok(());
+        }
+        let mut pending = vec![expression];
+        while let Some(node) = pending.pop() {
+            if node.source_dialect() == Some(DialectType::HANA) {
+                Generator::validate_hana_source_node(node, target)?;
+            }
+            // A supported outer call does not establish support for its arguments.
+            // Types in column definitions, casts, routine signatures, etc. are
+            // embedded syntax, not Expression children. Validate each type once,
+            // before normalization can replace its enclosing ARRAY/STRUCT type.
+            // A scalar native CAST already uses a value-aware conversion check
+            // (e.g. a HANA TINYINT literal can fit a target signed integer).
+            let cast_type_validated = matches!(node, Expression::Cast(c)
+                if matches!(c.to, crate::expressions::DataType::Hana { .. }));
+            let mut type_result = Ok(());
+            crate::ast_children::for_each_child_and_type_untracked(
+                node,
+                |child| pending.push(child),
+                |data_type| {
+                    if !cast_type_validated && type_result.is_ok() {
+                        type_result = Generator::validate_hana_source_type(data_type, target);
+                    }
+                },
+            );
+            type_result?;
+        }
+        Ok(())
     }
 
     fn reject_clickhouse_session_semantics(
@@ -4655,7 +4993,10 @@ impl Dialect {
                 Self::push_unsupported_diagnostic(&mut diagnostics, "UNNEST");
             }
 
-            if !Self::target_supports_remaining_explode(target) && Self::node_is_explode(node) {
+            if !Self::target_supports_remaining_explode(target)
+                && Self::node_is_explode(node)
+                && !(source == DialectType::Vertica && target == DialectType::Vertica)
+            {
                 Self::push_unsupported_diagnostic(&mut diagnostics, "EXPLODE");
             }
 
@@ -8905,6 +9246,7 @@ impl Dialect {
                 cross_apply: None,
                 ordinality: None,
                 column_aliases: vec![],
+                column_aliases_quoted: vec![],
             }));
 
             // Remove the original join and add to FROM expressions
@@ -10104,6 +10446,157 @@ impl Dialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        feature = "transpile",
+        feature = "dialect-hana",
+        feature = "dialect-duckdb",
+        feature = "dialect-trino"
+    ))]
+    #[test]
+    fn hana_validation_and_generation_agree_after_ast_serialization() {
+        let hana = Dialect::get(DialectType::HANA);
+        for (sql, duckdb, trino) in [
+            ("SELECT COALESCE(IFNULL(x, 0), 1) FROM t", true, true),
+            ("SELECT LOCATE('abcabc', 'bc', 2)", true, true),
+            ("SELECT LOCATE('abcabc', 'bc', 1, 2)", false, true),
+            ("SELECT SUBSTRING('abc', -1, -2)", true, true),
+            ("SELECT TO_DECIMAL(12.345, 5, 2)", true, true),
+            (
+                "SELECT CAST(12.345 AS DECIMAL(5)), CAST(-12.9 AS INT)",
+                true,
+                true,
+            ),
+            ("SELECT TO_DATE('2024-01-15', 'YYYY-MM-DD')", true, true),
+            (
+                "SELECT TO_TIMESTAMP('2024-01-15', 'YYYY-MM-DD')",
+                false,
+                true,
+            ),
+            (
+                "SELECT TO_VARCHAR(DATE '2024-01-15', 'YYYY-MM-DD')",
+                true,
+                true,
+            ),
+            ("SELECT CURRENT_UTCDATE", true, true),
+            (
+                "SELECT CURRENT_UTCTIMESTAMP(7), CURRENT_UTCTIME",
+                false,
+                true,
+            ),
+            ("CREATE TABLE t (n INT, xs INT ARRAY)", true, true),
+            ("CREATE TABLE t (n SMALLDECIMAL ARRAY)", false, false),
+            ("ALTER TABLE t ADD (n SMALLDECIMAL ARRAY)", false, false),
+            ("ALTER TABLE t ADD (n INT ARRAY)", true, true),
+            ("SELECT COALESCE(ADD_DAYS(d, 1), d) FROM t", false, false),
+            ("SELECT COALESCE(CAST(x AS INT), 0) FROM t", false, false),
+            (
+                "SELECT COALESCE(JSON_VALUE(j, '$.a'), 'x') FROM t",
+                false,
+                false,
+            ),
+            (
+                "SELECT COALESCE(SUBSTR_REGEXPR('a' IN s), 'x') FROM t",
+                false,
+                false,
+            ),
+            (
+                "SELECT COALESCE(STRING_AGG(x, ','), '') FROM t",
+                false,
+                false,
+            ),
+            (
+                "CREATE TABLE t (n INT DEFAULT ADD_DAYS(d, 1))",
+                false,
+                false,
+            ),
+            ("SELECT * FROM t FOR JSON", false, false),
+            ("CREATE COLUMN TABLE t (n INT)", false, false),
+            ("SELECT * FROM t WITH HINT (NO_INLINE)", false, false),
+        ] {
+            let ast = hana.parse(sql).unwrap().remove(0);
+            let json = serde_json::to_string(&ast).unwrap();
+            let ast: Expression = serde_json::from_str(&json).unwrap();
+            for (target, supported) in [(DialectType::DuckDB, duckdb), (DialectType::Trino, trino)]
+            {
+                assert_eq!(
+                    Dialect::reject_hana_source_semantics(&ast, DialectType::HANA, target).is_ok(),
+                    supported,
+                    "validation: {sql} -> {target}"
+                );
+                assert_eq!(
+                    Dialect::get(target).generate(&ast).is_ok(),
+                    supported,
+                    "generation: {sql} -> {target}"
+                );
+            }
+            assert!(Dialect::reject_hana_source_semantics(
+                &ast,
+                DialectType::HANA,
+                DialectType::HANA
+            )
+            .is_ok());
+        }
+    }
+
+    #[cfg(all(
+        feature = "transpile",
+        feature = "dialect-hana",
+        feature = "dialect-duckdb"
+    ))]
+    #[test]
+    fn hana_rejects_source_semantics_before_preprocessing_can_erase_them() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&called);
+        let mut hana = Dialect::get(DialectType::HANA);
+        hana.custom_preprocess = Some(Box::new(move |_| {
+            seen.store(true, Ordering::Relaxed);
+            Ok(Expression::number(1))
+        }));
+        for level in [
+            UnsupportedLevel::Ignore,
+            UnsupportedLevel::Warn,
+            UnsupportedLevel::Raise,
+            UnsupportedLevel::Immediate,
+        ] {
+            for sql in [
+                "SELECT COALESCE(ADD_DAYS(d, 1), d) FROM t",
+                "SELECT COALESCE(CAST(x AS INT), 0) FROM t",
+                "SELECT COALESCE(JSON_VALUE(j, '$.a'), 'x') FROM t",
+                "CREATE TABLE t (x SMALLDECIMAL ARRAY)",
+                "ALTER TABLE t ADD (x SMALLDECIMAL ARRAY)",
+                "SELECT CAST(xs AS SMALLDECIMAL ARRAY) FROM t",
+                "CREATE FUNCTION f(x SMALLDECIMAL ARRAY) RETURNS INT AS 1",
+                "SELECT * FROM t FOR JSON",
+                "SELECT * FROM t WITH HINT (NO_INLINE)",
+            ] {
+                assert!(
+                    hana.transpile_with(
+                        sql,
+                        DialectType::DuckDB,
+                        TranspileOptions::default().with_unsupported_level(level)
+                    )
+                    .is_err(),
+                    "{sql}"
+                );
+                assert!(
+                    !called.load(Ordering::Relaxed),
+                    "preprocessing must not erase unsupported input: {sql}"
+                );
+            }
+        }
+        let mut target = Dialect::get(DialectType::DuckDB);
+        Arc::make_mut(&mut target.generator_config).dialect = Some(DialectType::Generic);
+        assert!(hana
+            .transpile("SELECT LOCATE('abc', 'b')", &target)
+            .is_err());
+        assert!(!called.load(Ordering::Relaxed));
+        assert!(hana
+            .transpile("SELECT COALESCE(x, 0) FROM t", DialectType::DuckDB)
+            .is_ok());
+        assert!(called.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn built_in_dialect_instances_share_tokenizer_config() {

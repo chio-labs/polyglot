@@ -99,6 +99,8 @@ pub(super) fn rewrite(
                 }
 
                 Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    source_dialect: None,
+
                     name: "medianExactWeightedInterpolatedOrNull".to_string(),
                     args: vec![input, Expression::number(1)],
                     distinct: false,
@@ -193,6 +195,8 @@ pub(super) fn rewrite(
                             "ARG_MIN_NULL"
                         };
                         Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                            source_dialect: None,
+
                             name: func_name.to_string(),
                             args: vec![agg.this, *having_expr],
                             distinct: agg.distinct,
@@ -418,9 +422,11 @@ pub(super) fn rewrite(
                                 // STRING_AGG(x, sep) -> LISTAGG(x, sep)
                                 Ok(Expression::ListAgg(Box::new(
                                     crate::expressions::ListAggFunc {
+                                        source_dialect: None,
                                         this: sa.this,
                                         separator: sa.separator,
                                         on_overflow: None,
+                                        max_length: None,
                                         order_by: sa.order_by,
                                         distinct: sa.distinct,
                                         filter: None,
@@ -538,9 +544,11 @@ pub(super) fn rewrite(
                             let this = wrap_concat_args_in_varchar_cast(gc.this);
                             Ok(Expression::ListAgg(Box::new(
                                 crate::expressions::ListAggFunc {
+                                    source_dialect: None,
                                     this,
                                     separator: Some(sep),
                                     on_overflow: None,
+                                    max_length: None,
                                     order_by: gc.order_by,
                                     distinct: gc.distinct,
                                     filter: gc.filter,
@@ -631,9 +639,11 @@ pub(super) fn rewrite(
                             let sep = gc.separator.unwrap_or(Expression::string(","));
                             Ok(Expression::ListAgg(Box::new(
                                 crate::expressions::ListAggFunc {
+                                    source_dialect: None,
                                     this: gc.this,
                                     separator: Some(sep),
                                     on_overflow: None,
+                                    max_length: None,
                                     order_by: gc.order_by,
                                     distinct: gc.distinct,
                                     filter: None,
@@ -741,6 +751,8 @@ pub(super) fn rewrite(
                         let preserves_order = agg.limit.is_some();
                         Ok(Expression::AggregateFunction(Box::new(
                             crate::expressions::AggregateFunction {
+                                source_dialect: None,
+
                                 name: "COLLECT_LIST".to_string(),
                                 args: vec![agg.this.clone()],
                                 distinct: agg.distinct,
@@ -1102,6 +1114,8 @@ pub(super) fn rewrite(
                     match target {
                         DialectType::Presto => Ok(Expression::AggregateFunction(Box::new(
                             crate::expressions::AggregateFunction {
+                                source_dialect: None,
+
                                 name: "SET_AGG".to_string(),
                                 args: f.args,
                                 distinct: false,
@@ -1114,6 +1128,8 @@ pub(super) fn rewrite(
                         ))),
                         DialectType::Snowflake => Ok(Expression::AggregateFunction(Box::new(
                             crate::expressions::AggregateFunction {
+                                source_dialect: None,
+
                                 name: "ARRAY_UNIQUE_AGG".to_string(),
                                 args: f.args,
                                 distinct: false,
@@ -1159,6 +1175,8 @@ pub(super) fn rewrite(
                     };
                     Ok(Expression::AggregateFunction(Box::new(
                         crate::expressions::AggregateFunction {
+                            source_dialect: None,
+
                             name: name.to_string(),
                             args: f.args,
                             distinct: f.distinct,
@@ -1229,6 +1247,7 @@ pub(super) fn rewrite(
                             this: column.clone(),
                             percentile,
                             order_by: Some(vec![Ordered {
+                                nulls_auto: false,
                                 this: column,
                                 desc: false,
                                 nulls_first: None,

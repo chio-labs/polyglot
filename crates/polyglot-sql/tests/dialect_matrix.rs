@@ -25,10 +25,148 @@ fn transpile_succeeds(sql: &str, from: DialectType, to: DialectType) -> bool {
     source_dialect.transpile(sql, to).is_ok()
 }
 
+mod concat_precedence {
+    use super::*;
+    use DialectType::{DuckDB, MySQL, PostgreSQL, SQLite};
+
+    #[test]
+    fn sqlite_concat_keeps_grouping_when_transpiled() {
+        for (sql, expected) in [
+            ("SELECT 1 || 2 * 3", "SELECT CONCAT(1, 2) * 3"),
+            ("SELECT 1 * 2 || 3", "SELECT 1 * CONCAT(2, 3)"),
+            ("SELECT 1 + 2 || 3", "SELECT 1 + CONCAT(2, 3)"),
+            ("SELECT 1 || 2 + 3", "SELECT CONCAT(1, 2) + 3"),
+            ("SELECT 1 || 2 % 5", "SELECT CONCAT(1, 2) % 5"),
+            ("SELECT 1 || 2 || 3 * 4", "SELECT CONCAT(1, 2, 3) * 4"),
+            ("SELECT 1 || (2 * 3)", "SELECT CONCAT(1, (2 * 3))"),
+            ("SELECT (1 || 2) * 3", "SELECT (CONCAT(1, 2)) * 3"),
+            ("SELECT -1 || 2 * 3", "SELECT CONCAT(-1, 2) * 3"),
+            ("SELECT 1 || -2 * 3", "SELECT CONCAT(1, -2) * 3"),
+        ] {
+            assert_eq!(transpile(sql, SQLite, MySQL), expected, "{sql}");
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+        assert_eq!(
+            transpile("SELECT 1 || 2 * 3", SQLite, DuckDB),
+            "SELECT (1 || 2) * 3"
+        );
+        assert_eq!(
+            transpile("SELECT 1 + 2 || 3", SQLite, PostgreSQL),
+            "SELECT 1 + (2 || 3)"
+        );
+    }
+
+    #[test]
+    fn sqlite_target_groups_arithmetic_inside_concat() {
+        for source in [PostgreSQL, DuckDB] {
+            for (sql, expected) in [
+                ("SELECT '1' || 2 * 3", "SELECT '1' || (2 * 3)"),
+                ("SELECT 1 + 2 || '3'", "SELECT (1 + 2) || '3'"),
+                ("SELECT '1' || 2 % 5", "SELECT '1' || (2 % 5)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, SQLite),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_concat_and_json_arrows_share_precedence() {
+        assert_eq!(
+            transpile("SELECT '[' || 1 || ']' ->> 0", SQLite, DuckDB),
+            "SELECT ('[' || 1 || ']') ->> '$[0]'"
+        );
+        assert_eq!(
+            transpile("SELECT 'x' || '[1]' ->> 0", PostgreSQL, SQLite),
+            "SELECT 'x' || ('[1]' ->> 0)"
+        );
+        for sql in [
+            "SELECT '[' || 1 || ']' ->> 0",
+            "SELECT '[1]' ->> 0 || 'x'",
+            "SELECT j -> i || 'x'",
+            "SELECT (j) -> i || 'x'",
+            "SELECT ('[' || 1 || ']') -> 0",
+            "SELECT '[1]' ->> (0 || '')",
+            "SELECT 1 || 2 COLLATE NOCASE * 3",
+        ] {
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+    }
+}
+
+mod bitwise_precedence {
+    use super::*;
+    use DialectType::{MySQL, PostgreSQL, SQLite, Snowflake};
+
+    #[test]
+    fn same_tier_bitwise_operators_keep_source_grouping() {
+        for source in [SQLite, PostgreSQL] {
+            for (sql, expected) in [
+                (
+                    "SELECT 1 | 2 & 4 AS v",
+                    "SELECT BITAND(BITOR(1, 2), 4) AS v",
+                ),
+                (
+                    "SELECT 1 | 2 << 1 AS v",
+                    "SELECT BITSHIFTLEFT(BITOR(1, 2), 1) AS v",
+                ),
+                (
+                    "SELECT 8 | 1 >> 1 AS v",
+                    "SELECT BITSHIFTRIGHT(BITOR(8, 1), 1) AS v",
+                ),
+                ("SELECT 1 | 2 & 4 = 0", "SELECT BITAND(BITOR(1, 2), 4) = 0"),
+                ("SELECT 1 | (2 & 4)", "SELECT BITOR(1, (BITAND(2, 4)))"),
+                ("SELECT (1 | 2) & 4", "SELECT BITAND((BITOR(1, 2)), 4)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, Snowflake),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            transpile("SELECT 1 | 2 # 3", PostgreSQL, Snowflake),
+            "SELECT BITXOR(BITOR(1, 2), 3)"
+        );
+        assert_eq!(
+            transpile("SELECT 1 | 2 & 4", MySQL, Snowflake),
+            "SELECT BITOR(1, BITAND(2, 4))"
+        );
+    }
+
+    #[test]
+    fn bitwise_transpilation_preserves_grouping_in_both_directions() {
+        for shared_tier in [SQLite, PostgreSQL] {
+            for (source, target, sql, expected) in [
+                (shared_tier, MySQL, "SELECT 1 | 2 & 4", "SELECT (1 | 2) & 4"),
+                (MySQL, shared_tier, "SELECT 1 | 2 & 4", "SELECT 1 | (2 & 4)"),
+                (
+                    shared_tier,
+                    MySQL,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT (1 | 2) << 1",
+                ),
+                (
+                    MySQL,
+                    shared_tier,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT 1 | (2 << 1)",
+                ),
+            ] {
+                assert_eq!(transpile(sql, source, target), expected);
+            }
+        }
+    }
+}
+
 mod strict_unsupported_regressions {
     use super::*;
 
-    fn transpile_with_level(
+    pub(super) fn transpile_with_level(
         sql: &str,
         read: DialectType,
         write: DialectType,
@@ -484,7 +622,6 @@ mod strict_unsupported_regressions {
             "SELECT count(t.id) FROM t",
             "SELECT sum(t.amount) FROM t",
             "SELECT t.* FROM t",
-            "SELECT count(x) FILTER (WHERE EXISTS (SELECT t.* FROM t)) FROM u",
         ];
 
         for write in [DialectType::Fabric, DialectType::TSQL] {
@@ -517,6 +654,24 @@ mod strict_unsupported_regressions {
                 transpile_with_level(sql, DialectType::PostgreSQL, write, UnsupportedLevel::Raise)
                     .expect("strict TSQL/Fabric transpile should allow scalar aggregate arguments");
             }
+        }
+    }
+
+    #[test]
+    fn strict_tsql_targets_reject_filter_subqueries_lowered_into_aggregate_arguments() {
+        // FILTER becomes CASE inside COUNT. SQL Server/Fabric do not allow a
+        // subquery in that argument, even though the FILTER is valid PostgreSQL.
+        for target in [DialectType::TSQL, DialectType::Fabric] {
+            let error = transpile_with_level(
+                "SELECT count(x) FILTER (WHERE EXISTS (SELECT t.* FROM t)) FROM u",
+                DialectType::PostgreSQL,
+                target,
+                UnsupportedLevel::Raise,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("aggregate arguments containing subqueries"));
         }
     }
 
@@ -4910,5 +5065,1285 @@ mod secondary_dialects {
             DialectType::CockroachDB,
             DialectType::Generic
         ));
+    }
+}
+
+#[cfg(feature = "dialect-hana")]
+mod hana_regressions {
+    use super::strict_unsupported_regressions::transpile_with_level;
+    use super::*;
+    use polyglot_sql::expressions::Expression;
+    use polyglot_sql::ExpressionWalk;
+
+    #[test]
+    fn integer_casts_preserve_hana_truncation_and_reject_unverified_domains() {
+        let sql = "SELECT CAST(10.9 AS INTEGER), CAST(-10.9 AS BIGINT), CAST(10.9 AS TINYINT), CAST(-10.9 AS SMALLINT)";
+        assert_eq!(transpile(sql, DialectType::HANA, DialectType::DuckDB),
+            "SELECT CAST(TRUNC(10.9) AS INT), CAST(TRUNC(-10.9) AS BIGINT), CAST(TRUNC(10.9) AS UTINYINT), CAST(TRUNC(-10.9) AS SMALLINT)");
+        for target in [DialectType::PostgreSQL, DialectType::Trino] {
+            let sql = "SELECT CAST(-10.9 AS BIGINT)";
+            let output = transpile(sql, DialectType::HANA, target);
+            assert!(output.contains(if target == DialectType::Trino {
+                "TRUNCATE(-10.9)"
+            } else {
+                "TRUNC(-10.9)"
+            }));
+        }
+        let hana = Dialect::get(DialectType::HANA);
+        for sql in [
+            "SELECT CAST('10.9' AS INT)",
+            "SELECT CAST(x AS INT) FROM t",
+            "SELECT CAST(256 AS TINYINT)",
+        ] {
+            let ast = hana.parse(sql).unwrap();
+            let json = serde_json::to_string(&ast).unwrap();
+            let decoded: Vec<Expression> = serde_json::from_str(&json).unwrap();
+            assert!(hana.generate(&decoded[0]).is_ok(), "native {sql}");
+            for target in [DialectType::PostgreSQL, DialectType::Trino] {
+                assert!(
+                    Dialect::get(target).generate(&decoded[0]).is_err(),
+                    "{sql} -> {target:?}"
+                );
+                for level in [UnsupportedLevel::Ignore, UnsupportedLevel::Raise] {
+                    assert!(transpile_with_level(sql, DialectType::HANA, target, level).is_err());
+                }
+            }
+        }
+        for sql in [
+            "SELECT CAST(10.9 AS INT)",
+            "SELECT CAST(-10.9 AS BIGINT)",
+            "SELECT CAST('10.9' AS INT)",
+            "SELECT CAST(x AS SMALLINT) FROM t",
+        ] {
+            assert!(
+                transpile_with_level(
+                    sql,
+                    DialectType::PostgreSQL,
+                    DialectType::HANA,
+                    UnsupportedLevel::Raise
+                )
+                .is_err(),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            transpile(
+                "SELECT CAST(42 AS INT)",
+                DialectType::PostgreSQL,
+                DialectType::HANA
+            ),
+            "SELECT CAST(42 AS INT) FROM SYS.DUMMY"
+        );
+        for sql in [
+            "SELECT CAST(-32768 AS SMALLINT)",
+            "SELECT CAST(2147483647 AS INTEGER)",
+            "SELECT CAST(-9223372036854775808 AS BIGINT)",
+        ] {
+            assert!(
+                transpile_with_level(
+                    sql,
+                    DialectType::HANA,
+                    DialectType::DuckDB,
+                    UnsupportedLevel::Raise
+                )
+                .is_ok(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn incoming_decimal_casts_require_verified_rounding_and_overflow_semantics() {
+        for source in [DialectType::PostgreSQL, DialectType::DuckDB] {
+            for sql in [
+                "SELECT CAST(12.349 AS DECIMAL(5, 2))",
+                "SELECT CAST(-12.349 AS DECIMAL(5, 2))",
+                "SELECT CAST(999.999 AS DECIMAL(5, 2))",
+                "SELECT CAST('12.349' AS DECIMAL(5, 2))",
+                "SELECT CAST(x AS DECIMAL(5, 2)) FROM t",
+                "SELECT CAST(12.349 AS DECIMAL)",
+                "SELECT TRY_CAST(12.349 AS DECIMAL(5, 2))",
+                "SELECT SAFE_CAST(12.349 AS DECIMAL(5, 2))",
+            ] {
+                let ast = Dialect::get(source).parse(sql).unwrap();
+                let error = Dialect::get(DialectType::HANA)
+                    .generate(&ast[0])
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("Decimal CAST to HANA"),
+                    "{sql}: {error}"
+                );
+                for level in [
+                    UnsupportedLevel::Ignore,
+                    UnsupportedLevel::Warn,
+                    UnsupportedLevel::Raise,
+                    UnsupportedLevel::Immediate,
+                ] {
+                    let error =
+                        transpile_with_level(sql, source, DialectType::HANA, level).unwrap_err();
+                    assert!(
+                        error.to_string().contains("Decimal CAST to HANA"),
+                        "{sql}: {error}"
+                    );
+                }
+            }
+        }
+        for sql in [
+            "SELECT CAST(12.349 AS DECIMAL(5, 2)) FROM t",
+            "SELECT CAST(-12.349 AS DECIMAL(5, 2)) FROM t",
+            "SELECT CAST(x AS DECIMAL) FROM t",
+        ] {
+            assert_eq!(transpile(sql, DialectType::HANA, DialectType::HANA), sql);
+        }
+        assert_eq!(
+            transpile(
+                "CREATE TABLE t (x DECIMAL(5, 2))",
+                DialectType::PostgreSQL,
+                DialectType::HANA
+            ),
+            "CREATE TABLE t (x DECIMAL(5, 2))"
+        );
+    }
+
+    #[test]
+    fn synthetic_dummy_is_not_captured_by_ctes() {
+        for (sql, expected) in [
+            (
+                "WITH DUMMY AS (SELECT x FROM t) SELECT 42",
+                "WITH DUMMY AS (SELECT x FROM t) SELECT 42 FROM SYS.DUMMY",
+            ),
+            (
+                r#"WITH "DUMMY" AS (SELECT x FROM t) SELECT 42"#,
+                r#"WITH "DUMMY" AS (SELECT x FROM t) SELECT 42 FROM SYS.DUMMY"#,
+            ),
+            (
+                "WITH DUMMY AS (SELECT 7 AS x) SELECT (SELECT 42) FROM DUMMY",
+                "WITH DUMMY AS (SELECT 7 AS x FROM SYS.DUMMY) SELECT (SELECT 42 FROM SYS.DUMMY) FROM DUMMY",
+            ),
+            (
+                "WITH DUMMY AS (SELECT x FROM t) SELECT x FROM DUMMY",
+                "WITH DUMMY AS (SELECT x FROM t) SELECT x FROM DUMMY",
+            ),
+        ] {
+            assert_eq!(transpile(sql, DialectType::PostgreSQL, DialectType::HANA), expected);
+            let ast = Dialect::get(DialectType::PostgreSQL).parse(sql).unwrap();
+            assert_eq!(Dialect::get(DialectType::HANA).generate(&ast[0]).unwrap(), expected);
+            // Explicit relations, including the injected system relation, survive native generation.
+            assert_eq!(transpile(expected, DialectType::HANA, DialectType::HANA), expected);
+        }
+    }
+
+    #[test]
+    fn incoming_string_aggregation_requires_verified_null_semantics() {
+        for sql in [
+            "SELECT STRING_AGG(x, ',' ORDER BY id) FROM t",
+            "SELECT STRING_AGG(NULL, ',') FROM t",
+            "SELECT STRING_AGG(x, ',') FROM t WHERE 1 = 0",
+            "SELECT STRING_AGG(x, ',') OVER (PARTITION BY grp) FROM t",
+            "SELECT STRING_AGG(x, ',') FILTER (WHERE keep), COUNT(*) FROM t",
+        ] {
+            for source in [DialectType::PostgreSQL, DialectType::DuckDB] {
+                let error =
+                    transpile_with_level(sql, source, DialectType::HANA, UnsupportedLevel::Raise)
+                        .unwrap_err();
+                assert!(error.to_string().contains("STRING_AGG"), "{sql}: {error}");
+            }
+        }
+        assert!(Dialect::get(DialectType::HANA)
+            .transpile("SELECT STRING_AGG(x, ',') FROM t", DialectType::HANA)
+            .is_ok());
+    }
+
+    #[test]
+    fn dummy_relations_preserve_rows_columns_aliases_and_cte_scope() {
+        assert!(Dialect::get(DialectType::HANA)
+            .transpile("SELECT SYS.DUMMY.DUMMY FROM SYS.DUMMY", DialectType::DuckDB,)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit table alias"));
+        for target in [
+            DialectType::DuckDB,
+            DialectType::PostgreSQL,
+            DialectType::Trino,
+        ] {
+            for sql in [
+                "SELECT 1 FROM SYS.DUMMY",
+                "SELECT * FROM DUMMY",
+                "SELECT d.DUMMY FROM SYS.DUMMY AS d",
+                "SELECT COUNT(*) FROM DUMMY WHERE 1 = 0",
+            ] {
+                let output = transpile(sql, DialectType::HANA, target);
+                assert!(output.contains("SELECT 'X' AS DUMMY"), "{output}");
+                assert!(!output.contains("FROM SYS.DUMMY"), "{output}");
+            }
+        }
+        for sql in [
+            "SELECT * FROM app.DUMMY",
+            "SELECT * FROM \"dummy\"",
+            "WITH DUMMY AS (SELECT 7 AS n) SELECT n FROM DUMMY",
+        ] {
+            let output = transpile(sql, DialectType::HANA, DialectType::DuckDB);
+            assert!(!output.contains("SELECT 'X'"), "{output}");
+        }
+        // The alias is not visible in its own non-recursive definition.
+        for sql in [
+            "WITH DUMMY AS (SELECT * FROM SYS.DUMMY) SELECT * FROM DUMMY",
+            "WITH DUMMY AS (SELECT * FROM DUMMY) SELECT * FROM DUMMY",
+            "WITH first_cte AS (SELECT * FROM DUMMY), DUMMY AS (SELECT 7 AS n), last_cte AS (SELECT n FROM DUMMY) SELECT * FROM first_cte",
+        ] {
+            let output = transpile(sql, DialectType::HANA, DialectType::DuckDB);
+            assert_eq!(output.matches("SELECT 'X'").count(), 1, "{output}");
+        }
+        // A nested WITH does not shadow a sibling or its enclosing query.
+        let output = transpile(
+            "SELECT (WITH DUMMY AS (SELECT 7 AS n) SELECT n FROM DUMMY) FROM DUMMY",
+            DialectType::HANA,
+            DialectType::DuckDB,
+        );
+        assert_eq!(output.matches("SELECT 'X'").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn outer_statement_validation_still_rejects_nested_raw_fallbacks() {
+        let hana = Dialect::get(DialectType::HANA);
+        for sql in [
+            "UNSUPPORTED STATEMENT",
+            "SELECT (UNSUPPORTED STATEMENT)",
+            "CREATE TABLE t AS (UNSUPPORTED STATEMENT)",
+        ] {
+            assert!(hana.parse(sql).is_err(), "{sql}");
+        }
+        let mut sql = "SELECT 1".to_owned();
+        for _ in 0..80 {
+            sql = format!("SELECT ({sql})");
+        }
+        assert!(hana.parse(&sql).is_ok());
+        assert!(hana.parse("SELECT 1; UNSUPPORTED STATEMENT").is_err());
+    }
+
+    #[test]
+    fn shared_function_nodes_participate_in_generic_analysis() {
+        use polyglot_sql::optimizer::{normalize_identifiers, TypeAnnotator};
+        let hana = Dialect::get(DialectType::HANA);
+        let ast = hana
+            .parse("SELECT COALESCE(mixed, 1), mixed FROM tab")
+            .unwrap()
+            .remove(0);
+        assert!(ast.dfs().any(|e| matches!(e, Expression::Function(_))));
+        let normalized = normalize_identifiers(ast, Some(DialectType::HANA));
+        assert_eq!(
+            hana.generate(&normalized).unwrap(),
+            "SELECT COALESCE(MIXED, 1), MIXED FROM TAB"
+        );
+        let ast = hana
+            .parse("SELECT COALESCE(1, 2) FROM DUMMY")
+            .unwrap()
+            .remove(0);
+        let call = ast
+            .dfs()
+            .find(|e| matches!(e, Expression::Function(_)))
+            .unwrap();
+        assert_eq!(call.source_dialect(), Some(DialectType::HANA));
+        assert!(matches!(
+            TypeAnnotator::new(None, Some(DialectType::HANA)).annotate(call),
+            Some(polyglot_sql::expressions::DataType::Int { .. })
+        ));
+        for dialect in [DialectType::HANA, DialectType::PostgreSQL] {
+            let ast = Dialect::get(dialect)
+                .parse(r#"SELECT "f"(x) FROM t"#)
+                .unwrap()
+                .remove(0);
+            let call = ast
+                .dfs()
+                .find(|e| matches!(e, Expression::Function(_)))
+                .unwrap();
+            assert_eq!(
+                call.source_dialect(),
+                None,
+                "quoted UDFs are not native built-ins"
+            );
+        }
+    }
+
+    #[test]
+    fn source_metadata_survives_optimizers_and_standalone_generation() {
+        use polyglot_sql::optimizer::{canonicalize, normalize_identifiers};
+        let hana = Dialect::get(DialectType::HANA);
+        let trino = Dialect::get(DialectType::Trino);
+        let ast = hana
+            .parse("SELECT LOCATE('abcabc', 'bc', 1, 2) FROM DUMMY")
+            .unwrap()
+            .remove(0);
+        let ast = canonicalize(
+            normalize_identifiers(ast, Some(DialectType::HANA)),
+            Some(DialectType::HANA),
+        );
+        let call = ast
+            .dfs()
+            .find(|e| matches!(e, Expression::Function(_)))
+            .unwrap();
+        let json = serde_json::to_string(call).unwrap();
+        assert!(json.contains("\"source_dialect\":\"hana\""));
+        assert!(!json.contains("hana_function"));
+        let call: Expression = serde_json::from_str(&json).unwrap();
+        assert_eq!(trino.generate(&call).unwrap(), "STRPOS('abcabc', 'bc', 2)");
+        assert_eq!(
+            hana.generate(&call).unwrap(),
+            "LOCATE('abcabc', 'bc', 1, 2)"
+        );
+        for sql in [
+            "SELECT SUBSTR_REGEXPR('a' IN value OCCURRENCE 2) FROM t",
+            "SELECT JSON_VALUE(payload, '$.n' DEFAULT 0 ON EMPTY) FROM t",
+            "SELECT STRING_AGG(value, ',' ORDER BY id) FROM t",
+        ] {
+            let ast = hana.parse(sql).unwrap().remove(0);
+            let json = serde_json::to_string(&ast).unwrap();
+            let decoded: Expression = serde_json::from_str(&json).unwrap();
+            assert_eq!(hana.generate(&decoded).unwrap(), sql);
+            assert!(trino.generate(&decoded).is_err(), "{sql}");
+            assert!(!decoded.dfs().any(|e| e.variant_name().starts_with("hana_")));
+        }
+    }
+
+    #[test]
+    fn create_table_traversal_is_independent_of_source_metadata() {
+        use polyglot_sql::ast_transforms::rename_columns;
+        let hana = Dialect::get(DialectType::HANA);
+        let ast = hana
+            .parse("CREATE TABLE t (value INT CHECK (value > 0))")
+            .unwrap()
+            .remove(0);
+        let mut outputs = Vec::new();
+        for source in [None, Some(DialectType::HANA)] {
+            let mut ast = ast.clone();
+            if let Expression::CreateTable(table) = &mut ast {
+                table.source_dialect = source;
+            }
+            let renamed =
+                rename_columns(ast, &[("value".to_owned(), "new_value".to_owned())].into());
+            outputs.push(hana.generate(&renamed).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert!(outputs[0].contains("CHECK (new_value > 0)"));
+    }
+
+    #[test]
+    fn native_syntax_uses_shared_expression_categories() {
+        let hana = Dialect::get(DialectType::HANA);
+        for (sql, expected) in [
+            ("SELECT JSON_VALUE(j, '$.a') FROM t", "j_s_o_n_value"),
+            ("SELECT JSON_QUERY(j, '$.a') FROM t", "json_query"),
+            (
+                "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (v INT PATH '$.v'))",
+                "j_s_o_n_table",
+            ),
+            (
+                "SELECT * FROM t WHERE value LIKE_REGEXPR 'a'",
+                "regexp_like",
+            ),
+            (
+                "SELECT SUBSTR_REGEXPR('a' IN value) FROM t",
+                "regexp_extract",
+            ),
+            (
+                "SELECT a FROM t GROUP BY ROLLUP STRUCTURED RESULT (a)",
+                "rollup",
+            ),
+            ("SELECT * FROM t WITH HINT (NO_INLINE)", "hint"),
+            (
+                "CREATE TABLE t (id INT) PARTITION BY HASH (id) PARTITIONS 4",
+                "partition_by_property",
+            ),
+            ("CALL demo.proc(1)", "call"),
+            ("UPSERT t VALUES (1) WITH PRIMARY KEY", "upsert"),
+        ] {
+            let ast = hana.parse(sql).unwrap().remove(0);
+            assert!(
+                ast.dfs().any(|e| e.variant_name() == expected),
+                "{sql}: expected {expected}"
+            );
+            assert_eq!(hana.generate(&ast).unwrap(), sql);
+        }
+    }
+
+    #[test]
+    fn native_semantics_survive_transpile_and_json() {
+        let hana = Dialect::get(DialectType::HANA);
+        for sql in [
+            "SELECT LOCATE('abcabc', 'bc', 1, 2) FROM DUMMY",
+            "SELECT TO_DECIMAL(7654321.888888, 10, 3) FROM DUMMY",
+            "SELECT CURRENT_UTCTIMESTAMP(7), CURRENT_UTCDATE, CURRENT_UTCTIME FROM DUMMY",
+            "SELECT ADD_DAYS(d, 7), BITAND(a, b), TO_VARCHAR(d, 'YYYY-MM-DD') FROM t",
+            "SELECT * FROM t FOR JSON",
+            "SELECT * FROM t FOR XML",
+            "SELECT * FROM t FOR JSON ('arraywrap' = 'NO')",
+            "SELECT * FROM t WITH HINT (NO_INLINE)",
+            "ALTER TABLE t ADD (x INT)",
+            "CREATE TABLE t (xs INT ARRAY)",
+            "CREATE COLUMN TABLE t (id INT)",
+            "CREATE ROW TABLE t (id INT)",
+            "CREATE LOCAL TEMPORARY COLUMN TABLE t (id INT)",
+            "SELECT * FROM t FOR UPDATE IGNORE LOCKED",
+            "SELECT * FROM t WHERE CONTAINS(name, 'abc', FUZZY(0.8))",
+            "SELECT * FROM t WHERE name LIKE_REGEXPR '^a' FLAG 'i'",
+            "SELECT SUBSTR_REGEXPR('a' IN s OCCURRENCE 2) FROM t",
+            "UPSERT t VALUES (1, 8) WITH PRIMARY KEY",
+            "UPSERT t VALUES (2, 2) WHERE id = 2",
+            "UPSERT t SELECT id, val FROM source",
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY HASH (id) PARTITIONS 4",
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY HASH (id) NO PRIMARY KEY CHECK PARTITIONS 4",
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY RANGE (id) PRIMARY KEY CHECK (PARTITION OTHERS)",
+            "SELECT * FROM HIERARCHY(SOURCE (SELECT id AS node_id, parent AS parent_id FROM t))",
+            "SELECT * FROM HIERARCHY(SOURCE t START WHERE id = 1 SIBLING ORDER BY id ORPHAN ROOT)",
+            r#"SELECT * FROM "_SYS_BIC"."pkg/view"(PLACEHOLDER."$$P$$" => 'X')"#,
+            "SELECT * FROM t FOR JSON ('arraywrap' = 'NO') RETURNS NVARCHAR(5000)",
+            "SELECT * FROM t FOR XML RETURNS NCLOB",
+            "SELECT * FROM t FOR SHARE LOCK WAIT 3",
+            "SELECT * FROM t FOR SHARE LOCK IGNORE LOCKED",
+            "SELECT * FROM t ORDER BY a WITH COLLATION ENGLISH WITH HINT (NO_INLINE CASCADE)",
+            "CALL demo.proc(1, ?) ASYNC WITH HINT (NO_INLINE)",
+            "CALL demo.library:member(1)",
+            "SELECT JSON_VALUE(j, '$.a' RETURNING INT DEFAULT 0 ON EMPTY ERROR ON ERROR) FROM t",
+            "SELECT JSON_QUERY(j, '$.a' WITH CONDITIONAL ARRAY WRAPPER EMPTY ARRAY ON EMPTY NULL ON ERROR) FROM t",
+            "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (rn FOR ORDINALITY, v NVARCHAR(20) PATH '$.v' DEFAULT 'missing' ON EMPTY ERROR ON ERROR))",
+            "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (NESTED PATH '$.a[*]' COLUMNS (v INT PATH '$.v')) ERROR ON ERROR)",
+            "SELECT CAST(x AS ST_GEOMETRY(4326)), CAST(y AS REAL_VECTOR(3)) FROM t",
+            "CREATE COLUMN TABLE t (id INT) NO AUTO MERGE UNLOAD PRIORITY 5",
+            "CREATE TABLE t (id INT) RECORD COMMIT TIMESTAMP",
+            "CREATE TABLE t (id INT, next_id INT GENERATED ALWAYS AS id + 1)",
+
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION 0 <= VALUES < 100, PARTITION OTHERS)",
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY HASH (id) PARTITIONS 4 SUBPARTITION BY RANGE (id) (PARTITION VALUES < 100, PARTITION OTHERS DYNAMIC THRESHOLD 1000)",
+            "CREATE COLUMN TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION VALUES = 1 PAGE LOADABLE, PARTITION OTHERS DYNAMIC INCREASING INTERVAL 10)",
+            "SELECT CURRENT_CONNECTION, CURRENT_SCHEMA, CURRENT_USER, SESSION_USER, SYSUUID FROM DUMMY",
+            "SELECT NTH_VALUE(x, 2 ORDER BY y), STRING_AGG(s, ',' ORDER BY id) FROM t",
+            "SELECT * FROM t WHERE s NOT LIKE_REGEXPR '^a' FLAG 'i'",
+            "SELECT REPLACE_REGEXPR('a' IN s WITH 'b' OCCURRENCE ALL) FROM t",
+            "SELECT LOCATE_REGEXPR(AFTER 'a' IN s FROM 2 OCCURRENCE 1 GROUP 0) FROM t",
+            "SELECT a, b, SUM(x) FROM t GROUP BY GROUPING SETS BEST -1 LIMIT 2 OFFSET 1 WITH SUBTOTAL WITH BALANCE WITH TOTAL ((a), (b))",
+            "SELECT a, SUM(x) FROM t GROUP BY ROLLUP STRUCTURED RESULT WITH OVERVIEW PREFIX '#groups' (a)",
+            "SELECT a, SUM(x) FROM t GROUP BY CUBE MULTIPLE RESULTSETS (a)",
+            "SELECT * FROM t LIMIT 1 OFFSET 2 TOTAL ROWCOUNT",
+            "SELECT LOCALTOUTC(ts, 'EST', 'sap' NULL ON ERROR) FROM t",
+            "SELECT UTCTOLOCAL(ts, 'INVALID', 'sap' DEFAULT '2025-01-01 00:00:00' ON ERROR) FROM t",
+        ] {
+            let ast = hana.parse(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
+            assert!(!ast[0].dfs().any(|node| matches!(node, Expression::Raw(_) | Expression::Command(_))), "{sql}");
+            let json = serde_json::to_string(&ast).unwrap();
+            let decoded: Vec<Expression> = serde_json::from_str(&json).unwrap();
+            let output = hana.generate(&decoded[0]).unwrap();
+            assert_eq!(output, sql, "AST round trip: {sql}");
+            assert_eq!(hana.transpile(sql, DialectType::HANA).unwrap(), vec![sql], "transpile: {sql}");
+        }
+    }
+
+    #[test]
+    fn preserves_quoted_and_qualified_names() {
+        let sql = "SELECT \"CURRENT_UTCDATE\", t.CURRENT_UTCTIME, \"ADD_DAYS\"(d, 1) FROM t";
+        assert_eq!(transpile(sql, DialectType::HANA, DialectType::HANA), sql);
+    }
+
+    #[test]
+    fn native_children_participate_in_ast_mutations() {
+        use polyglot_sql::ast_transforms::{rename_columns, rename_tables};
+        let hana = Dialect::get(DialectType::HANA);
+        for sql in [
+            "SELECT LOCATE(value, 'a'), JSON_VALUE(payload, '$.n' DEFAULT value ON EMPTY) FROM records",
+            "SELECT SUBSTR_REGEXPR('a' IN value), LOCALTOUTC(value, 'UTC') FROM records ORDER BY value",
+            "SELECT value, SUM(n) FROM records GROUP BY ROLLUP BEST 1 (value)",
+            "SELECT * FROM HIERARCHY(SOURCE (SELECT value AS node_id, parent AS parent_id FROM records))",
+            "UPSERT target_table SELECT value FROM source_table",
+            "CREATE TABLE records (value INT, next_value INT GENERATED ALWAYS AS value + 1) PARTITION BY HASH (value) PARTITIONS 4",
+        ] {
+            let ast = hana.parse(sql).unwrap().remove(0);
+            assert!(ast.dfs().any(|e| matches!(e, Expression::Column(c) if c.name.name == "value")), "{sql}");
+            let renamed = rename_columns(ast.clone(), &[("value".to_owned(), "renamed".to_owned())].into());
+            assert!(!renamed.dfs().any(|e| matches!(e, Expression::Column(c) if c.name.name == "value")), "{sql}");
+            assert!(renamed.dfs().any(|e| matches!(e, Expression::Column(c) if c.name.name == "renamed")), "{sql}");
+            assert!(ast.dfs().any(|e| matches!(e, Expression::Column(c) if c.name.name == "value")), "{sql}");
+        }
+        let ast = hana
+            .parse("UPSERT target_table SELECT value FROM source_table")
+            .unwrap()
+            .remove(0);
+        let renamed = rename_tables(
+            ast,
+            &[
+                ("target_table".to_owned(), "new_target".to_owned()),
+                ("source_table".to_owned(), "new_source".to_owned()),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            hana.generate(&renamed).unwrap(),
+            "UPSERT new_target SELECT value FROM new_source"
+        );
+    }
+
+    #[test]
+    fn quoted_reserved_names_and_qualified_calls_are_not_builtins() {
+        for (sql, trino) in [
+            (
+                r#"SELECT "CURRENT_USER", t.CURRENT_SCHEMA, demo."ADD_DAYS"(d, 1) FROM t"#,
+                r#"SELECT "CURRENT_USER", t."CURRENT_SCHEMA", demo."ADD_DAYS"(d, 1) FROM t"#,
+            ),
+            (r#"SELECT "COUNT"(x) FROM t"#, r#"SELECT "COUNT"(x) FROM t"#),
+        ] {
+            assert_eq!(transpile(sql, DialectType::HANA, DialectType::HANA), sql);
+            assert_eq!(transpile(sql, DialectType::HANA, DialectType::Trino), trino);
+        }
+    }
+
+    #[test]
+    fn incoming_queries_generate_native_syntax_or_report_unsupported() {
+        assert_eq!(
+            transpile("SELECT 1", DialectType::Generic, DialectType::HANA),
+            "SELECT 1 FROM SYS.DUMMY"
+        );
+        for (sql, source) in [
+            ("SELECT SUBSTRING('abcdef', -2, 2)", DialectType::DuckDB),
+            ("SELECT DATE_ADD('day', 1, d) FROM t", DialectType::Trino),
+            ("SELECT x ILIKE 'a%' FROM t", DialectType::PostgreSQL),
+        ] {
+            assert!(
+                Dialect::get(source)
+                    .transpile(sql, DialectType::HANA)
+                    .is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_casts_retain_conversion_semantics() {
+        assert_eq!(
+            transpile("SELECT UNKNOWN", DialectType::HANA, DialectType::HANA),
+            "SELECT NULL FROM SYS.DUMMY"
+        );
+        assert_eq!(
+            transpile("SELECT UNKNOWN", DialectType::HANA, DialectType::DuckDB),
+            "SELECT NULL"
+        );
+        assert_eq!(
+            transpile(
+                r#"SELECT "UNKNOWN" FROM t"#,
+                DialectType::HANA,
+                DialectType::HANA
+            ),
+            r#"SELECT "UNKNOWN" FROM t"#
+        );
+
+        for (sql, expected) in [
+            (
+                "SELECT CAST(-12.349 AS DECIMAL(5, 2))",
+                "SELECT CAST(TRUNC(-12.349, 2) AS DECIMAL(5, 2))",
+            ),
+            (
+                "SELECT CAST(12.99 AS DECIMAL(5))",
+                "SELECT CAST(TRUNC(12.99, 0) AS DECIMAL(5, 0))",
+            ),
+            (
+                "SELECT CAST(-12.349 AS DEC(5, 2))",
+                "SELECT CAST(TRUNC(-12.349, 2) AS DECIMAL(5, 2))",
+            ),
+        ] {
+            assert_eq!(
+                transpile(sql, DialectType::HANA, DialectType::DuckDB),
+                expected
+            );
+        }
+        assert_eq!(
+            transpile(
+                "SELECT CAST(255 AS TINYINT)",
+                DialectType::HANA,
+                DialectType::Trino
+            ),
+            "SELECT CAST(255 AS SMALLINT)"
+        );
+        assert!(Dialect::get(DialectType::HANA)
+            .transpile(
+                "SELECT CAST(x AS DECIMAL(10, 2)) FROM t",
+                DialectType::DuckDB
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_unverified_string_domains_and_volatile_bounds() {
+        for sql in [
+            "SELECT SUBSTRING(s, -2, 2) FROM t",
+            "SELECT SUBSTRING('abcdef', RAND(), 2) FROM DUMMY",
+            "SELECT SUBSTRING('a😀b', 2, 1) FROM DUMMY",
+            "SELECT SUBSTRING(x'ABCDEF', 1, 2) FROM DUMMY",
+            "SELECT LOCATE('a😀b', 'b') FROM DUMMY",
+            "SELECT LOCATE(s, 'b') FROM t",
+            "SELECT LOCATE('abc', '', 2) FROM DUMMY",
+            "SELECT LOCATE('abc', '', 1, 2) FROM DUMMY",
+            "SELECT TO_DECIMAL(CAST(s AS NVARCHAR(30)), 10, 2) FROM t",
+        ] {
+            for target in [
+                DialectType::Trino,
+                DialectType::DuckDB,
+                DialectType::PostgreSQL,
+            ] {
+                assert!(
+                    Dialect::get(DialectType::HANA)
+                        .transpile(sql, target)
+                        .is_err(),
+                    "{sql} -> {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validates_native_precision_and_function_arity() {
+        let hana = Dialect::get(DialectType::HANA);
+        for sql in [
+            "SELECT LOCATE('a') FROM DUMMY",
+            "SELECT SUBSTRING('a') FROM DUMMY",
+            "SELECT CURRENT_UTCTIMESTAMP(8) FROM DUMMY",
+            "SELECT CURRENT_UTCTIMESTAMP(x) FROM t",
+            "SELECT CAST(x AS FLOAT(0)) FROM t",
+            "SELECT CAST(x AS FLOAT(54)) FROM t",
+            "SELECT CAST(x AS DECIMAL(10, 11)) FROM t",
+            "SELECT CAST(x AS SMALLDECIMAL(10, 2)) FROM t",
+            "SELECT CAST(x AS NVARCHAR(5001)) FROM t",
+        ] {
+            assert!(hana.parse(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn source_semantics_generate_safe_target_expressions() {
+        for target in [
+            DialectType::Presto,
+            DialectType::Athena,
+            DialectType::Dune,
+            DialectType::DuckDB,
+        ] {
+            assert!(Dialect::get(DialectType::HANA)
+                .transpile(
+                    "SELECT TO_TIMESTAMP(s, 'YYYY-MM-DD HH24:MI:SS') FROM t",
+                    target
+                )
+                .is_err());
+        }
+        for (sql, target, expected) in [
+            (
+                "SELECT LOCATE('abcabc', 'bc')",
+                DialectType::Trino,
+                "SELECT STRPOS('abcabc', 'bc')",
+            ),
+            (
+                "SELECT LOCATE('length in char', '')",
+                DialectType::Trino,
+                "SELECT STRPOS('length in char', '')",
+            ),
+            (
+                "SELECT TO_TIMESTAMP('2024-01-15 12:30:45', 'YYYY-MM-DD HH24:MI:SS')",
+                DialectType::Trino,
+                "SELECT CAST(DATE_PARSE('2024-01-15 12:30:45', '%Y-%m-%d %H:%i:%s') AS TIMESTAMP(7))",
+            ),
+            (
+                "SELECT SUBSTRING('abcdef', -2, 2)",
+                DialectType::DuckDB,
+                "SELECT SUBSTRING('abcdef', 1, 2)",
+            ),
+            (
+                "SELECT TO_DECIMAL(7654321.888888, 10, 3)",
+                DialectType::DuckDB,
+                "SELECT CAST(TRUNC(7654321.888888, 3) AS DECIMAL(10, 3))",
+            ),
+            (
+                "SELECT TO_DATE('2024-01-15', 'YYYY-MM-DD')",
+                DialectType::Trino,
+                "SELECT CAST(DATE_PARSE('2024-01-15', '%Y-%m-%d') AS DATE)",
+            ),
+            (
+                "SELECT CAST(x AS FLOAT(24)), CAST(y AS FLOAT(53)) FROM t",
+                DialectType::Trino,
+                "SELECT CAST(x AS REAL), CAST(y AS DOUBLE) FROM t",
+            ),
+            (
+                "SELECT CAST(x AS LONGDATE), CAST(y AS TIME) FROM t",
+                DialectType::Trino,
+                "SELECT CAST(x AS TIMESTAMP(7)), CAST(y AS TIME(0)) FROM t",
+            ),
+        ] {
+            assert_eq!(transpile(sql, DialectType::HANA, target), expected);
+            let ast = Dialect::get(DialectType::HANA).parse(sql).unwrap();
+            assert_eq!(Dialect::get(target).generate(&ast[0]).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn incompatible_hana_features_fail_in_every_mode() {
+        for sql in [
+            "SELECT * FROM t FOR JSON",
+            "SELECT * FROM t FOR XML",
+            "SELECT TO_VARCHAR(1234.5, '9,999.00')",
+            "SELECT TO_VARCHAR(d, fmt) FROM t",
+            "SELECT TO_TIMESTAMP(s, 'YYYY-MM-DD HH24:MI:SS.FF7') FROM t",
+            "SELECT CAST(x AS SMALLDECIMAL) FROM t",
+            "CREATE TABLE t (x SMALLDECIMAL ARRAY)",
+            "ALTER TABLE t ADD (x SMALLDECIMAL ARRAY)",
+            "ALTER TABLE t ADD x SMALLDECIMAL ARRAY",
+            "ALTER TABLE t ALTER COLUMN x TYPE SMALLDECIMAL ARRAY",
+            "SELECT CAST(xs AS SMALLDECIMAL ARRAY) FROM t",
+            "CREATE FUNCTION f(x SMALLDECIMAL ARRAY) RETURNS INT AS 1",
+            "SELECT ADD_MONTHS_LAST(d, 1) FROM t",
+            "SELECT * FROM t WITH HINT (NO_INLINE)",
+            "SELECT * FROM t FOR UPDATE IGNORE LOCKED",
+            "SELECT * FROM HIERARCHY(SOURCE t)",
+            "SELECT JSON_VALUE(j, '$.a' ERROR ON ERROR) FROM t",
+            "SELECT SUBSTR_REGEXPR('a' IN s) FROM t",
+            "UPSERT t VALUES (1) WITH PRIMARY KEY",
+            "CREATE COLUMN TABLE t (a INT)",
+            "CALL demo.proc(1)",
+            "SELECT a, SUM(x) FROM t GROUP BY ROLLUP BEST 1 (a)",
+            "SELECT * FROM t LIMIT 1 TOTAL ROWCOUNT",
+            "SELECT LOCALTOUTC(ts, 'EST', 'sap' NULL ON ERROR) FROM t",
+        ] {
+            for target in [
+                DialectType::Generic,
+                DialectType::PostgreSQL,
+                DialectType::MySQL,
+                DialectType::BigQuery,
+                DialectType::Snowflake,
+                DialectType::DuckDB,
+                DialectType::SQLite,
+                DialectType::Hive,
+                DialectType::Spark,
+                DialectType::Trino,
+                DialectType::Presto,
+                DialectType::Redshift,
+                DialectType::TSQL,
+                DialectType::Oracle,
+                DialectType::ClickHouse,
+                DialectType::Databricks,
+                DialectType::Athena,
+                DialectType::Teradata,
+                DialectType::Doris,
+                DialectType::StarRocks,
+                DialectType::Materialize,
+                DialectType::RisingWave,
+                DialectType::SingleStore,
+                DialectType::CockroachDB,
+                DialectType::TiDB,
+                DialectType::Druid,
+                DialectType::Solr,
+                DialectType::Tableau,
+                DialectType::Dune,
+                DialectType::Fabric,
+                DialectType::Drill,
+                DialectType::Dremio,
+                DialectType::Exasol,
+                DialectType::DataFusion,
+                DialectType::Vertica,
+            ] {
+                let ast = Dialect::get(DialectType::HANA).parse(sql).unwrap();
+                assert!(
+                    Dialect::get(target).generate(&ast[0]).is_err(),
+                    "direct: {sql} -> {target}"
+                );
+                for level in [
+                    UnsupportedLevel::Ignore,
+                    UnsupportedLevel::Warn,
+                    UnsupportedLevel::Raise,
+                    UnsupportedLevel::Immediate,
+                ] {
+                    assert!(
+                        Dialect::get(DialectType::HANA)
+                            .transpile_with(
+                                sql,
+                                target,
+                                TranspileOptions::default().with_unsupported_level(level)
+                            )
+                            .is_err(),
+                        "{sql} -> {target}: {level:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hana_storage_checks_do_not_apply_to_other_sources() {
+        let sql = "CREATE GLOBAL TEMPORARY TABLE t (a INT)";
+        let output = Dialect::get(DialectType::Teradata)
+            .transpile(sql, DialectType::Teradata)
+            .unwrap();
+        assert!(output[0].contains("GLOBAL TEMPORARY TABLE"));
+        assert!(Dialect::get(DialectType::HANA)
+            .transpile(sql, DialectType::Teradata)
+            .is_err());
+    }
+
+    #[test]
+    fn unrelated_custom_types_are_unchanged() {
+        for name in ["SMALLDECIMAL", "ALPHANUM", "SECONDDATE"] {
+            let sql = format!("SELECT CAST(x AS {name}) FROM t");
+            assert_eq!(
+                transpile(&sql, DialectType::PostgreSQL, DialectType::PostgreSQL),
+                sql
+            );
+        }
+    }
+}
+
+mod oracle_row_limit_regressions {
+    use super::*;
+    use DialectType::*;
+
+    #[test]
+    fn postgres_limits_render_as_fetch_first_in_nested_queries() {
+        let cases = [
+            (
+                "SELECT a FROM t LIMIT 5",
+                "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
+                "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t OFFSET 10",
+                "SELECT a FROM t OFFSET 10 ROWS",
+            ),
+            ("SELECT a FROM t LIMIT ALL", "SELECT a FROM t"),
+            ("SELECT a FROM t LIMIT NULL", "SELECT a FROM t"),
+            (
+                "SELECT * FROM (SELECT a FROM t LIMIT 5) AS s",
+                "SELECT * FROM (SELECT a FROM t FETCH FIRST 5 ROWS ONLY) s",
+            ),
+            (
+                "SELECT a FROM t WHERE a IN (SELECT b FROM u LIMIT 3)",
+                "SELECT a FROM t WHERE a IN (SELECT b FROM u FETCH FIRST 3 ROWS ONLY)",
+            ),
+            (
+                "WITH c AS (SELECT a FROM t LIMIT 2) SELECT * FROM c",
+                "WITH c AS (SELECT a FROM t FETCH FIRST 2 ROWS ONLY) SELECT * FROM c",
+            ),
+            (
+                "INSERT INTO x SELECT a FROM t LIMIT 5",
+                "INSERT INTO x SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, PostgreSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_operation_limits_apply_to_the_whole_set_operation() {
+        let cases = [
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t UNION ALL SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 LIMIT 5 OFFSET 2",
+                "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 OFFSET 2 ROWS FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t INTERSECT SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t INTERSECT SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t EXCEPT SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t MINUS SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            // Parenthesized branch limits stay on their branch.
+            (
+                "(SELECT a FROM t LIMIT 5) UNION ALL SELECT a FROM u ORDER BY 1 LIMIT 3",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) UNION ALL SELECT a FROM u ORDER BY 1 FETCH FIRST 3 ROWS ONLY",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, PostgreSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn tsql_top_maps_to_fetch_first() {
+        let cases = [
+            (
+                "SELECT TOP 5 a FROM t",
+                "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT TOP 10 PERCENT a FROM t",
+                "SELECT a FROM t FETCH FIRST 10 PERCENT ROWS ONLY",
+            ),
+            (
+                "SELECT TOP 5 WITH TIES a FROM t ORDER BY a",
+                "SELECT a FROM t ORDER BY a NULLS FIRST FETCH FIRST 5 ROWS WITH TIES",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, TSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    /// `SELECT TOP n` limits only its own branch; the converted trailing limit must not
+    /// bind to the whole set operation.
+    #[test]
+    fn tsql_top_in_set_operation_branch_stays_branch_local() {
+        let cases = [
+            (
+                "SELECT a FROM t UNION ALL SELECT TOP 5 a FROM u",
+                "SELECT a FROM t UNION ALL (SELECT a FROM u FETCH FIRST 5 ROWS ONLY)",
+                "SELECT a FROM t UNION ALL (SELECT a FROM u LIMIT 5)",
+            ),
+            (
+                "SELECT TOP 5 a FROM t UNION ALL SELECT a FROM u",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) UNION ALL SELECT a FROM u",
+                "(SELECT a FROM t LIMIT 5) UNION ALL SELECT a FROM u",
+            ),
+            (
+                "SELECT TOP 5 a FROM t INTERSECT SELECT TOP 2 a FROM u",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) INTERSECT (SELECT a FROM u FETCH FIRST 2 ROWS ONLY)",
+                "(SELECT a FROM t LIMIT 5) INTERSECT (SELECT a FROM u LIMIT 2)",
+            ),
+            (
+                "SELECT TOP 5 a FROM t EXCEPT SELECT a FROM u ORDER BY a",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) MINUS SELECT a FROM u ORDER BY a NULLS FIRST",
+                "(SELECT a FROM t LIMIT 5) EXCEPT SELECT a FROM u ORDER BY a NULLS FIRST",
+            ),
+        ];
+        for (sql, oracle, duckdb) in cases {
+            assert_eq!(transpile(sql, TSQL, Oracle), oracle, "{sql}");
+            assert_eq!(transpile(sql, TSQL, DuckDB), duckdb, "{sql}");
+            assert_eq!(transpile(sql, TSQL, TSQL), sql, "{sql}");
+        }
+        // SQLite rejects parenthesized compound operands; use a derived table instead.
+        assert_eq!(
+            transpile(
+                "SELECT a FROM t UNION ALL SELECT TOP 5 a FROM u",
+                TSQL,
+                SQLite
+            ),
+            "SELECT a FROM t UNION ALL SELECT * FROM (SELECT a FROM u LIMIT 5)"
+        );
+    }
+
+    /// A comment between an operand and the set operator wraps the operand in
+    /// `Annotated`; its branch limit must still be grouped, with the comment kept
+    /// outside the parentheses.
+    #[test]
+    fn commented_tsql_top_set_operand_stays_branch_local() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for comment in ["/* branch note */", "-- branch note"] {
+                let sql = format!("SELECT TOP 5 a FROM t\n{comment}\n{op} SELECT a FROM u");
+                assert_eq!(
+                    transpile(&sql, TSQL, DuckDB),
+                    format!("(SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, SQLite),
+                    format!("SELECT * FROM (SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, Oracle),
+                    format!(
+                        "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) /* branch note */ {} SELECT a FROM u",
+                        if op == "EXCEPT" { "MINUS" } else { op }
+                    ),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_fetch_identity_is_preserved() {
+        for sql in [
+            "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            "SELECT a FROM t OFFSET 1 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS WITH TIES",
+        ] {
+            assert_eq!(transpile(sql, Oracle, Oracle), sql);
+        }
+    }
+
+    #[test]
+    fn limit_dialects_still_emit_limit() {
+        for target in [PostgreSQL, DuckDB, MySQL] {
+            assert_eq!(
+                transpile("SELECT a FROM t LIMIT 5 OFFSET 2", Generic, target),
+                "SELECT a FROM t LIMIT 5 OFFSET 2",
+                "{target:?}"
+            );
+        }
+    }
+}
+
+mod compound_row_limit_regressions {
+    use super::*;
+    use polyglot_sql::expressions::{Expression, Limit, Literal};
+    use polyglot_sql::traversal::ExpressionWalk;
+    use DialectType::*;
+
+    fn set_parts(expr: &Expression) -> (&Expression, &Expression, Option<&Expression>) {
+        match expr {
+            Expression::Union(set) => (&set.left, &set.right, set.limit.as_deref()),
+            Expression::Intersect(set) => (&set.left, &set.right, set.limit.as_deref()),
+            Expression::Except(set) => (&set.left, &set.right, set.limit.as_deref()),
+            _ => panic!("Expected a set operation: {expr:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_belongs_to_complete_compound_query() {
+        for read in [Oracle, PostgreSQL, TSQL, DuckDB] {
+            for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+                let sql = format!("SELECT a FROM t {op} SELECT a FROM u ORDER BY a OFFSET 2 ROWS FETCH NEXT 5 ROWS ONLY");
+                let ast = Dialect::get(read).parse(&sql).unwrap().remove(0);
+                let (_, right, limit) = set_parts(&ast);
+                assert!(
+                    matches!(limit, Some(Expression::Fetch(fetch)) if fetch.direction == "NEXT")
+                );
+                assert!(
+                    matches!(right, Expression::Select(select) if select.fetch.is_none() && select.offset.is_none() && select.order_by.is_none())
+                );
+                let oracle = transpile(&sql, read, Oracle);
+                assert!(
+                    oracle.ends_with("OFFSET 2 ROWS FETCH NEXT 5 ROWS ONLY"),
+                    "{oracle}"
+                );
+                assert_eq!(oracle.matches("FETCH").count(), 1);
+                let duckdb = transpile(&sql, read, DuckDB);
+                assert!(duckdb.ends_with("LIMIT 5 OFFSET 2"), "{duckdb}");
+                let tsql = transpile(&sql, read, TSQL);
+                assert_eq!(tsql.matches("FETCH").count(), 1, "{tsql}");
+                assert!(
+                    tsql.ends_with("OFFSET 2 ROWS FETCH NEXT 5 ROWS ONLY"),
+                    "{tsql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn percentages_survive_compound_generation_and_wrapping() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for pct in ["10 PERCENT", "10%", "12.5 PERCENT"] {
+                let sql = format!("SELECT a FROM t {op} SELECT a FROM u ORDER BY a LIMIT {pct}");
+                let ast = Dialect::get(DuckDB).parse(&sql).unwrap().remove(0);
+                assert!(
+                    matches!(set_parts(&ast).2, Some(Expression::Limit(limit)) if limit.percent)
+                );
+                let canonical = pct.replace('%', " PERCENT");
+                let duckdb = transpile(&sql, DuckDB, DuckDB);
+                assert!(duckdb.ends_with(&format!("LIMIT {canonical}")), "{duckdb}");
+                let oracle = transpile(&sql, DuckDB, Oracle);
+                assert!(
+                    oracle.ends_with(&format!("FETCH FIRST {canonical} ROWS ONLY")),
+                    "{oracle}"
+                );
+                assert!(transpile(&oracle, Oracle, DuckDB).ends_with(&format!("LIMIT {canonical}")));
+                let tsql = transpile(&sql, DuckDB, TSQL);
+                assert!(tsql.contains(&format!("TOP {canonical}")), "{tsql}");
+                assert_eq!(tsql.matches("PERCENT").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_options_and_omitted_count_survive() {
+        for op in ["UNION ALL", "INTERSECT", "MINUS"] {
+            for tail in [
+                "FETCH FIRST ROWS ONLY",
+                "FETCH NEXT 12.5 PERCENT ROWS ONLY",
+                "FETCH FIRST 5 ROWS WITH TIES",
+                "FETCH NEXT 10 PERCENT ROWS WITH TIES",
+            ] {
+                let sql = format!("SELECT a FROM t {op} SELECT a FROM u ORDER BY a {tail}");
+                assert_eq!(transpile(&sql, Oracle, Oracle), sql);
+                let tsql = transpile(&sql, Oracle, TSQL);
+                if tail.contains("PERCENT") {
+                    assert!(tsql.contains("PERCENT"), "{tsql}");
+                }
+                if tail.contains("WITH TIES") {
+                    assert!(tsql.contains("WITH TIES"), "{tsql}");
+                }
+                if tail == "FETCH FIRST ROWS ONLY" {
+                    assert!(tsql.ends_with("FETCH FIRST 1 ROWS ONLY"), "{tsql}");
+                    let duckdb = transpile(&sql, Oracle, DuckDB);
+                    assert!(duckdb.ends_with("LIMIT 1"), "{duckdb}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parentheses_comments_and_nested_compounds_keep_scope() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            let sql = format!("SELECT a FROM t {op} (SELECT a FROM u ORDER BY a FETCH FIRST 5 ROWS ONLY) ORDER BY a OFFSET 1 ROW FETCH NEXT 3 ROWS ONLY");
+            let sqlite = transpile(&sql, Oracle, SQLite);
+            assert!(
+                sqlite.contains("SELECT * FROM (SELECT a FROM u ORDER BY a NULLS LAST LIMIT 5)"),
+                "{sqlite}"
+            );
+            assert!(
+                sqlite.ends_with("ORDER BY a NULLS LAST LIMIT 3 OFFSET 1"),
+                "{sqlite}"
+            );
+            let out = transpile(&sql, Oracle, DuckDB);
+            assert!(
+                out.contains("(SELECT a FROM u ORDER BY a LIMIT 5)"),
+                "{out}"
+            );
+            assert!(out.ends_with("ORDER BY a LIMIT 3 OFFSET 1"), "{out}");
+            let sql = format!("(SELECT a FROM t) {op} (SELECT a FROM u) ORDER BY a LIMIT 10%");
+            assert!(transpile(&sql, DuckDB, Oracle).ends_with("FETCH FIRST 10 PERCENT ROWS ONLY"));
+        }
+        for sql in [
+            "SELECT a FROM t UNION ALL SELECT a FROM u UNION ALL SELECT a FROM v ORDER BY a FETCH FIRST 3 ROWS ONLY",
+            "SELECT a FROM t UNION ALL SELECT a FROM u EXCEPT SELECT a FROM v ORDER BY a FETCH FIRST 3 ROWS ONLY",
+            "WITH c AS (SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a FETCH FIRST 3 ROWS ONLY) SELECT * FROM c",
+            "SELECT * FROM (SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a FETCH FIRST 3 ROWS ONLY) s",
+        ] {
+            let sql = transpile(sql, Oracle, DuckDB);
+            assert_eq!(sql.matches("LIMIT 3").count(), 1, "{sql}");
+            assert!(!sql.contains("FETCH"), "{sql}");
+            Dialect::get(DuckDB).parse(&sql).unwrap();
+        }
+        let sql = "SELECT a FROM t\n/* branch note */\nUNION ALL SELECT a FROM u ORDER BY a\n/* limit note */\nLIMIT 10 PERCENT";
+        let out = transpile(sql, DuckDB, Oracle);
+        assert_eq!(out.matches("branch note").count(), 1, "{out}");
+        assert_eq!(out.matches("limit note").count(), 1, "{out}");
+        assert!(out.contains("FETCH FIRST 10 PERCENT ROWS ONLY"), "{out}");
+        for sql in [
+            "(SELECT a FROM t UNION ALL SELECT a FROM u) ORDER BY a LIMIT 10 PERCENT",
+            "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a OFFSET 2 LIMIT 10 PERCENT",
+        ] {
+            assert!(transpile(sql, DuckDB, Oracle).contains("FETCH FIRST 10 PERCENT ROWS ONLY"));
+        }
+        let wrapped = transpile(
+            "(SELECT a FROM t UNION ALL SELECT a FROM u) ORDER BY a LIMIT 10 PERCENT",
+            DuckDB,
+            TSQL,
+        );
+        assert!(wrapped.contains("TOP 10 PERCENT"), "{wrapped}");
+        let sql = "(SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 10) ORDER BY a OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY";
+        let out = transpile(sql, DuckDB, DuckDB);
+        assert!(out.contains("LIMIT 10)"), "{out}");
+        assert!(out.ends_with("ORDER BY a LIMIT 3 OFFSET 2"), "{out}");
+        Dialect::get(DuckDB).parse(&out).unwrap();
+    }
+
+    #[test]
+    fn set_limit_json_and_direct_ast_generation_are_compatible() {
+        let dialect = Dialect::get(DuckDB);
+        for tail in [
+            "LIMIT 5",
+            "LIMIT 10 PERCENT",
+            "FETCH FIRST 5 PERCENT ROWS WITH TIES",
+        ] {
+            let sql = format!("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a {tail}");
+            let ast = dialect.parse(&sql).unwrap().remove(0);
+            let json = serde_json::to_string(&ast).unwrap();
+            let decoded: Expression = serde_json::from_str(&json).unwrap();
+            assert_eq!(ast, decoded);
+            let clause = set_parts(&decoded).2.unwrap();
+            match tail {
+                "LIMIT 5" => assert!(matches!(clause, Expression::Literal(_))),
+                "LIMIT 10 PERCENT" => {
+                    assert!(matches!(clause, Expression::Limit(limit) if limit.percent))
+                }
+                _ => assert!(
+                    matches!(clause, Expression::Fetch(fetch) if fetch.percent && fetch.with_ties)
+                ),
+            }
+            assert!(decoded
+                .dfs()
+                .any(|node| matches!(node, Expression::Literal(_))));
+            let pretty = Dialect::get(Oracle)
+                .generate_with_overrides(&decoded, |config| config.pretty = true)
+                .unwrap();
+            assert_eq!(pretty.matches("FETCH").count(), 1, "{pretty}");
+            if tail.contains("PERCENT") {
+                assert!(pretty.contains("PERCENT"), "{pretty}");
+            }
+        }
+        let mut ast = dialect
+            .parse("SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 5")
+            .unwrap()
+            .remove(0);
+        let Expression::Union(set) = &mut ast else {
+            unreachable!()
+        };
+        set.limit = Some(Box::new(Expression::Limit(Box::new(Limit {
+            this: Expression::Literal(Box::new(Literal::Number("10".into()))),
+            percent: true,
+            comments: vec!["limit note".into()],
+        }))));
+        let out = Dialect::get(TSQL).generate(&ast).unwrap();
+        assert!(out.contains("TOP 10 PERCENT"), "{out}");
+        assert_eq!(out.matches("limit note").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn compound_limit_children_remain_transformable() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for tail in ["LIMIT 10 PERCENT", "FETCH FIRST 10 PERCENT ROWS ONLY"] {
+                let sql = format!("SELECT a FROM t {op} SELECT a FROM u ORDER BY a {tail}");
+                let ast = Dialect::get(DuckDB).parse(&sql).unwrap().remove(0);
+                let updated = polyglot_sql::traversal::transform_all(ast, &|expr| {
+                    Ok(match expr {
+                        Expression::Literal(value) if matches!(value.as_ref(), Literal::Number(n) if n == "10") =>
+                            Expression::Literal(Box::new(Literal::Number("20".into()))),
+                        other => other,
+                    })
+                }).unwrap();
+                let out = Dialect::get(Oracle).generate(&updated).unwrap();
+                assert!(out.contains("FETCH FIRST 20 PERCENT ROWS ONLY"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn vertica_ordering_wrapper_preserves_complete_limit_clause() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            let sql = format!("SELECT a FROM t {op} SELECT a FROM u ORDER BY a NULLS LAST /* limit note */ LIMIT 5");
+            let out = transpile(&sql, DuckDB, Vertica);
+            assert!(out.contains("CASE WHEN"), "{out}");
+            assert_eq!(out.matches("LIMIT").count(), 1, "{out}");
+            assert!(out.ends_with("LIMIT 5 /* limit note */"), "{out}");
+            Dialect::get(Vertica).parse(&out).unwrap();
+        }
+    }
+
+    #[test]
+    fn unsupported_modifiers_are_reported_without_losing_them() {
+        for (sql, target, marker) in [
+            ("SELECT a FROM t UNION ALL SELECT a FROM u FETCH FIRST 5 ROWS WITH TIES", TSQL, "WITH TIES"),
+            ("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a LIMIT 10 PERCENT", SQLite, "PERCENT"),
+            ("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a LIMIT 10 PERCENT OFFSET 2", TSQL, "PERCENT"),
+            ("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a OFFSET 2 ROWS FETCH NEXT 5 ROWS WITH TIES", TSQL, "WITH TIES"),
+            ("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a FETCH FIRST 5 ROWS WITH TIES", DuckDB, "WITH TIES"),
+        ] {
+            for level in [UnsupportedLevel::Raise, UnsupportedLevel::Immediate] {
+                assert!(strict_unsupported_regressions::transpile_with_level(sql, DuckDB, target, level).is_err(), "{sql} -> {target:?}");
+            }
+            let out = transpile(sql, DuckDB, target);
+            assert!(out.contains(marker), "{out}");
+        }
+    }
+
+    #[test]
+    fn conflicting_compound_limits_are_rejected() {
+        for sql in [
+            "SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 5 FETCH FIRST 2 ROWS ONLY",
+            "SELECT a FROM t UNION ALL SELECT a FROM u FETCH FIRST 2 ROWS ONLY LIMIT 5",
+            "(SELECT a FROM t) UNION ALL (SELECT a FROM u) LIMIT 5 FETCH FIRST 2 ROWS ONLY",
+            "(SELECT a FROM t UNION ALL SELECT a FROM u) LIMIT 5 FETCH FIRST 2 ROWS ONLY",
+        ] {
+            assert!(Dialect::get(Oracle).parse(sql).is_err(), "{sql}");
+        }
     }
 }

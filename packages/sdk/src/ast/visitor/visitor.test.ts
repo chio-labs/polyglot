@@ -18,7 +18,7 @@ import {
   isExpressionValue,
   makeExpr,
 } from '../helpers';
-import { isExpressionType } from '../types/guards';
+import { isExpressionType, isFunction } from '../types/guards';
 import {
   addSelectColumns,
   addWhere,
@@ -953,6 +953,47 @@ describe('Column and Table Renaming', () => {
 // WHERE Clause Manipulation Tests
 // ============================================================================
 
+describe('clause mutation failures', () => {
+  const mutations = [
+    {
+      operation: 'addWhere',
+      amend: (node: Expression) =>
+        addWhere(node, col('amount').gt(lit(0)).toJSON() as Expression),
+    },
+    { operation: 'setLimit', amend: (node: Expression) => setLimit(node, 3) },
+    { operation: 'setOffset', amend: (node: Expression) => setOffset(node, 2) },
+  ];
+
+  it.each(
+    mutations,
+  )('reports deserialization failures from $operation without silently dropping the clause', ({
+    operation,
+    amend,
+  }) => {
+    const arms = Array.from(
+      { length: 80 },
+      (_, value) => `SELECT ${value} AS amount`,
+    );
+    const node = parseFirstWithDialect(
+      `SELECT * FROM (${arms.join(' UNION ALL ')}) q`,
+      Dialect.DuckDB,
+    );
+    const before = structuredClone(node);
+    expect(() => amend(node)).toThrow(
+      new RegExp(`${operation} failed:.*recursion limit`, 'i'),
+    );
+    expect(node).toEqual(before);
+  });
+
+  it.each(mutations)('reports an invalid input AST from $operation', ({
+    operation,
+    amend,
+  }) => {
+    const invalid = makeExpr('not_a_real_expression', {}) as Expression;
+    expect(() => amend(invalid)).toThrow(`${operation} failed:`);
+  });
+});
+
 describe('WHERE Clause Manipulation', () => {
   describe('addWhere()', () => {
     it('should add WHERE clause to query without one', () => {
@@ -1456,5 +1497,35 @@ describe('Integration Tests', () => {
     // Should be semantically equivalent
     expect(regenerated.toUpperCase()).toContain('SELECT');
     expect(regenerated.toUpperCase()).toContain('FROM');
+  });
+});
+
+describe('HANA AST traversal', () => {
+  it('uses shared node guards and retains source semantics after JSON serialization', () => {
+    const sql =
+      "SELECT LOCATE(value, 'a', 1, 2), JSON_VALUE(payload, '$.n' DEFAULT 0 ON EMPTY) FROM records";
+    const ast = parseFirstWithDialect(sql, Dialect.HANA);
+    expect(findAll(ast, isFunction)).toHaveLength(1);
+    const call = findAll(ast, isFunction)[0];
+    if (!isFunction(call)) throw new Error('Expected shared Function node');
+    expect(call.function.source_dialect).toBe('hana');
+    expect(
+      findAll(ast, (node) => isExpressionType(node, 'j_s_o_n_value')),
+    ).toHaveLength(1);
+    expect(getColumns(ast).map(columnReference)).toEqual(['value', 'payload']);
+    const copied: Expression = JSON.parse(JSON.stringify(clone(ast)));
+    expect(generate([copied], Dialect.HANA)).toEqual(
+      generate([ast], Dialect.HANA),
+    );
+    const renamed = renameColumns(copied, {
+      value: 'needle_source',
+      payload: 'document',
+    });
+    expect(getColumns(renamed).map(columnReference)).toEqual([
+      'needle_source',
+      'document',
+    ]);
+    expect(getColumns(ast).map(columnReference)).toEqual(['value', 'payload']);
+    expect(generate([copied], Dialect.DuckDB).success).toBe(false);
   });
 });

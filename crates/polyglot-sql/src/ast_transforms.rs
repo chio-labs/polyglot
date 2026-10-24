@@ -13,11 +13,230 @@ use crate::ast_mutation as engine;
 use crate::expressions::*;
 use crate::traversal::{is_aggregate, ExpressionWalk};
 
-/// Apply a bottom-up transformation to every node in the tree.
-/// Wraps `crate::traversal::transform` with a simpler signature for this module.
+/// Allocate case-insensitively unique names for synthesized AST scopes.
+#[cfg(feature = "generate")]
+#[derive(Default)]
+pub(crate) struct AstNames(HashSet<String>);
+
+#[cfg(feature = "generate")]
+impl AstNames {
+    pub(crate) fn collect(&mut self, expression: &Expression) {
+        for node in expression.dfs() {
+            match node {
+                Expression::Column(c) => {
+                    self.reserve(&c.name);
+                    if let Some(table) = &c.table {
+                        self.reserve(table);
+                    }
+                }
+                Expression::Identifier(id) => self.reserve(id),
+                Expression::Alias(a) => {
+                    self.reserve(&a.alias);
+                    for id in &a.column_aliases {
+                        self.reserve(id);
+                    }
+                }
+                Expression::Table(t) => {
+                    self.reserve(&t.name);
+                    if let Some(alias) = &t.alias {
+                        self.reserve(alias);
+                    }
+                }
+                Expression::Subquery(s) => {
+                    if let Some(alias) = &s.alias {
+                        self.reserve(alias);
+                    }
+                    for id in &s.column_aliases {
+                        self.reserve(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reserve(&mut self, id: &Identifier) {
+        self.0.insert(id.name.to_ascii_lowercase());
+    }
+
+    pub(crate) fn fresh(&mut self, stem: &str) -> String {
+        let mut name = stem.to_string();
+        let mut suffix = 0;
+        while !self.0.insert(name.to_ascii_lowercase()) {
+            suffix += 1;
+            name = format!("{stem}_{suffix}");
+        }
+        name
+    }
+}
+
+/// Apply a complete bottom-up rewrite, retaining the embedded wrapper callbacks
+/// historically exposed by these helpers. Physical children are visited only once.
 fn xform<F: Fn(Expression) -> Expression>(expr: Expression, fun: F) -> Expression {
-    crate::traversal::transform(expr, &|node| Ok(Some(fun(node))))
-        .unwrap_or_else(|_| Expression::Null(Null))
+    crate::traversal::transform_all(expr, &|node| {
+        transform_embedded_wrappers(node, &fun).map(&fun)
+    })
+    .unwrap_or_else(|_| Expression::Null(Null))
+}
+
+// Embedded TableRef/Join/Ordered/etc. fields are not Expression nodes in the
+// generated visitor. Preserve their helper callbacks after their expression
+// children have been rewritten, without traversing those children again.
+fn transform_embedded_wrappers<F: Fn(Expression) -> Expression>(
+    expr: Expression,
+    fun: &F,
+) -> crate::Result<Expression> {
+    macro_rules! boxed_wrapper {
+        ($value:expr, $variant:ident) => {
+            match fun(Expression::$variant(Box::new($value))) {
+                Expression::$variant(value) => *value,
+                _ => {
+                    return Err(crate::Error::Internal(
+                        concat!(
+                            stringify!($variant),
+                            " transformation returned a different node type"
+                        )
+                        .to_string(),
+                    ))
+                }
+            }
+        };
+    }
+    let table = |table: TableRef| -> crate::Result<TableRef> {
+        // Time-travel wrappers also belong to embedded DML targets.
+        let node = transform_embedded_wrappers(Expression::Table(Box::new(table)), fun)?;
+        match fun(node) {
+            Expression::Table(table) => Ok(*table),
+            _ => Err(crate::Error::Internal(
+                "Table transformation returned a different node type".into(),
+            )),
+        }
+    };
+    let joins = |joins: Vec<Join>| -> crate::Result<Vec<Join>> {
+        joins
+            .into_iter()
+            .map(|join| Ok(boxed_wrapper!(join, Join)))
+            .collect()
+    };
+    let ordered = |items: Vec<Ordered>| -> Vec<Ordered> {
+        items
+            .into_iter()
+            .map(
+                |item| match fun(Expression::Ordered(Box::new(item.clone()))) {
+                    Expression::Ordered(item) => *item,
+                    _ => item,
+                },
+            )
+            .collect()
+    };
+    let order_by = |mut order: OrderBy| {
+        order.expressions = ordered(order.expressions);
+        order
+    };
+    Ok(match expr {
+        Expression::Select(mut select) => {
+            select.joins = joins(select.joins)?;
+            select.order_by = select.order_by.map(order_by);
+            if let Some(windows) = &mut select.windows {
+                for window in windows {
+                    window.spec.order_by = ordered(std::mem::take(&mut window.spec.order_by));
+                }
+            }
+            Expression::Select(select)
+        }
+        Expression::Update(mut update) => {
+            update.table = table(update.table)?;
+            update.extra_tables = update
+                .extra_tables
+                .into_iter()
+                .map(table)
+                .collect::<crate::Result<_>>()?;
+            update.table_joins = joins(update.table_joins)?;
+            if let Some(from) = update.from_clause.take() {
+                update.from_clause = Some(boxed_wrapper!(from, From));
+            }
+            update.from_joins = joins(update.from_joins)?;
+            update.order_by = update.order_by.map(order_by);
+            Expression::Update(update)
+        }
+        Expression::Delete(mut delete) => {
+            delete.table = table(delete.table)?;
+            delete.using = delete
+                .using
+                .into_iter()
+                .map(table)
+                .collect::<crate::Result<_>>()?;
+            delete.tables = delete
+                .tables
+                .into_iter()
+                .map(table)
+                .collect::<crate::Result<_>>()?;
+            delete.joins = joins(delete.joins)?;
+            delete.order_by = delete.order_by.map(order_by);
+            Expression::Delete(delete)
+        }
+        Expression::Upsert(mut upsert) => {
+            upsert.table = table(upsert.table)?;
+            Expression::Upsert(upsert)
+        }
+        Expression::JoinedTable(mut joined) => {
+            joined.joins = joins(joined.joins)?;
+            Expression::JoinedTable(joined)
+        }
+        Expression::WindowFunction(mut window) => {
+            window.over.order_by = ordered(window.over.order_by);
+            Expression::WindowFunction(window)
+        }
+        Expression::WithinGroup(mut within) => {
+            within.order_by = ordered(within.order_by);
+            Expression::WithinGroup(within)
+        }
+        Expression::StringAgg(mut agg) => {
+            agg.order_by = agg.order_by.map(ordered);
+            Expression::StringAgg(agg)
+        }
+        Expression::Union(mut union) => {
+            union.order_by = union.order_by.take().map(order_by);
+            Expression::Union(union)
+        }
+        Expression::Intersect(mut intersect) => {
+            intersect.order_by = intersect.order_by.take().map(order_by);
+            Expression::Intersect(intersect)
+        }
+        Expression::Except(mut except) => {
+            except.order_by = except.order_by.take().map(order_by);
+            Expression::Except(except)
+        }
+        Expression::Cast(mut cast) => {
+            cast.to =
+                crate::dialects::transform_data_type_recursive(cast.to, &|node| Ok(fun(node)))?;
+            Expression::Cast(cast)
+        }
+        Expression::TryCast(mut cast) => {
+            cast.to =
+                crate::dialects::transform_data_type_recursive(cast.to, &|node| Ok(fun(node)))?;
+            Expression::TryCast(cast)
+        }
+        Expression::SafeCast(mut cast) => {
+            cast.to =
+                crate::dialects::transform_data_type_recursive(cast.to, &|node| Ok(fun(node)))?;
+            Expression::SafeCast(cast)
+        }
+        Expression::Table(mut table) => {
+            if let Some(when) = table.when.take() {
+                if let Expression::HistoricalData(when) = fun(Expression::HistoricalData(when)) {
+                    table.when = Some(when);
+                }
+            }
+            if let Some(changes) = table.changes.take() {
+                if let Expression::Changes(changes) = fun(Expression::Changes(changes)) {
+                    table.changes = Some(changes);
+                }
+            }
+            Expression::Table(table)
+        }
+        other => other,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +528,32 @@ pub fn remove_nodes<F: Fn(&Expression) -> bool>(expr: Expression, predicate: F) 
 // Convenience getters
 // ---------------------------------------------------------------------------
 
+/// Return a single named projection while preserving identifier quoting.
+#[cfg(feature = "generate")]
+pub(crate) fn output_identifier(expression: &Expression) -> Option<&Identifier> {
+    match expression {
+        Expression::Alias(a) if a.column_aliases.is_empty() => Some(&a.alias),
+        Expression::Column(c) => Some(&c.name),
+        _ => None,
+    }
+}
+
+/// Borrow the leftmost projection list through query wrappers and set operations.
+#[cfg(feature = "generate")]
+pub(crate) fn query_projections(mut query: &Expression) -> Option<&[Expression]> {
+    loop {
+        query = match query {
+            Expression::Select(s) => return Some(&s.expressions),
+            Expression::Union(s) => &s.left,
+            Expression::Intersect(s) => &s.left,
+            Expression::Except(s) => &s.left,
+            Expression::Subquery(s) => &s.this,
+            Expression::Paren(p) => &p.this,
+            _ => return None,
+        };
+    }
+}
+
 /// Collect all column names (as `String`) referenced in the expression tree.
 pub fn get_column_names(expr: &Expression) -> Vec<String> {
     expr.find_all(|e| matches!(e, Expression::Column(_)))
@@ -473,6 +718,9 @@ pub fn get_table_names(expr: &Expression) -> Vec<String> {
                     names.push(name);
                 }
             }
+            Expression::Upsert(upsert) => {
+                push_table_ref_name(&upsert.table, &cte_aliases, &mut names);
+            }
             Expression::Insert(insert) => {
                 push_table_ref_name(&insert.table, &cte_aliases, &mut names);
             }
@@ -532,12 +780,7 @@ pub fn get_identifiers(expr: &Expression) -> Vec<&Expression> {
 
 /// Collect all function call nodes in the expression tree.
 pub fn get_functions(expr: &Expression) -> Vec<&Expression> {
-    expr.find_all(|e| {
-        matches!(
-            e,
-            Expression::Function(_) | Expression::AggregateFunction(_)
-        )
-    })
+    expr.find_all(crate::traversal::is_function)
 }
 
 /// Collect all literal value nodes in the expression tree.

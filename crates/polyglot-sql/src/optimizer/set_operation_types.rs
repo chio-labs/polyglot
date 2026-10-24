@@ -219,6 +219,16 @@ pub(crate) fn query_columns(
         .collect()
 }
 
+/// The type a set operation assigns when both operands have type `t`. Some
+/// dialects canonicalize integer aliases, such as Snowflake `INT` to `NUMBER(38, 0)`.
+pub(crate) fn self_union_type(t: &DataType, dialect: Option<DialectType>) -> Option<DataType> {
+    let value = OutputType::Known(t.clone());
+    match combine(&value, &value, dialect.unwrap_or_default(), 0) {
+        OutputType::Known(t) => Some(t),
+        _ => None,
+    }
+}
+
 fn projection_output(expr: &Expression, dialect: DialectType) -> QueryOutput {
     let (name, mut inner) = match expr {
         Expression::Alias(alias) => (crate::binding::identifier_name(&alias.alias), &alias.this),
@@ -339,7 +349,8 @@ fn family(dialect: DialectType) -> Family {
         DataFusion => Family::Arrow,
         Doris | StarRocks => Family::Standard,
         Drill | Dremio => Family::Limited,
-        Exasol => Family::Standard,
+        Exasol | Vertica => Family::Standard,
+        HANA => Family::Limited,
         Druid | Solr | Tableau => Family::Limited,
     }
 }
@@ -707,6 +718,7 @@ fn decimal_common(l: &DataType, r: &DataType, dialect: DialectType) -> Option<Da
     let limit = match dialect {
         DialectType::MySQL | DialectType::TiDB => 65,
         DialectType::Exasol => 36,
+        DialectType::Vertica => 1024,
         DialectType::ClickHouse => 76,
         _ => 38,
     };

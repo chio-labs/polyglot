@@ -8,6 +8,8 @@ use super::*;
 
 mod aggregates;
 mod collections;
+pub(in crate::dialects) mod duckdb;
+mod hana;
 mod json;
 mod operators;
 mod postgres_interval;
@@ -15,6 +17,7 @@ mod scalar;
 mod statements;
 pub(in crate::dialects) mod temporal;
 mod types;
+pub(in crate::dialects) mod vertica;
 
 #[derive(Debug, Clone, Copy)]
 struct NormalizationContext {
@@ -83,9 +86,28 @@ pub(super) fn normalize(
         Scalar(scalar::Action),
     }
 
+    let expr = if source == DialectType::HANA && target != DialectType::HANA {
+        hana::lower_dummy(expr, target)?
+    } else {
+        expr
+    };
     let expr = statements::normalize_root(expr, &context);
 
     transform_recursive(expr, &|e| {
+        // Source-bound nodes share the ordinary AST categories, but their lowering
+        // must retain the semantics recorded by the parser through serialization.
+        if e.source_dialect().is_some()
+            || matches!(&e, Expression::Function(f) if !f.qualified_name.is_empty())
+        {
+            return Ok(e);
+        }
+        let e = if matches!(source, DialectType::Vertica) && !matches!(target, DialectType::Vertica)
+        {
+            vertica::normalize_from_vertica(e, target)?
+        } else {
+            e
+        };
+
         if matches!(source, DialectType::DataFusion) && matches!(target, DialectType::DuckDB) {
             if let Expression::Function(ref function) = e {
                 if function.name.eq_ignore_ascii_case("NOW") && function.args.is_empty() {
@@ -1393,6 +1415,17 @@ pub(super) fn normalize(
                             timezone: false,
                         },
                     };
+                    // Preserve the source literal's type for enclosing temporal
+                    // functions before the target CAST erases its precision.
+                    let inferred_type = if target == DialectType::DuckDB
+                        && matches!(
+                            source,
+                            DialectType::Athena | DialectType::Presto | DialectType::Trino
+                        ) {
+                        Some(temporal::timestamp_literal_type(&s).unwrap_or(DataType::Unknown))
+                    } else {
+                        None
+                    };
                     return Ok(Expression::Cast(Box::new(Cast {
                         this: Expression::Literal(Box::new(Literal::String(s))),
                         to: dt,
@@ -1400,7 +1433,7 @@ pub(super) fn normalize(
                         double_colon_syntax: false,
                         format: None,
                         default: None,
-                        inferred_type: None,
+                        inferred_type,
                     })));
                 }
             }
@@ -1676,19 +1709,15 @@ pub(super) fn normalize(
                 Expression::Function(f) => {
                     let name = f.name.to_ascii_uppercase();
                     if name == "TO_ISO8601"
-                        && matches!(source, DialectType::Athena | DialectType::Presto | DialectType::Trino)
+                        && !f.quoted
+                        && matches!(
+                            source,
+                            DialectType::Athena | DialectType::Presto | DialectType::Trino
+                        )
                         && matches!(target, DialectType::DuckDB)
                     {
-                        // DuckDB has no native equivalent. A generic STRFTIME
-                        // rewrite loses source precision and per-value time zones.
-                        return Err(crate::error::Error::unsupported(
-                            "TO_ISO8601 translation preserving source precision and time zone",
-                            target.to_string(),
-                        ));
-                    }
-                    // DuckDB json(x) is a synonym for CAST(x AS JSON) — parses a string.
-                    // Map to JSON_PARSE(x) for Trino/Presto/Athena to preserve semantics.
-                    if matches!(source, DialectType::PostgreSQL)
+                        Action::Temporal(temporal::Action::ToIso8601DuckDB)
+                    } else if matches!(source, DialectType::PostgreSQL)
                         && matches!(target, DialectType::TSQL | DialectType::Fabric)
                         && temporal::is_postgres_date_part_function(&e)
                     {
@@ -1890,6 +1919,8 @@ pub(super) fn normalize(
                     {
                         // BigQuery-specific functions that need to be converted to standard forms
                         match name.as_str() {
+                            "DATE" if target == DialectType::DuckDB && f.args.len() == 2
+                                => Action::Scalar(scalar::Action::BigQueryFunctionNormalize),
                             "TIMESTAMP_DIFF" | "DATETIME_DIFF" | "TIME_DIFF"
                             | "DATE_DIFF"
                             | "TIMESTAMP_ADD" | "TIMESTAMP_SUB"
@@ -2371,15 +2402,18 @@ pub(super) fn normalize(
                         | DialectType::Teradata
                         | DialectType::Spark
                         | DialectType::Databricks
-                        | DialectType::Redshift => Action::None,
+                        | DialectType::Redshift
+                        | DialectType::Vertica => Action::None,
                         _ => Action::Scalar(scalar::Action::Nvl2Expand),
                     }
                 }
                 Expression::Decode(_) | Expression::DecodeCase(_) => {
                     // DECODE(a, b, c[, d, e[, ...]]) -> CASE WHEN with null-safe comparisons
-                    // Keep as DECODE for Oracle/Snowflake
+                    // Keep as DECODE for Oracle/Snowflake/Vertica
                     match target {
-                        DialectType::Oracle | DialectType::Snowflake => Action::None,
+                        DialectType::Oracle | DialectType::Snowflake | DialectType::Vertica => {
+                            Action::None
+                        }
                         _ => Action::Scalar(scalar::Action::DecodeSimplify),
                     }
                 }
@@ -2736,8 +2770,11 @@ pub(super) fn normalize(
                                 | DialectType::StarRocks
                                 | DialectType::Doris
                         );
+                        // Vertica's implicit NULL placement depends on the sort key's data
+                        // type (NULLS AUTO), so there is no source default to make explicit.
                         if o.nulls_first.is_none()
                             && source != target
+                            && source != DialectType::Vertica
                             && (target_supports_nulls || target_rewrites_nulls)
                         {
                             Action::Operators(operators::Action::NullsOrdering)

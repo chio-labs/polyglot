@@ -1547,3 +1547,69 @@ func TestIntegrationPackageLevelAPI(t *testing.T) {
 	}
 	assertValidJSON(t, "OpenLineageRunEvent wrapper", runEvent.Event)
 }
+
+func TestIntegrationVerticaStructuredSyntaxAndErrors(t *testing.T) {
+	client := integrationClient(t)
+	sql := "COPY t FROM LOCAL '/tmp/data.json' PARSER FJSONPARSER(flatten_maps=TRUE)"
+	ast, err := client.Parse(sql, "vertica")
+	if err != nil || !strings.Contains(string(ast), `"kind":"copy"`) {
+		t.Fatalf("structured COPY: %s, %v", ast, err)
+	}
+	generated, err := client.Generate(ast, "vertica")
+	if err != nil || len(generated) != 1 || !strings.Contains(generated[0], "FJSONPARSER(flatten_maps = TRUE)") {
+		t.Fatalf("native COPY: %v, %v", generated, err)
+	}
+	for _, level := range []UnsupportedLevel{UnsupportedIgnore, UnsupportedWarn, UnsupportedRaise, UnsupportedImmediate} {
+		for _, sql := range []string{"SELECT x::!INT FROM t", "SELECT LISTAGG(x) FROM t", "SELECT id FROM t FOR UPDATE"} {
+			if _, err := client.Transpile(sql, "vertica", "postgres", TranspileOptions{UnsupportedLevel: level}); err == nil {
+				t.Fatalf("unsafe translation accepted at %s: %s", level, sql)
+			}
+		}
+	}
+	result, err := client.Transpile("SELECT B'101100'", "vertica", "duckdb")
+	if err != nil || len(result) != 1 || result[0] != "SELECT UNHEX('2c')" {
+		t.Fatalf("binary value: %v, %v", result, err)
+	}
+}
+
+func TestIntegrationHana(t *testing.T) {
+	client := integrationClient(t)
+	sql := "SELECT * FROM t FOR JSON ('arraywrap' = 'NO')"
+	output, err := client.Transpile(sql, "hana", "hana")
+	if err != nil || len(output) != 1 || output[0] != sql {
+		t.Fatalf("HANA native round trip: %v, %v", output, err)
+	}
+	if _, err := client.Transpile(sql, "hana", "duckdb"); err == nil {
+		t.Fatal("expected unsupported HANA serialization error")
+	}
+	output, err = client.Transpile("SELECT LOCATE('abcabc', 'bc')", "hana", "duckdb")
+	if err != nil || len(output) != 1 || output[0] != "SELECT STRPOS('abcabc', 'bc')" {
+		t.Fatalf("HANA LOCATE: %v, %v", output, err)
+	}
+	for _, tc := range []struct{ sql, target, want string }{
+		{"SELECT LOCATE('abcabc', 'bc', 1, 2)", "trino", "SELECT STRPOS('abcabc', 'bc', 2)"},
+		{sql, "duckdb", ""},
+	} {
+		parsed, err := client.Parse(tc.sql, "hana")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(parsed, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		serialized, err := json.Marshal(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Independent generation receives only the serialized AST and target.
+		generated, err := client.Generate(serialized, tc.target)
+		if tc.want == "" {
+			if err == nil {
+				t.Fatal("serialized AST lost unsupported source semantics")
+			}
+		} else if err != nil || len(generated) != 1 || generated[0] != tc.want {
+			t.Fatalf("serialized HANA AST generation: %v, %v", generated, err)
+		}
+	}
+}

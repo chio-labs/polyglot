@@ -58,6 +58,26 @@ fn project_projection_facts_preserve_set_operation_common_types() {
 }
 
 #[test]
+fn analyze_query_non_recursive_cte_table_shadowing_473() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{"name": "orders", "columns": [{"name": "id", "type": "BIGINT"}]}]
+    }))
+    .unwrap();
+    for dialect in [DialectType::DuckDB, DialectType::PostgreSQL] {
+        for (sql, expected) in [
+            ("WITH orders AS (SELECT CAST(1 AS INT) AS id UNION ALL SELECT id FROM orders) SELECT id FROM orders", "BIGINT"),
+            ("WITH orders(out_id) AS (SELECT CAST(1 AS INT) AS id UNION ALL SELECT id FROM orders) SELECT out_id FROM orders", "BIGINT"),
+            ("WITH RECURSIVE orders(id) AS (SELECT CAST(1 AS INT) AS id UNION ALL SELECT id + 1 FROM orders WHERE id < 3) SELECT id FROM orders", "INT"),
+        ] {
+            let analysis = analyze_query(sql, AnalyzeQueryOptions {
+                dialect, schema: Some(schema.clone()), ..Default::default()
+            }).unwrap();
+            assert_eq!(analysis.projections[0].type_hint.as_deref(), Some(expected), "{dialect}: {sql}");
+        }
+    }
+}
+
+#[test]
 fn analyze_query_set_operation_types_454() {
     let schema: ValidationSchema = serde_json::from_value(json!({
         "tables": [{"name": "orders", "columns": [{"name": "amount", "type": "VARCHAR", "nullable": true}]}]
@@ -194,14 +214,15 @@ fn analyze_query_set_operation_name_alignment_and_cast_consensus_454() {
             vec![Some("FLOAT"), Some("FLOAT")], vec![None, None]),
         ("SELECT CAST(1 AS INT) AS a UNION ALL BY NAME SELECT CAST(2 AS FLOAT) AS a, CAST('x' AS VARCHAR) AS b",
             vec![Some("FLOAT"), Some("VARCHAR")], vec![None, None]),
+        // Snowflake set operations report integer columns as NUMBER(38, 0).
         ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT CAST(2 AS INTEGER) AS a",
-            vec![Some("INT")], vec![Some("INT")]),
+            vec![Some("DECIMAL(38, 0)")], vec![None]),
         ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT 2 AS a",
-            vec![Some("INT")], vec![None]),
+            vec![Some("DECIMAL(38, 0)")], vec![None]),
         ("SELECT CAST(1 AS INT) AS a UNION ALL SELECT NULL AS a",
-            vec![Some("INT")], vec![None]),
+            vec![Some("DECIMAL(38, 0)")], vec![None]),
         ("SELECT CAST(1 AS INT) AS \"a\" UNION ALL BY NAME SELECT CAST(2 AS FLOAT) AS a",
-            vec![Some("INT"), Some("FLOAT")], vec![None, None]),
+            vec![Some("DECIMAL(38, 0)"), Some("FLOAT")], vec![None, None]),
     ] {
         let analysis = analyze_query(sql, AnalyzeQueryOptions { dialect: DialectType::Snowflake, ..Default::default() }).unwrap();
         assert_eq!(analysis.projections.iter().map(|p| p.type_hint.as_deref()).collect::<Vec<_>>(), expected_types, "{sql}");
@@ -3612,6 +3633,69 @@ fn star_over_pivot_and_unpivot_reports_reshaped_columns_in_every_mode() {
                 })
                 .collect();
             assert_eq!(upstream, expected_upstream, "{} ({mode})", case.name);
+        }
+    }
+}
+
+#[test]
+fn analyze_query_pivot_cte_does_not_reenter_its_source_470() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{"name": "staged_orders", "columns": [
+            {"name": "customer_id", "type": "INT"},
+            {"name": "category", "type": "VARCHAR"},
+            {"name": "amount", "type": "INT"}
+        ]}]
+    }))
+    .unwrap();
+    for pivot_values in ["'books', 'games'", "ANY ORDER BY category"] {
+        for (source, output) in [
+            ("pivot_input", "customer_id"),
+            ("pivot_input AS i", "i.customer_id"),
+            ("pivot_input", "p.customer_id"),
+        ] {
+            let alias = if output.starts_with("p.") {
+                " AS p"
+            } else {
+                ""
+            };
+            for projection in ["*", output] {
+                let sql = format!("WITH pivot_input AS (SELECT customer_id, category, amount FROM staged_orders) SELECT {projection} FROM {source} PIVOT(MAX(amount) FOR category IN ({pivot_values})){alias}");
+                for with_schema in [false, true] {
+                    let analysis = analyze_query(
+                        &sql,
+                        AnalyzeQueryOptions {
+                            dialect: DialectType::Snowflake,
+                            schema: with_schema.then(|| schema.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                    assert!(!analysis.projections.is_empty(), "{sql}");
+                    if projection != "*" {
+                        assert!(
+                            analysis.projections[0]
+                                .upstream
+                                .iter()
+                                .any(|reference| reference.table.as_deref().is_some_and(|table| {
+                                    table.eq_ignore_ascii_case("staged_orders")
+                                }) && reference
+                                    .column
+                                    .eq_ignore_ascii_case("customer_id")),
+                            "{sql}: {:?}",
+                            analysis.projections[0].upstream
+                        );
+                    } else {
+                        assert!(
+                            !analysis.projections.iter().any(|projection| projection
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case("category")
+                                    || name.eq_ignore_ascii_case("amount"))),
+                            "pivot input columns are not pivot output columns: {sql}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
