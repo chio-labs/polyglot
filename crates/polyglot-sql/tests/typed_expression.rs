@@ -456,4 +456,134 @@ mod analysis {
             }
         }
     }
+
+    #[test]
+    fn typed_like_assertions_take_the_type_of_their_argument_in_every_position() {
+        for (dialect, _) in dialects() {
+            let mut positions = POSITIONS.to_vec();
+            if dialect != DialectType::PostgreSQL {
+                positions.push(STAR_MODIFIER);
+            }
+            for (label, template) in positions {
+                for (like, cast_type) in [("note", "VARCHAR"), ("orders.amount", "BIGINT")] {
+                    let typed = template.replace(
+                        "{m}",
+                        &format!("__polyglot_typed_like(bar(amount, 0), {like})"),
+                    );
+                    let cast =
+                        template.replace("{m}", &format!("CAST(bar(amount, 0) AS {cast_type})"));
+                    assert_eq!(
+                        output_type(&typed, dialect),
+                        output_type(&cast, dialect),
+                        "{dialect:?} {label}: {typed}"
+                    );
+                    let plain = template.replace("{m}", "bar(amount, 0)");
+                    assert_eq!(
+                        validation_errors(&typed, dialect),
+                        validation_errors(&plain, dialect),
+                        "{dialect:?} {label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_like_assertions_of_unknown_arguments_assert_nothing() {
+        for (dialect, _) in dialects() {
+            for template in [
+                "SELECT {m} AS x FROM orders",
+                "WITH c AS (SELECT {m} AS x FROM orders) SELECT x FROM c",
+            ] {
+                let plain = template.replace("{m}", "bar(amount, 0)");
+                let typed =
+                    template.replace("{m}", "__polyglot_typed_like(bar(amount, 0), baz(note))");
+                assert_eq!(
+                    output_type(&typed, dialect),
+                    output_type(&plain, dialect),
+                    "{dialect:?}: {typed}"
+                );
+                let known = template.replace("{m}", "__polyglot_typed_like(UPPER(note), amount)");
+                let upper = template.replace("{m}", "UPPER(note)");
+                assert_eq!(
+                    output_type(&known, dialect),
+                    output_type(&upper, dialect),
+                    "{dialect:?}: {known}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_like_assertions_leave_every_fact_unchanged() {
+        for (dialect, _) in dialects() {
+            for (body, like) in [
+                ("UPPER(note)", "note"),
+                ("amount + k", "amount"),
+                ("bar(note)", "k"),
+            ] {
+                let marker = format!("__polyglot_typed_like({body}, {like})");
+                for template in [
+                    "SELECT {b} AS a FROM orders",
+                    "WITH c AS (SELECT {b} AS a FROM orders) SELECT a FROM c",
+                ] {
+                    let plain = analyze(&template.replace("{b}", body), dialect);
+                    let typed = analyze(&template.replace("{b}", &marker), dialect);
+                    let mut plain_facts = facts(&plain);
+                    let mut typed_facts = facts(&typed);
+                    for value in [&mut plain_facts, &mut typed_facts] {
+                        strip_types(value);
+                    }
+                    assert_eq!(typed_facts, plain_facts, "{dialect:?}: {marker}");
+                }
+            }
+        }
+    }
+
+    /// The facts without inferred types, which a typed-like assertion exists to change.
+    fn strip_types(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove("typeHint");
+                object.remove("type_hint");
+                object.values_mut().for_each(strip_types);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_types),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn typed_like_expressions_lower_and_round_trip() {
+    for dialect in [
+        DialectType::DuckDB,
+        DialectType::Snowflake,
+        DialectType::PostgreSQL,
+    ] {
+        let sql = "SELECT __polyglot_typed_like(bar(amount), o.note) AS x FROM orders AS o";
+        let item = unaliased(first_projection(sql, dialect));
+        let Expression::Annotated(annotated) = &item else {
+            panic!("{dialect:?}: not lowered: {item:?}");
+        };
+        assert!(annotated.type_assertion.is_none());
+        assert!(matches!(
+            annotated.type_like.as_deref(),
+            Some(Expression::Column(_))
+        ));
+        let generated = Dialect::get(dialect)
+            .generate(&parse_one(sql, dialect).unwrap())
+            .unwrap();
+        assert!(
+            generated
+                .to_lowercase()
+                .contains("__polyglot_typed_like(bar(amount), o.note)"),
+            "{dialect:?}: {generated}"
+        );
+    }
+    let three = unaliased(first_projection(
+        "SELECT __polyglot_typed_like(a, b, c) FROM t",
+        DialectType::DuckDB,
+    ));
+    assert!(matches!(three, Expression::Function(_)));
 }
