@@ -115,3 +115,33 @@ fn comment_annotations_serialize_without_a_type_assertion() {
     let restored: Annotated = serde_json::from_value(json).unwrap();
     assert_eq!(restored, annotated);
 }
+
+#[test]
+fn type_assertions_apply_only_where_the_inferred_type_is_unknown() {
+    use polyglot_sql::expressions::type_assertion_result;
+    let varchar = DataType::VarChar {
+        length: None,
+        parenthesized_length: false,
+    };
+    let bigint = DataType::BigInt { length: None };
+    let unknown_array = DataType::Array {
+        element_type: Box::new(DataType::Unknown),
+        dimension: None,
+    };
+    assert_eq!(type_assertion_result(None, &varchar), &varchar);
+    assert_eq!(
+        type_assertion_result(Some(&DataType::Unknown), &varchar),
+        &varchar
+    );
+    assert_eq!(
+        type_assertion_result(Some(&unknown_array), &varchar),
+        &varchar
+    );
+    assert_eq!(type_assertion_result(Some(&bigint), &varchar), &bigint);
+    assert_eq!(
+        type_assertion_result(Some(&DataType::Text), &varchar),
+        &DataType::Text
+    );
+    assert!(unknown_array.contains_unknown());
+    assert!(!bigint.contains_unknown());
+}

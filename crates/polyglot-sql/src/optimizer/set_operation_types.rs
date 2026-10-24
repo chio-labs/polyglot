@@ -237,10 +237,14 @@ fn projection_output(expr: &Expression, dialect: DialectType) -> QueryOutput {
         Expression::Star(_) => ("*".into(), expr),
         _ => (String::new(), expr),
     };
+    let mut asserted = None;
     loop {
         inner = match inner {
             Expression::Paren(p) => &p.this,
-            Expression::Annotated(a) => &a.this,
+            Expression::Annotated(a) => {
+                asserted = super::annotate_types::innermost_assertion(asserted, a);
+                &a.this
+            }
             _ => break,
         };
     }
@@ -274,6 +278,12 @@ fn projection_output(expr: &Expression, dialect: DialectType) -> QueryOutput {
             _ => inferred_output(expr, inner, dialect),
         },
         _ => inferred_output(expr, inner, dialect),
+    };
+    let value = match (asserted, value) {
+        (Some(asserted), OutputType::Unknown | OutputType::Null) => {
+            OutputType::Known(canonical(asserted, dialect))
+        }
+        (_, value) => value,
     };
     QueryOutput {
         name,

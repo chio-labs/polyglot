@@ -1374,7 +1374,10 @@ impl Expression {
             Expression::Array(a) => a.inferred_type.as_ref(),
             Expression::ArrayFunc(a) => a.inferred_type.as_ref(),
             Expression::Paren(p) => p.this.inferred_type(),
-            Expression::Annotated(a) => a.this.inferred_type(),
+            Expression::Annotated(a) => match &a.type_assertion {
+                Some(asserted) => Some(type_assertion_result(a.this.inferred_type(), asserted)),
+                None => a.this.inferred_type(),
+            },
             Expression::Subquery(s) => s.inferred_type.as_ref(),
             Expression::Alias(a) => a.inferred_type.as_ref(),
             Expression::Unnest(u) => u.inferred_type.as_ref(),
@@ -6461,6 +6464,31 @@ pub struct HanaDataType {
 }
 
 impl DataType {
+    /// Whether this type is [`DataType::Unknown`] or has an unknown component, such as
+    /// `ARRAY<UNKNOWN>`.
+    pub fn contains_unknown(&self) -> bool {
+        match self {
+            DataType::Unknown => true,
+            DataType::Array { element_type, .. } | DataType::List { element_type } => {
+                element_type.contains_unknown()
+            }
+            DataType::Nullable { inner } => inner.contains_unknown(),
+            DataType::Map {
+                key_type,
+                value_type,
+            } => key_type.contains_unknown() || value_type.contains_unknown(),
+            DataType::Struct { fields, .. } => fields
+                .iter()
+                .any(|field| field.data_type.contains_unknown()),
+            DataType::Object { fields, .. } => fields.iter().any(|(_, t, _)| t.contains_unknown()),
+            DataType::Union { fields } => fields.iter().any(|(_, t)| t.contains_unknown()),
+            DataType::Vector { element_type, .. } => element_type
+                .as_deref()
+                .is_some_and(DataType::contains_unknown),
+            _ => false,
+        }
+    }
+
     /// Canonical unsigned names and their bit-width aliases. Parser entry points
     /// and legacy Custom-type normalization share this mapping.
     pub(crate) fn from_unsigned_name(name: &str) -> Option<Self> {
@@ -10769,6 +10797,21 @@ pub struct Paren {
 /// `type_assertion` is `TYPE`. The node is transparent for every analysis except typing:
 /// it takes the asserted type only where the type of `expr` is unknown.
 pub const TYPED_EXPRESSION_FUNCTION: &str = "__polyglot_typed";
+
+/// Type of an expression carrying a type assertion.
+///
+/// The asserted type applies only where the inferred type is absent or has an unknown
+/// component. A known inferred type stands, including when it disagrees with the
+/// assertion, so callers can report the disagreement.
+pub fn type_assertion_result<'a>(
+    inferred: Option<&'a DataType>,
+    asserted: &'a DataType,
+) -> &'a DataType {
+    match inferred {
+        Some(inferred) if !inferred.contains_unknown() => inferred,
+        _ => asserted,
+    }
+}
 
 /// Expression annotated with trailing comments (for round-trip preservation)
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
