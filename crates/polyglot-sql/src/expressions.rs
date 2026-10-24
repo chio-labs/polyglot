@@ -1374,7 +1374,10 @@ impl Expression {
             Expression::Array(a) => a.inferred_type.as_ref(),
             Expression::ArrayFunc(a) => a.inferred_type.as_ref(),
             Expression::Paren(p) => p.this.inferred_type(),
-            Expression::Annotated(a) => a.this.inferred_type(),
+            Expression::Annotated(a) => match &a.type_assertion {
+                Some(asserted) => Some(type_assertion_result(a.this.inferred_type(), asserted)),
+                None => a.this.inferred_type(),
+            },
             Expression::Subquery(s) => s.inferred_type.as_ref(),
             Expression::Alias(a) => a.inferred_type.as_ref(),
             Expression::Unnest(u) => u.inferred_type.as_ref(),
@@ -6461,6 +6464,80 @@ pub struct HanaDataType {
 }
 
 impl DataType {
+    /// Whether this type is [`DataType::Unknown`] or has an unknown component, such as
+    /// `ARRAY<UNKNOWN>`.
+    pub fn contains_unknown(&self) -> bool {
+        match self {
+            DataType::Unknown => true,
+            DataType::Array { element_type, .. } | DataType::List { element_type } => {
+                element_type.contains_unknown()
+            }
+            DataType::Nullable { inner } => inner.contains_unknown(),
+            DataType::Map {
+                key_type,
+                value_type,
+            } => key_type.contains_unknown() || value_type.contains_unknown(),
+            DataType::Struct { fields, .. } => fields
+                .iter()
+                .any(|field| field.data_type.contains_unknown()),
+            DataType::Object { fields, .. } => fields.iter().any(|(_, t, _)| t.contains_unknown()),
+            DataType::Union { fields } => fields.iter().any(|(_, t)| t.contains_unknown()),
+            DataType::Vector { element_type, .. } => element_type
+                .as_deref()
+                .is_some_and(DataType::contains_unknown),
+            _ => false,
+        }
+    }
+
+    /// Whether `refined` fills this type's unknown components without changing its shape.
+    ///
+    /// [`DataType::Unknown`] is refined by every type. A partly unknown type is refined by a
+    /// type of the same shape, such as `UNKNOWN[]` by `BIGINT[]` or a struct with unknown
+    /// fields by the same struct with those fields typed, whose other components agree.
+    /// A fully known type is refined by nothing.
+    pub fn is_refined_by(&self, refined: &DataType) -> bool {
+        self.contains_unknown() && self.matches_shape_of(refined)
+    }
+
+    fn matches_shape_of(&self, refined: &DataType) -> bool {
+        if !self.contains_unknown() {
+            return self == refined;
+        }
+        match (self, refined) {
+            (DataType::Unknown, _) => true,
+            (DataType::Nullable { inner }, other) => inner.matches_shape_of(other),
+            (this, DataType::Nullable { inner }) => this.matches_shape_of(inner),
+            (
+                DataType::Array { element_type, .. } | DataType::List { element_type },
+                DataType::Array {
+                    element_type: other,
+                    ..
+                }
+                | DataType::List {
+                    element_type: other,
+                },
+            ) => element_type.matches_shape_of(other),
+            (
+                DataType::Map {
+                    key_type,
+                    value_type,
+                },
+                DataType::Map {
+                    key_type: other_key,
+                    value_type: other_value,
+                },
+            ) => key_type.matches_shape_of(other_key) && value_type.matches_shape_of(other_value),
+            (DataType::Struct { fields, .. }, DataType::Struct { fields: other, .. }) => {
+                fields.len() == other.len()
+                    && fields.iter().zip(other).all(|(field, other)| {
+                        field.name.eq_ignore_ascii_case(&other.name)
+                            && field.data_type.matches_shape_of(&other.data_type)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Canonical unsigned names and their bit-width aliases. Parser entry points
     /// and legacy Custom-type normalization share this mapping.
     pub(crate) fn from_unsigned_name(name: &str) -> Option<Self> {
@@ -10763,12 +10840,53 @@ pub struct Paren {
     pub trailing_comments: Vec<String>,
 }
 
+/// Name of the analysis-only type assertion function.
+///
+/// The parser lowers `__polyglot_typed(expr, 'TYPE')` into an [`Annotated`] node whose
+/// `type_assertion` is `TYPE`. The node is transparent for every analysis except typing:
+/// it takes the asserted type only where the type of `expr` is unknown.
+pub const TYPED_EXPRESSION_FUNCTION: &str = "__polyglot_typed";
+
+/// Name of the analysis-only type assertion function that asserts another expression's type.
+///
+/// The parser lowers `__polyglot_typed_like(expr, like)` into an [`Annotated`] node whose
+/// `type_like` is `like`. Type annotation resolves the type of `like` into the node's
+/// `type_assertion`, which then applies as for [`TYPED_EXPRESSION_FUNCTION`]; an unknown
+/// type of `like` asserts nothing. Like `type_assertion`, `like` is not a child of the node.
+pub const TYPED_LIKE_EXPRESSION_FUNCTION: &str = "__polyglot_typed_like";
+
+/// Type of an expression carrying a type assertion.
+///
+/// The asserted type applies where the inferred type is absent or unknown, and where a
+/// partly unknown inferred type has the asserted type's shape (see
+/// [`DataType::is_refined_by`]). A known inferred type, or a partly unknown one of
+/// another shape, stands, including when it disagrees with the assertion, so callers
+/// can report the disagreement.
+pub fn type_assertion_result<'a>(
+    inferred: Option<&'a DataType>,
+    asserted: &'a DataType,
+) -> &'a DataType {
+    match inferred {
+        Some(inferred) if inferred.is_refined_by(asserted) => asserted,
+        Some(inferred) => inferred,
+        None => asserted,
+    }
+}
+
 /// Expression annotated with trailing comments (for round-trip preservation)
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Annotated {
     pub this: Expression,
     pub trailing_comments: Vec<String>,
+    /// Type asserted by a lowered [`TYPED_EXPRESSION_FUNCTION`] call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub type_assertion: Option<DataType>,
+    /// Expression whose type a lowered [`TYPED_LIKE_EXPRESSION_FUNCTION`] call asserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub type_like: Option<Box<Expression>>,
 }
 
 // === BATCH GENERATED STRUCT DEFINITIONS ===

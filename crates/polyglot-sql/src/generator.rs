@@ -3808,7 +3808,26 @@ impl Generator {
                 Ok(())
             }
             Expression::Annotated(annotated) => {
-                self.generate_expression(&annotated.this)?;
+                if let Some(like) = &annotated.type_like {
+                    self.write(crate::expressions::TYPED_LIKE_EXPRESSION_FUNCTION);
+                    self.write("(");
+                    self.generate_expression(&annotated.this)?;
+                    self.write(", ");
+                    self.generate_expression(like)?;
+                    self.write(")");
+                } else if let Some(type_assertion) = &annotated.type_assertion {
+                    self.write(crate::expressions::TYPED_EXPRESSION_FUNCTION);
+                    self.write("(");
+                    self.generate_expression(&annotated.this)?;
+                    self.write(", ");
+                    let start = self.output.len();
+                    self.generate_data_type(type_assertion)?;
+                    let type_sql = self.output.split_off(start);
+                    self.generate_string_literal(&type_sql)?;
+                    self.write(")");
+                } else {
+                    self.generate_expression(&annotated.this)?;
+                }
                 for comment in &annotated.trailing_comments {
                     self.write(" ");
                     self.write_formatted_comment(comment);
@@ -45537,6 +45556,8 @@ mod tests {
             Expression::Annotated(Box::new(Annotated {
                 this: parse_one(sql),
                 trailing_comments: vec![" branch note ".into()],
+                type_assertion: None,
+                type_like: None,
             }))
         };
         let limited = || annotate("SELECT a FROM t LIMIT 5");

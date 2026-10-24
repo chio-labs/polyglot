@@ -988,6 +988,8 @@ impl Parser {
                     stmt = Expression::Annotated(Box::new(Annotated {
                         this: stmt,
                         trailing_comments: semi_comments,
+                        type_assertion: None,
+                        type_like: None,
                     }));
                 }
             }
@@ -2189,6 +2191,8 @@ impl Parser {
                                 crate::expressions::Annotated {
                                     this: expr,
                                     trailing_comments: pre_alias_comments,
+                                    type_assertion: None,
+                                    type_like: None,
                                 },
                             )))
                         }
@@ -2202,6 +2206,8 @@ impl Parser {
                         crate::expressions::Annotated {
                             this: expr,
                             trailing_comments: leading_comments,
+                            type_assertion: None,
+                            type_like: None,
                         },
                     )))
                 } else {
@@ -4013,6 +4019,8 @@ impl Parser {
                                 Expression::Annotated(Box::new(Annotated {
                                     this: expr,
                                     trailing_comments: comments,
+                                    type_assertion: None,
+                                    type_like: None,
                                 }))
                             }
                         } else {
@@ -4122,6 +4130,8 @@ impl Parser {
                         Expression::Annotated(Box::new(Annotated {
                             this: expr,
                             trailing_comments: pre_alias_comments,
+                            type_assertion: None,
+                            type_like: None,
                         }))
                     }
                 } else if !leading_comments.is_empty() {
@@ -4129,6 +4139,8 @@ impl Parser {
                     Expression::Annotated(Box::new(Annotated {
                         this: expr,
                         trailing_comments: leading_comments,
+                        type_assertion: None,
+                        type_like: None,
                     }))
                 } else {
                     expr
@@ -11762,6 +11774,8 @@ impl Parser {
                 Expression::Annotated(Box::new(Annotated {
                     this: result,
                     trailing_comments: set_op_leading_comments,
+                    type_assertion: None,
+                    type_like: None,
                 }))
             } else {
                 result
@@ -30549,6 +30563,8 @@ impl Parser {
                 right = Expression::Annotated(Box::new(Annotated {
                     this: right,
                     trailing_comments: pending,
+                    type_assertion: None,
+                    type_like: None,
                 }));
             }
             left = Expression::Or(Box::new(BinaryOp {
@@ -30638,6 +30654,8 @@ impl Parser {
                 right = Expression::Annotated(Box::new(Annotated {
                     this: right,
                     trailing_comments: pending,
+                    type_assertion: None,
+                    type_like: None,
                 }));
             }
             left = Expression::And(Box::new(BinaryOp {
@@ -30852,6 +30870,8 @@ impl Parser {
                         left = Expression::Annotated(Box::new(Annotated {
                             this: left,
                             trailing_comments: pre_left_comments,
+                            type_assertion: None,
+                            type_like: None,
                         }));
                     }
                 }
@@ -35760,6 +35780,8 @@ impl Parser {
                 Expression::Annotated(Box::new(Annotated {
                     this: first_literal,
                     trailing_comments: token.trailing_comments,
+                    type_assertion: None,
+                    type_like: None,
                 }))
             };
 
@@ -35776,6 +35798,8 @@ impl Parser {
                         Expression::Annotated(Box::new(Annotated {
                             this: literal,
                             trailing_comments: next_token.trailing_comments,
+                            type_assertion: None,
+                            type_like: None,
                         }))
                     };
                     expressions.push(literal);
@@ -41691,6 +41715,35 @@ impl Parser {
                 inferred_type: None,
             })))
         } else {
+            if !distinct && name.eq_ignore_ascii_case(crate::expressions::TYPED_EXPRESSION_FUNCTION)
+            {
+                if let Some(type_assertion) = self.typed_expression_assertion(&args) {
+                    let this = args.swap_remove(0);
+                    return Ok(Expression::Annotated(Box::new(
+                        crate::expressions::Annotated {
+                            this,
+                            trailing_comments,
+                            type_assertion: Some(type_assertion),
+                            type_like: None,
+                        },
+                    )));
+                }
+            }
+            if !distinct
+                && args.len() == 2
+                && name.eq_ignore_ascii_case(crate::expressions::TYPED_LIKE_EXPRESSION_FUNCTION)
+            {
+                let like = args.pop().map(Box::new);
+                let this = args.swap_remove(0);
+                return Ok(Expression::Annotated(Box::new(
+                    crate::expressions::Annotated {
+                        this,
+                        trailing_comments,
+                        type_assertion: None,
+                        type_like: like,
+                    },
+                )));
+            }
             self.normalize_date_part_arg(name, &mut args);
             let mut func = Function::new(name.to_string(), args);
             func.distinct = distinct;
@@ -41698,6 +41751,20 @@ impl Parser {
             func.quoted = quoted;
             Ok(Expression::Function(Box::new(func)))
         }
+    }
+
+    /// Asserted type of a well-formed `__polyglot_typed(expr, 'TYPE')` call: exactly two
+    /// arguments, the second a string literal naming a data type of this dialect.
+    fn typed_expression_assertion(&self, args: &[Expression]) -> Option<DataType> {
+        let [_, Expression::Literal(literal)] = args else {
+            return None;
+        };
+        let Literal::String(text) = literal.as_ref() else {
+            return None;
+        };
+        crate::dialects::Dialect::get(self.config.dialect.unwrap_or_default())
+            .parse_data_type(text)
+            .ok()
     }
 
     /// Check for an AS alias after an expression in ClickHouse function arg context.
@@ -41941,6 +42008,8 @@ impl Parser {
                     Expression::Annotated(Box::new(Annotated {
                         this: arg,
                         trailing_comments,
+                        type_assertion: None,
+                        type_like: None,
                     }))
                 }
                 _ => arg,
@@ -49682,6 +49751,8 @@ impl Parser {
                         Expression::Annotated(Box::new(Annotated {
                             this: expr,
                             trailing_comments,
+                            type_assertion: None,
+                            type_like: None,
                         }))
                     }
                     // For expressions that already capture trailing_comments, don't double-wrap
@@ -49897,6 +49968,8 @@ impl Parser {
                         Expression::Annotated(Box::new(crate::expressions::Annotated {
                             this: expr,
                             trailing_comments,
+                            type_assertion: None,
+                            type_like: None,
                         }))
                     }
                     _ => expr,

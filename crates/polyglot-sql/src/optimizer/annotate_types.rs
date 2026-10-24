@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dialects::DialectType;
 use crate::expressions::{
-    BinaryOp, DataType, DateTimeField, DotAccess, Expression, Function, IfFunc, ListAggOverflow,
-    Literal, Map, Nvl2Func, Struct, StructField, Subscript,
+    type_assertion_result, BinaryOp, DataType, DateTimeField, DotAccess, Expression, Function,
+    IfFunc, ListAggOverflow, Literal, Map, Nvl2Func, Struct, StructField, Subscript,
 };
 use crate::schema::{normalize_name, Schema, SchemaError, SchemaResult, TABLE_PARTS};
 use crate::traversal::ExpressionWalk;
@@ -493,7 +493,23 @@ impl<'a> TypeAnnotator<'a> {
 
             // Transparent wrappers preserve the type of their inner expression.
             Expression::Paren(paren) => self.annotate(&paren.this),
-            Expression::Annotated(annotated) => self.annotate(&annotated.this),
+            Expression::Annotated(annotated) => {
+                let inferred = self.annotate(&annotated.this);
+                let like = match (&annotated.type_assertion, &annotated.type_like) {
+                    (None, Some(like)) => {
+                        self.annotate(like).filter(|like| !like.contains_unknown())
+                    }
+                    _ => None,
+                };
+                match annotated.type_assertion.as_ref().or(like.as_ref()) {
+                    Some(asserted) => {
+                        let inferred =
+                            inferred.filter(|_| !self.is_unknown_function_result(&annotated.this));
+                        Some(type_assertion_result(inferred.as_ref(), asserted).clone())
+                    }
+                    None => inferred,
+                }
+            }
 
             // Functions
             Expression::Function(func) => self.annotate_function(func),
@@ -920,6 +936,11 @@ impl<'a> TypeAnnotator<'a> {
             }
             Expression::Annotated(annotated) => {
                 self.annotate_in_place(&mut annotated.this);
+                if let Some(like) = &mut annotated.type_like {
+                    self.annotate_in_place(like);
+                    let resolved = self.annotate(like).filter(|like| !like.contains_unknown());
+                    annotated.type_assertion = resolved;
+                }
             }
 
             // Case
@@ -1630,6 +1651,23 @@ impl<'a> TypeAnnotator<'a> {
 
     /// Relation outputs cannot rely on the scalar annotator's legacy fallback
     /// that assigns an unknown function the type of its first argument.
+    /// Whether `expr` is a function call whose type is only a fallback guess, such as the
+    /// first argument's type for an unknown function in some dialects.
+    fn is_unknown_function_result(&self, mut expr: &Expression) -> bool {
+        loop {
+            expr = match expr {
+                Expression::Paren(paren) => &paren.this,
+                Expression::Annotated(annotated) if annotated.type_assertion.is_none() => {
+                    &annotated.this
+                }
+                Expression::Function(func) => {
+                    return !Self::function_result_is_known(func, self._dialect.unwrap_or_default())
+                }
+                _ => return false,
+            };
+        }
+    }
+
     pub(crate) fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
         let mut annotator = Self::new(None, Some(dialect));
         // Probe dispatch without traversing or cloning a query argument. The
@@ -2462,28 +2500,49 @@ fn query_outputs(expressions: &[Expression], dialect: Option<DialectType>) -> Ou
         .iter()
         .map(|expression| {
             let mut inner = expression;
+            let mut asserted = None;
             loop {
                 inner = match inner {
                     Expression::Alias(alias) => &alias.this,
                     Expression::Paren(paren) => &paren.this,
-                    Expression::Annotated(annotated) => &annotated.this,
+                    Expression::Annotated(annotated) => {
+                        asserted = innermost_assertion(asserted, annotated);
+                        &annotated.this
+                    }
                     _ => break,
                 };
             }
             let unknown_function = matches!(inner, Expression::Function(func)
                 if !TypeAnnotator::function_result_is_known(func, dialect.unwrap_or_default()));
+            let data_type = if unknown_function {
+                DataType::Unknown
+            } else {
+                projection_type(expression, dialect)
+            };
             // Keep unnamed slots until CTE/derived-table column aliases have
             // been applied by ordinal. They are not registered as named columns.
             (
                 projection_name(expression).unwrap_or_default(),
-                if unknown_function {
-                    DataType::Unknown
-                } else {
-                    projection_type(expression, dialect)
+                match asserted {
+                    Some(asserted) => type_assertion_result(Some(&data_type), asserted).clone(),
+                    None => data_type,
                 },
             )
         })
         .collect()
+}
+
+/// The assertion that applies to a chain of nested annotations: the innermost one,
+/// unless it is itself partly unknown.
+pub(super) fn innermost_assertion<'a>(
+    outer: Option<&'a DataType>,
+    annotated: &'a crate::expressions::Annotated,
+) -> Option<&'a DataType> {
+    match (&annotated.type_assertion, outer) {
+        (Some(inner), Some(_)) if inner.contains_unknown() => outer,
+        (Some(inner), _) => Some(inner),
+        (None, _) => outer,
+    }
 }
 
 fn array_element_type(data_type: Option<&DataType>) -> DataType {
@@ -2900,6 +2959,12 @@ pub fn annotate_types(
     dialect: Option<DialectType>,
 ) {
     annotate_scoped_expression(expr, schema, dialect);
+}
+
+/// Whether type annotation knows the result type of `func` in `dialect`, rather than only
+/// guessing it, as it does for an unmodelled function in some dialects.
+pub fn function_result_is_known(func: &Function, dialect: DialectType) -> bool {
+    TypeAnnotator::function_result_is_known(func, dialect)
 }
 
 #[cfg(test)]

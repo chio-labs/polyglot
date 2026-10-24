@@ -899,6 +899,8 @@ fn set_operation_branch_expression(operand: &Expression) -> Expression {
             Expression::Annotated(Box::new(crate::expressions::Annotated {
                 this: set_operation_branch_expression(&annotated.this),
                 trailing_comments: annotated.trailing_comments.clone(),
+                type_assertion: annotated.type_assertion.clone(),
+                type_like: annotated.type_like.clone(),
             }))
         }
         _ => unreachable!("only set operations are shallow"),
