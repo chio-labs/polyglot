@@ -148,6 +148,46 @@ fn placement(
     }
 }
 
+/// Whether `expression` is an analysis-only type assertion, which grouping looks through.
+fn is_type_marker(expression: &Expression) -> bool {
+    matches!(expression, Expression::Annotated(annotated) if annotated.type_assertion.is_some() || annotated.type_like.is_some())
+}
+
+fn has_type_marker(expression: &Expression) -> bool {
+    expression.dfs().any(is_type_marker)
+}
+
+/// `expression` with every type assertion replaced by the expression it types, when `marked`.
+fn without_type_markers(expression: &Expression, marked: bool) -> std::borrow::Cow<'_, Expression> {
+    if !marked || !has_type_marker(expression) {
+        return std::borrow::Cow::Borrowed(expression);
+    }
+    let unmarked = crate::traversal::transform_all(expression.clone(), &|node| {
+        Ok(match node {
+            Expression::Annotated(annotated)
+                if annotated.type_assertion.is_some() || annotated.type_like.is_some() =>
+            {
+                annotated.this
+            }
+            other => other,
+        })
+    });
+    match unmarked {
+        Ok(unmarked) => std::borrow::Cow::Owned(unmarked),
+        Err(_) => std::borrow::Cow::Borrowed(expression),
+    }
+}
+
+/// Whether `node` is one of the group keys, with type assertions transparent on both sides.
+fn same_group_key(
+    groups: &[std::borrow::Cow<'_, Expression>],
+    node: &Expression,
+    marked: bool,
+) -> bool {
+    let node = without_type_markers(node, marked);
+    groups.iter().any(|group| **group == *node)
+}
+
 fn unalias(expression: &Expression) -> &Expression {
     match expression {
         Expression::Alias(alias) => &alias.this,
@@ -221,11 +261,30 @@ fn grouping(
                 | Expression::Rollup(_)
                 | Expression::Tuple(_)
                 | Expression::Paren(_)
-        ) || matches!(node, Expression::Function(function) if !function.quoted && matches!(function.name.to_ascii_uppercase().as_str(), "GROUPING SETS" | "CUBE" | "ROLLUP"))
+        ) || is_type_marker(node)
+            || matches!(node, Expression::Function(function) if !function.quoted && matches!(function.name.to_ascii_uppercase().as_str(), "GROUPING SETS" | "CUBE" | "ROLLUP"))
         {
             pending.extend(node.children());
         }
     }
+    let marked = groups.iter().any(|group| has_type_marker(group))
+        || select.expressions.iter().any(has_type_marker)
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|having| has_type_marker(&having.this))
+        || select
+            .qualify
+            .as_ref()
+            .is_some_and(|qualify| has_type_marker(&qualify.this))
+        || select
+            .order_by
+            .as_ref()
+            .is_some_and(|order| order.expressions.iter().any(|e| has_type_marker(&e.this)));
+    let unmarked_groups: Vec<std::borrow::Cow<'_, Expression>> = groups
+        .iter()
+        .map(|group| without_type_markers(group, marked))
+        .collect();
     let mut column_key = |column: &Column| {
         let table = column
             .table
@@ -330,7 +389,7 @@ fn grouping(
             if boundary(node)
                 || is_aggregate(node)
                 || matches!(node, Expression::WithinGroup(group) if is_aggregate(&group.this))
-                || groups.iter().any(|group| *group == node)
+                || same_group_key(&unmarked_groups, node, marked)
             {
                 continue;
             }

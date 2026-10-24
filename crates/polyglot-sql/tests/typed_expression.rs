@@ -540,6 +540,80 @@ mod analysis {
         }
     }
 
+    fn semantic_errors(sql: &str, dialect: DialectType) -> Vec<String> {
+        let options = SchemaValidationOptions {
+            semantic: true,
+            ..Default::default()
+        };
+        validate_with_schema(sql, dialect, &schema(), &options)
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .collect()
+    }
+
+    /// Every way to mark the `{a}`, `{b}` and `{c}` slots of `template`: plain or asserted.
+    fn marked_variants(template: &str, plain: &str, marked: &str) -> Vec<String> {
+        let mut variants = Vec::new();
+        for mask in 0..8 {
+            let mut sql = template.to_owned();
+            for (bit, slot) in ["{a}", "{b}", "{c}"].iter().enumerate() {
+                let value = if mask & (1 << bit) == 0 {
+                    plain
+                } else {
+                    marked
+                };
+                sql = sql.replace(slot, value);
+            }
+            variants.push(sql);
+        }
+        variants
+    }
+
+    #[test]
+    fn type_assertions_are_transparent_to_grouping_and_ordering_keys() {
+        let key = "(amount + k)";
+        let marker = "__polyglot_typed((amount + k), 'BIGINT')";
+        let like = "__polyglot_typed_like((amount + k), amount)";
+        let templates = [
+            "SELECT {a} AS g, COUNT(*) AS n FROM orders GROUP BY {b}",
+            "SELECT {a} AS g, COUNT(*) AS n FROM orders GROUP BY {b} ORDER BY {c}",
+            "SELECT {a} AS g, COUNT(*) AS n FROM orders GROUP BY ROLLUP ({b})",
+            "SELECT {a} AS g, COUNT(*) AS n FROM orders GROUP BY CUBE ({b})",
+            "SELECT {a} AS g, COUNT(*) AS n FROM orders GROUP BY GROUPING SETS (({b}), ())",
+            "SELECT COUNT(*) AS n FROM orders GROUP BY {b} HAVING {a} > 0",
+            "SELECT {a} + 1 AS g FROM orders GROUP BY {b} HAVING SUM({c}) > 0",
+            "SELECT SUM(amount) OVER (PARTITION BY {a} ORDER BY {b}) AS w FROM orders",
+            "SELECT {a} AS g, COUNT(*) OVER (PARTITION BY {b}) AS w FROM orders GROUP BY {c}",
+        ];
+        for (dialect, _) in dialects() {
+            let mut all = templates.to_vec();
+            if dialect != DialectType::Snowflake {
+                all.push("SELECT DISTINCT ON ({a}) {b} AS g FROM orders ORDER BY {c}");
+            }
+            for template in all {
+                let plain = template
+                    .replace("{a}", key)
+                    .replace("{b}", key)
+                    .replace("{c}", key);
+                let expected = semantic_errors(&plain, dialect);
+                assert!(
+                    !expected.iter().any(|error| error.starts_with("E230")),
+                    "{dialect:?}: {plain}: {expected:?}"
+                );
+                for asserted in [marker, like] {
+                    for typed in marked_variants(template, key, asserted) {
+                        assert_eq!(
+                            semantic_errors(&typed, dialect),
+                            expected,
+                            "{dialect:?}: {typed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The facts without inferred types, which a typed-like assertion exists to change.
     fn strip_types(value: &mut serde_json::Value) {
         match value {
