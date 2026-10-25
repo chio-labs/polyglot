@@ -1592,8 +1592,8 @@ fn values_source_columns_471() {
         "SELECT inventory_rows.product_id FROM (VALUES (1)) AS inventory_rows(product_id)",
         "SELECT column1, column2 FROM VALUES (1, 'a'), (2, 'b')",
         "SELECT v.column1, v.column2 FROM (VALUES (1, 'a'), (2, 'b')) v",
-        "WITH v AS (VALUES (1, 2)) SELECT column1, column2 FROM v",
-        "WITH v(a, b) AS (VALUES (1, 2)) SELECT a, b FROM v",
+        "WITH v AS (SELECT * FROM (VALUES (1, 2))) SELECT column1, column2 FROM v",
+        "WITH v(a, b) AS (SELECT * FROM VALUES (1, 2)) SELECT a, b FROM v",
         "SELECT v.id, items.quantity FROM VALUES (1) v(id) JOIN items ON v.id = items.quantity",
         "SELECT v.\"Product\" FROM VALUES (1) v(\"Product\")",
         "SELECT v.\"Product\" FROM (VALUES (1)) v(\"Product\")",
@@ -1616,7 +1616,15 @@ fn values_source_columns_471() {
             "SELECT id FROM VALUES (1) a(id) JOIN (VALUES (2)) b(id) ON a.id = b.id",
             "E221",
         ),
-        ("WITH v AS (VALUES (1)) SELECT column2 FROM v", "E201"),
+        (
+            "WITH v AS (SELECT * FROM VALUES (1)) SELECT column2 FROM v",
+            "E201",
+        ),
+        (
+            "WITH v AS (VALUES (1, 2)) SELECT column1, column2 FROM v",
+            "E003",
+        ),
+        ("WITH v(a, b) AS (VALUES (1, 2)) SELECT a, b FROM v", "E003"),
     ] {
         let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
         assert!(

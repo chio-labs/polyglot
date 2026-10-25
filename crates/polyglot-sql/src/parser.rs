@@ -3428,6 +3428,14 @@ impl Parser {
             };
 
             self.expect(TokenType::LParen)?;
+            if self.config.dialect == Some(DialectType::Snowflake) && self.check(TokenType::Values)
+            {
+                return Err(self.parse_error(format!(
+                    "Snowflake does not accept a bare VALUES list as the body of CTE '{}'; \
+                     select from it instead, as SELECT * FROM (VALUES ...) AS t(column, ...)",
+                    name.name
+                )));
+            }
             let query = self.parse_statement()?;
             self.expect(TokenType::RParen)?;
 
