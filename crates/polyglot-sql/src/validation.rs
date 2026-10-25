@@ -4015,10 +4015,9 @@ fn validate_scope_columns(
             && select.connect.is_some()
             && column.table.is_none()
             && !column.name.quoted
-            && matches!(
-                column.name.name.to_ascii_uppercase().as_str(),
-                "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
-            )
+            // LEVEL is Snowflake's only CONNECT BY pseudo-column; it does not support
+            // Oracle's CONNECT_BY_ISLEAF or CONNECT_BY_ISCYCLE.
+            && column.name.name.eq_ignore_ascii_case("LEVEL")
         {
             continue;
         }

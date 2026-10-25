@@ -301,7 +301,7 @@ fn snowflake_realworld_scope_and_aggregate_regressions() {
         };
         for sql in [
             "SELECT id, LEVEL - 1, CONNECT_BY_ROOT id, SYS_CONNECT_BY_PATH(id::VARCHAR, ',') FROM orders START WITH parent_id IS NULL CONNECT BY parent_id = PRIOR id",
-            "SELECT LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+            "SELECT LEVEL FROM orders CONNECT BY parent_id = PRIOR id",
             "SELECT COUNT(id, quantity, amount), COUNT(DISTINCT id, quantity) FROM orders",
             "SELECT status, COUNT(id, quantity) FROM orders GROUP BY status",
             "SELECT COUNT(id, quantity) OVER () FROM orders",
@@ -319,6 +319,14 @@ fn snowflake_realworld_scope_and_aggregate_regressions() {
         for (sql, code) in [
             ("SELECT LEVEL FROM orders", "E201"),
             ("SELECT CONNECT_BY_ISLEAF FROM orders", "E201"),
+            (
+                "SELECT CONNECT_BY_ISLEAF FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            (
+                "SELECT CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
             (
                 "SELECT missing FROM orders CONNECT BY parent_id = PRIOR id",
                 "E201",
