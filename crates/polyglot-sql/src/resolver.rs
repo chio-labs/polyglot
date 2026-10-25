@@ -322,7 +322,7 @@ impl<'a> Resolver<'a> {
                 // match how MappingSchema stores hierarchical keys.
                 let table_name = qualified_table_name(table);
                 match self.schema.column_names(&table_name) {
-                    Ok(cols) => cols,
+                    Ok(cols) => apply_alias_columns(cols, &table.column_aliases),
                     Err(_) => Vec::new(), // Schema might not have this table
                 }
             }
@@ -360,6 +360,12 @@ impl<'a> Resolver<'a> {
             Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
                 alias_output_columns(alias)
             }
+            // A table function's own columns are unknown; its alias list names them.
+            Expression::Alias(alias) if matches!(&alias.this, Expression::Function(_)) => alias
+                .column_aliases
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
             Expression::Alias(alias) => {
                 let columns = self.get_source_columns_for_expression(&alias.this)?;
                 apply_alias_columns(columns, &alias.column_aliases)
