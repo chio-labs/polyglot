@@ -660,10 +660,20 @@ fn rewrite_stars_in_select(
                 if let Some(expanded) =
                     expand_star_from_sources(qual, &sources, resolved_ctes, schema)
                 {
-                    for (src_alias, col_name) in &expanded {
-                        let table_id = Identifier::new(src_alias);
-                        new_expressions.push(make_column_expr(col_name, Some(&table_id)));
-                        result_columns.push(col_name.clone());
+                    let columns: Vec<Expression> = expanded
+                        .iter()
+                        .map(|(src_alias, col_name)| {
+                            // An unaliased derived table has no name to qualify with.
+                            let table_id =
+                                (!src_alias.is_empty()).then(|| Identifier::new(src_alias));
+                            make_column_expr(col_name, table_id.as_ref())
+                        })
+                        .collect();
+                    for column in columns {
+                        if let Some(name) = get_expression_output_name(&column) {
+                            result_columns.push(name);
+                        }
+                        new_expressions.push(column);
                     }
                 } else {
                     new_expressions.push(expr.clone());
@@ -764,6 +774,17 @@ fn source_output_columns(
             (!output.is_empty()).then_some(output)
         }
         SourceRelation::Pivot(_) => None,
+        SourceRelation::Derived {
+            query,
+            column_aliases,
+        } => {
+            let mut query: Expression = (**query).clone();
+            let mut columns = rewrite_stars_in_query(&mut query, resolved_ctes, schema)?;
+            for (column, alias) in columns.iter_mut().zip(column_aliases) {
+                *column = alias.name.clone();
+            }
+            (!columns.is_empty() && !columns.iter().any(|column| column == "*")).then_some(columns)
+        }
     }
 }
 
@@ -852,6 +873,11 @@ enum SourceRelation {
     Plain,
     Pivot(Box<crate::expressions::Pivot>),
     Unpivot(Box<crate::expressions::Unpivot>),
+    /// A derived table, whose columns are its query's outputs renamed by its alias list.
+    Derived {
+        query: Box<Expression>,
+        column_aliases: Vec<Identifier>,
+    },
 }
 
 /// Extract source info (alias, normalized CTE name, fully-qualified name) from a
@@ -905,6 +931,21 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
                     relation: SourceRelation::Plain,
                 })
             }
+            Expression::Subquery(s) if !s.lateral => {
+                let (alias, quoted) = s.alias.as_ref().map_or((String::new(), false), |alias| {
+                    (alias.name.clone(), alias.quoted)
+                });
+                Some(SourceInfo {
+                    normalized: alias.to_lowercase(),
+                    fq_name: alias.clone(),
+                    alias,
+                    quoted,
+                    relation: SourceRelation::Derived {
+                        query: Box::new(s.this.clone()),
+                        column_aliases: s.column_aliases.clone(),
+                    },
+                })
+            }
             Expression::Subquery(s) => {
                 let alias_identifier = s.alias.as_ref()?;
                 let alias = alias_identifier.name.clone();
@@ -922,9 +963,13 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
             Expression::Alias(a) if matches!(&a.this, Expression::Unnest(_)) => {
                 Some(virtual_source_info(&a.alias))
             }
-            Expression::Alias(a) if is_query_like_relation(&a.this) => {
-                Some(virtual_source_info(&a.alias))
-            }
+            Expression::Alias(a) if is_query_like_relation(&a.this) => Some(SourceInfo {
+                relation: SourceRelation::Derived {
+                    query: Box::new(a.this.clone()),
+                    column_aliases: a.column_aliases.clone(),
+                },
+                ..virtual_source_info(&a.alias)
+            }),
             Expression::Lateral(lateral) => lateral.alias.as_deref().map(named_virtual_source_info),
             Expression::LateralView(lateral_view) => lateral_view
                 .table_alias
