@@ -7840,7 +7840,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_set_operand(&union.right)?;
+        self.generate_right_set_operand(&union.right, false)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &union.order_by {
             if self.config.pretty {
@@ -8006,7 +8006,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_set_operand(&intersect.right)?;
+        self.generate_right_set_operand(&intersect.right, true)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &intersect.order_by {
             if self.config.pretty {
@@ -8205,7 +8205,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_set_operand(&except.right)?;
+        self.generate_right_set_operand(&except.right, false)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &except.order_by {
             if self.config.pretty {
@@ -30294,6 +30294,38 @@ impl Generator {
     /// `FETCH FIRST n ROWS ONLY`) is parenthesized, so the limit stays on that
     /// branch instead of binding to the whole set operation. ClickHouse already
     /// binds branch LIMITs locally.
+    /// Generate a set operation's right operand, grouping a nested set operation the target
+    /// would otherwise read differently. Targets that give INTERSECT higher precedence read
+    /// `a UNION b INTERSECT c` as the AST's right-nested INTERSECT; SQLite and Oracle evaluate
+    /// every set operator left to right, and BigQuery requires parentheses to mix them.
+    fn generate_right_set_operand(
+        &mut self,
+        expr: &Expression,
+        parent_intersect: bool,
+    ) -> Result<()> {
+        let nested_intersect = match expr {
+            Expression::Intersect(_) => true,
+            Expression::Union(_) | Expression::Except(_) => false,
+            _ => return self.generate_set_operand(expr),
+        };
+        let left_to_right = matches!(
+            self.config.dialect,
+            Some(DialectType::SQLite) | Some(DialectType::Oracle) | Some(DialectType::BigQuery)
+        );
+        if !left_to_right && nested_intersect && !parent_intersect {
+            return self.generate_set_operand(expr);
+        }
+        if self.config.dialect == Some(DialectType::SQLite) {
+            // SQLite does not accept parenthesized compound-select operands.
+            self.write_keyword("SELECT * FROM");
+            self.write_space();
+        }
+        self.write("(");
+        self.generate_expression(expr)?;
+        self.write(")");
+        Ok(())
+    }
+
     fn generate_set_operand(&mut self, expr: &Expression) -> Result<()> {
         // Group the annotated operand itself, keeping its comments outside the parentheses.
         if let Expression::Annotated(annotated) = expr {
