@@ -25372,8 +25372,10 @@ impl Generator {
             }
             self.write(" : ");
         } else {
-            // Standard syntax: x -> expr or (x, y) -> expr
-            if f.parameters.len() == 1 {
+            // Standard syntax: x -> expr or (x, y) -> expr; Snowflake keeps parameter types.
+            let typed = matches!(self.config.dialect, Some(DialectType::Snowflake))
+                && f.parameter_types.iter().any(Option::is_some);
+            if f.parameters.len() == 1 && !typed {
                 self.generate_identifier(&f.parameters[0])?;
             } else {
                 self.write("(");
@@ -25382,6 +25384,10 @@ impl Generator {
                         self.write(", ");
                     }
                     self.generate_identifier(param)?;
+                    if let Some(Some(data_type)) = f.parameter_types.get(i).filter(|_| typed) {
+                        self.write_space();
+                        self.generate_data_type(data_type)?;
+                    }
                 }
                 self.write(")");
             }

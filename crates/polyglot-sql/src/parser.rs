@@ -33725,6 +33725,48 @@ impl Parser {
         }
     }
 
+    /// Parse `name type [, name type]...) -> body` after `(`, or rewind and return None.
+    fn try_parse_typed_parenthesized_lambda(&mut self) -> Result<Option<Expression>> {
+        let saved = self.current;
+        let mut parameters: Vec<Identifier> = Vec::new();
+        let mut parameter_types: Vec<Option<DataType>> = Vec::new();
+        loop {
+            let named = self.check(TokenType::Identifier)
+                || self.check(TokenType::Var)
+                || self.check(TokenType::QuotedIdentifier);
+            if !named || self.is_at_end() {
+                self.current = saved;
+                return Ok(None);
+            }
+            let token = self.advance()?;
+            let quoted = token.token_type == TokenType::QuotedIdentifier;
+            if self.is_at_end() || !self.is_type_keyword() {
+                self.current = saved;
+                return Ok(None);
+            }
+            let Ok(data_type) = self.parse_data_type() else {
+                self.current = saved;
+                return Ok(None);
+            };
+            parameters.push(Self::identifier_from_token(token, quoted));
+            parameter_types.push(Some(data_type));
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        if !(self.match_token(TokenType::RParen) && self.match_token(TokenType::Arrow)) {
+            self.current = saved;
+            return Ok(None);
+        }
+        let body = self.parse_expression()?;
+        Ok(Some(Expression::Lambda(Box::new(LambdaExpr {
+            parameters,
+            body,
+            colon: false,
+            parameter_types,
+        }))))
+    }
+
     /// Parse the remainder of a parenthesized primary after its opening parenthesis.
     ///
     /// `set_operation_may_follow` controls whether a parenthesized query may absorb a
@@ -33868,6 +33910,12 @@ impl Parser {
                     colon: false,
                     parameter_types: Vec::new(),
                 })));
+            }
+        }
+        // Snowflake: (total DOUBLE, item VARIANT) -> body, a lambda with typed parameters.
+        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+            if let Some(lambda) = self.try_parse_typed_parenthesized_lambda()? {
+                return Ok(lambda);
             }
         }
         if self.check(TokenType::Select)
