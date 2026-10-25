@@ -326,7 +326,7 @@ pub(super) fn check(
                 }
             }
         }
-        Expression::Cast(expr) | Expression::TryCast(expr) | Expression::SafeCast(expr) if matches!(&expr.to, DataType::Custom { name } if canonical_type_family(name) == TypeFamily::Unknown && !known_types.iter().any(|known| known.eq_ignore_ascii_case(name))) => {
+        Expression::Cast(expr) | Expression::TryCast(expr) | Expression::SafeCast(expr) if matches!(&expr.to, DataType::Custom { name } if canonical_type_family(name) == TypeFamily::Unknown && !known_types.iter().any(|known| known.eq_ignore_ascii_case(name)) && !is_bigquery_range_type(name, dialect)) => {
             if coercion::covered(dialect) {
                 errors.push(type_issue(
                     false,
@@ -602,3 +602,12 @@ pub(super) fn check(
         _ => {}
     }
 }
+
+/// BigQuery's `RANGE<T>`, which the parser keeps as a named custom type.
+fn is_bigquery_range_type(name: &str, dialect: DialectType) -> bool {
+    dialect == DialectType::BigQuery
+        && name.len() > RANGE_TYPE_PREFIX.len()
+        && name[..RANGE_TYPE_PREFIX.len()].eq_ignore_ascii_case(RANGE_TYPE_PREFIX)
+}
+
+const RANGE_TYPE_PREFIX: &str = "RANGE<";
