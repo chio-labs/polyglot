@@ -8,7 +8,7 @@
 use crate::dialects::DialectType;
 use crate::expressions::{
     Alias, BinaryOp, Column, DotAccess, Expression, Identifier, Join, JoinKind, LateralView,
-    Literal, Over, Paren, Select, TableRef, VarArgFunc, With,
+    Literal, Over, Paren, Select, Star, TableRef, VarArgFunc, With,
 };
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
@@ -1058,6 +1058,7 @@ fn expand_stars(
         match expr {
             Expression::Star(star) => {
                 has_star = true;
+                let star_start: usize = new_selections.len();
                 if let Some(table) = &star.table {
                     let table_name = &table.name;
                     if !ordered_sources.contains(table_name) {
@@ -1129,6 +1130,8 @@ fn expand_stars(
                         }
                     }
                 }
+                let expanded: Vec<Expression> = new_selections.split_off(star_start);
+                new_selections.extend(apply_star_modifiers(star, expanded));
             }
             Expression::Column(col) if is_star_column(col) => {
                 has_star = true;
@@ -3059,6 +3062,78 @@ fn is_star_column(col: &Column) -> bool {
 }
 
 /// Create a qualified column expression
+/// The output name of one expanded star column: a column's name or an alias.
+fn expanded_output_name(expression: &Expression) -> Option<&str> {
+    match expression {
+        Expression::Column(column) => Some(column.name.name.as_str()),
+        Expression::Alias(alias) => Some(alias.alias.name.as_str()),
+        _ => None,
+    }
+}
+
+fn same_star_name(identifier: &Identifier, name: &str) -> bool {
+    if identifier.quoted {
+        identifier.name == name
+    } else {
+        identifier.name.eq_ignore_ascii_case(name)
+    }
+}
+
+/// Apply a star's EXCLUDE, REPLACE and RENAME, in that order, to its expanded columns.
+pub(crate) fn apply_star_modifiers(star: &Star, expanded: Vec<Expression>) -> Vec<Expression> {
+    let alias = |this: Expression, name: Identifier| {
+        Expression::Alias(Box::new(Alias {
+            this,
+            alias: name,
+            column_aliases: vec![],
+            alias_explicit_as: true,
+            alias_keyword: None,
+            pre_alias_comments: vec![],
+            trailing_comments: vec![],
+            inferred_type: None,
+        }))
+    };
+    expanded
+        .into_iter()
+        .filter(|expression| {
+            let name = expanded_output_name(expression).unwrap_or_default();
+            !star
+                .except
+                .iter()
+                .flatten()
+                .any(|excluded| same_star_name(excluded, name))
+        })
+        .map(|expression| {
+            let name = expanded_output_name(&expression)
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(replacement) = star
+                .replace
+                .iter()
+                .flatten()
+                .find(|replacement| same_star_name(&replacement.alias, &name))
+            {
+                return alias(replacement.this.clone(), replacement.alias.clone());
+            }
+            match star
+                .rename
+                .iter()
+                .flatten()
+                .find(|(from, _)| same_star_name(from, &name))
+            {
+                Some((_, to)) => {
+                    let this = match expression {
+                        Expression::Alias(existing) => existing.this,
+                        other => other,
+                    };
+                    alias(this, to.clone())
+                }
+                None => expression,
+            }
+        })
+        .collect()
+}
+
 fn create_qualified_column(name: &str, table: Option<&str>) -> Expression {
     Expression::boxed_column(Column {
         name: Identifier::new(name),

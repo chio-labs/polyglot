@@ -1,4 +1,4 @@
-//! Stars expand over derived tables in query analysis.
+//! Stars expand over derived tables and honour EXCLUDE, REPLACE and RENAME in query analysis.
 
 use polyglot_sql::{
     analyze_query, analyze_query_for_project_projections, AnalyzeQueryOptions, DialectType,
@@ -24,7 +24,7 @@ fn names(analysis: QueryAnalysis) -> Vec<String> {
         .collect()
 }
 
-const CASES: [(DialectType, &str, &[&str]); 4] = [
+const CASES: [(DialectType, &str, &[&str]); 9] = [
     (
         DialectType::DuckDB,
         "SELECT * FROM (SELECT 1 AS order_id, 'a' AS status)",
@@ -45,10 +45,35 @@ const CASES: [(DialectType, &str, &[&str]); 4] = [
         "WITH t AS (SELECT 1 AS order_id) SELECT s.* FROM (SELECT * FROM t) AS s",
         &["order_id"],
     ),
+    (
+        DialectType::DuckDB,
+        "WITH t AS (SELECT 1 AS order_id, 'a' AS status) SELECT * EXCLUDE (status) FROM t",
+        &["order_id"],
+    ),
+    (
+        DialectType::DuckDB,
+        "SELECT * EXCLUDE (status) FROM (SELECT 1 AS order_id, 'a' AS status) AS t UNION ALL SELECT 2 AS order_id",
+        &["order_id"],
+    ),
+    (
+        DialectType::DuckDB,
+        "WITH t AS (SELECT 1 AS order_id, 'a' AS status) SELECT * REPLACE (upper(status) AS status) FROM t",
+        &["order_id", "status"],
+    ),
+    (
+        DialectType::Snowflake,
+        "WITH t AS (SELECT 1 AS order_id, 'a' AS status) SELECT * RENAME (status AS state) FROM t",
+        &["order_id", "state"],
+    ),
+    (
+        DialectType::Snowflake,
+        "WITH t AS (SELECT 1 AS order_id, 'a' AS status) SELECT t.* EXCLUDE (order_id) FROM t",
+        &["status"],
+    ),
 ];
 
 #[test]
-fn project_projection_analysis_expands_stars_over_derived_tables() {
+fn project_projection_analysis_expands_stars_with_their_modifiers() {
     for (dialect, sql, expected) in CASES {
         let analysis = analyze_query_for_project_projections(sql, options(dialect)).unwrap();
         assert_eq!(names(analysis), expected, "{dialect:?} {sql}");
@@ -56,7 +81,7 @@ fn project_projection_analysis_expands_stars_over_derived_tables() {
 }
 
 #[test]
-fn default_analysis_expands_stars_over_derived_tables() {
+fn default_analysis_expands_stars_with_their_modifiers() {
     for (dialect, sql, expected) in CASES {
         let analysis = analyze_query(sql, options(dialect)).unwrap();
         assert_eq!(names(analysis), expected, "{dialect:?} {sql}");

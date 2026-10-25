@@ -11,6 +11,7 @@ use crate::expressions::{DataType, Expression, Identifier, JoinKind, NamedWindow
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
 use crate::optimizer::annotate_types::annotate_types;
+use crate::optimizer::qualify_columns::apply_star_modifiers;
 use crate::optimizer::qualify_schema_aware_expression;
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{
@@ -669,7 +670,7 @@ fn rewrite_stars_in_select(
                             make_column_expr(col_name, table_id.as_ref())
                         })
                         .collect();
-                    for column in columns {
+                    for column in apply_star_modifiers(star, columns) {
                         if let Some(name) = get_expression_output_name(&column) {
                             result_columns.push(name);
                         }

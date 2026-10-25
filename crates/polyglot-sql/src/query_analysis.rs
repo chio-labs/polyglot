@@ -1449,19 +1449,50 @@ fn star_projection_facts(
             }
 
             let table = projection_star_table(inner);
-            let expanded_columns = expanded_star_columns(
+            let mut expanded_columns = expanded_star_columns(
                 table.as_deref(),
                 &scope,
                 &ordered_sources,
                 mapping_schema,
                 dialect,
             );
+            if let Expression::Star(star) = inner {
+                expanded_columns = star_modified_names(star, expanded_columns);
+            }
 
             Some(StarProjectionFact {
                 index,
                 table,
                 expanded_columns,
             })
+        })
+        .collect()
+}
+
+/// The column names a star's EXCLUDE and RENAME leave; REPLACE keeps each name.
+fn star_modified_names(star: &crate::expressions::Star, columns: Vec<String>) -> Vec<String> {
+    let same = |identifier: &crate::expressions::Identifier, name: &str| {
+        if identifier.quoted {
+            identifier.name == name
+        } else {
+            identifier.name.eq_ignore_ascii_case(name)
+        }
+    };
+    columns
+        .into_iter()
+        .filter(|name| {
+            !star
+                .except
+                .iter()
+                .flatten()
+                .any(|excluded| same(excluded, name))
+        })
+        .map(|name| {
+            star.rename
+                .iter()
+                .flatten()
+                .find(|(from, _)| same(from, &name))
+                .map_or(name, |(_, to)| to.name.clone())
         })
         .collect()
 }
