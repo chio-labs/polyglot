@@ -45151,10 +45151,31 @@ impl Parser {
             "STRUCT" => self.parse_struct_data_type(),
             "ROW" => self.parse_row_data_type(),
             "RECORD" => self.parse_record_data_type(),
+            "RANGE"
+                if self.config.dialect == Some(crate::dialects::DialectType::BigQuery)
+                    && self.check(TokenType::Lt) =>
+            {
+                self.parse_bigquery_range_data_type()
+            }
             _ => self.parse_scalar_data_type(name, raw_name),
         }?;
 
         self.finish_data_type(base_type)
+    }
+
+    /// BigQuery `RANGE<DATE>`, `RANGE<DATETIME>` or `RANGE<TIMESTAMP>`, kept by name.
+    fn parse_bigquery_range_data_type(&mut self) -> Result<DataType> {
+        self.expect(TokenType::Lt)?;
+        let element_name = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+        self.expect(TokenType::Gt)?;
+        if !matches!(element_name.as_str(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(self.parse_error(format!(
+                "RANGE element type must be DATE, DATETIME or TIMESTAMP, not {element_name}"
+            )));
+        }
+        Ok(DataType::Custom {
+            name: format!("RANGE<{element_name}>"),
+        })
     }
 
     #[inline(never)]
