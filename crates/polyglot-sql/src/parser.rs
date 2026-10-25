@@ -3428,6 +3428,14 @@ impl Parser {
             };
 
             self.expect(TokenType::LParen)?;
+            if self.config.dialect == Some(DialectType::Snowflake) && self.check(TokenType::Values)
+            {
+                return Err(self.parse_error(format!(
+                    "Snowflake does not accept a bare VALUES list as the body of CTE '{}'; \
+                     select from it instead, as SELECT * FROM (VALUES ...) AS t(column, ...)",
+                    name.name
+                )));
+            }
             let query = self.parse_statement()?;
             self.expect(TokenType::RParen)?;
 
@@ -33174,7 +33182,8 @@ impl Parser {
             Expression::JSONExtract(_) |  // Allow chained paths like a:b:c
             Expression::Function(_) |     // Allow function results like PARSE_JSON(...):x
             Expression::ParseJson(_) |    // Allow PARSE_JSON specifically
-            Expression::Parameter(_) // Allow positional params like $1:name
+            Expression::Parameter(_) |    // Allow positional params like $1:name
+            Expression::Subscript(_) // Allow bracket subscripts like f[0]:name
         );
 
         if !is_valid_json_path_base {
@@ -33725,6 +33734,48 @@ impl Parser {
         }
     }
 
+    /// Parse `name type [, name type]...) -> body` after `(`, or rewind and return None.
+    fn try_parse_typed_parenthesized_lambda(&mut self) -> Result<Option<Expression>> {
+        let saved = self.current;
+        let mut parameters: Vec<Identifier> = Vec::new();
+        let mut parameter_types: Vec<Option<DataType>> = Vec::new();
+        loop {
+            let named = self.check(TokenType::Identifier)
+                || self.check(TokenType::Var)
+                || self.check(TokenType::QuotedIdentifier);
+            if !named || self.is_at_end() {
+                self.current = saved;
+                return Ok(None);
+            }
+            let token = self.advance()?;
+            let quoted = token.token_type == TokenType::QuotedIdentifier;
+            if self.is_at_end() || !self.is_type_keyword() {
+                self.current = saved;
+                return Ok(None);
+            }
+            let Ok(data_type) = self.parse_data_type() else {
+                self.current = saved;
+                return Ok(None);
+            };
+            parameters.push(Self::identifier_from_token(token, quoted));
+            parameter_types.push(Some(data_type));
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        if !(self.match_token(TokenType::RParen) && self.match_token(TokenType::Arrow)) {
+            self.current = saved;
+            return Ok(None);
+        }
+        let body = self.parse_expression()?;
+        Ok(Some(Expression::Lambda(Box::new(LambdaExpr {
+            parameters,
+            body,
+            colon: false,
+            parameter_types,
+        }))))
+    }
+
     /// Parse the remainder of a parenthesized primary after its opening parenthesis.
     ///
     /// `set_operation_may_follow` controls whether a parenthesized query may absorb a
@@ -33868,6 +33919,12 @@ impl Parser {
                     colon: false,
                     parameter_types: Vec::new(),
                 })));
+            }
+        }
+        // Snowflake: (total DOUBLE, item VARIANT) -> body, a lambda with typed parameters.
+        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+            if let Some(lambda) = self.try_parse_typed_parenthesized_lambda()? {
+                return Ok(lambda);
             }
         }
         if self.check(TokenType::Select)
@@ -45102,10 +45159,31 @@ impl Parser {
             "STRUCT" => self.parse_struct_data_type(),
             "ROW" => self.parse_row_data_type(),
             "RECORD" => self.parse_record_data_type(),
+            "RANGE"
+                if self.config.dialect == Some(crate::dialects::DialectType::BigQuery)
+                    && self.check(TokenType::Lt) =>
+            {
+                self.parse_bigquery_range_data_type()
+            }
             _ => self.parse_scalar_data_type(name, raw_name),
         }?;
 
         self.finish_data_type(base_type)
+    }
+
+    /// BigQuery `RANGE<DATE>`, `RANGE<DATETIME>` or `RANGE<TIMESTAMP>`, kept by name.
+    fn parse_bigquery_range_data_type(&mut self) -> Result<DataType> {
+        self.expect(TokenType::Lt)?;
+        let element_name = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+        self.expect(TokenType::Gt)?;
+        if !matches!(element_name.as_str(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(self.parse_error(format!(
+                "RANGE element type must be DATE, DATETIME or TIMESTAMP, not {element_name}"
+            )));
+        }
+        Ok(DataType::Custom {
+            name: format!("RANGE<{element_name}>"),
+        })
     }
 
     #[inline(never)]
@@ -56024,6 +56102,9 @@ impl Parser {
                 }
                 self.skip();
             }
+            if !self.check(TokenType::RParen) {
+                return Err(self.parse_error("Expected ')' to close the IF condition"));
+            }
             // Extract condition text from source (inside outer parens)
             let cond_text = if self.source.is_some() {
                 let inner_start = self.tokens[cond_start + 1].span.start;
@@ -56041,7 +56122,9 @@ impl Parser {
             while !self.is_at_end() && !self.check(TokenType::Semicolon) {
                 self.skip();
             }
-            let body_text = if self.source.is_some() {
+            let body_text = if body_start >= self.current {
+                String::new()
+            } else if self.source.is_some() {
                 let start_span = self.tokens[body_start].span.start;
                 let end_span = if self.current > 0 {
                     self.tokens[self.current - 1].span.end
@@ -56054,7 +56137,9 @@ impl Parser {
             } else {
                 self.tokens_to_sql(body_start, self.current)
             };
-            let command_text = format!("IF {} {}", cond_text, body_text);
+            let command_text = format!("IF {} {}", cond_text, body_text)
+                .trim_end()
+                .to_string();
             return Ok(Some(Expression::Command(Box::new(
                 crate::expressions::Command { this: command_text },
             ))));

@@ -301,7 +301,7 @@ fn snowflake_realworld_scope_and_aggregate_regressions() {
         };
         for sql in [
             "SELECT id, LEVEL - 1, CONNECT_BY_ROOT id, SYS_CONNECT_BY_PATH(id::VARCHAR, ',') FROM orders START WITH parent_id IS NULL CONNECT BY parent_id = PRIOR id",
-            "SELECT LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+            "SELECT LEVEL FROM orders CONNECT BY parent_id = PRIOR id",
             "SELECT COUNT(id, quantity, amount), COUNT(DISTINCT id, quantity) FROM orders",
             "SELECT status, COUNT(id, quantity) FROM orders GROUP BY status",
             "SELECT COUNT(id, quantity) OVER () FROM orders",
@@ -319,6 +319,14 @@ fn snowflake_realworld_scope_and_aggregate_regressions() {
         for (sql, code) in [
             ("SELECT LEVEL FROM orders", "E201"),
             ("SELECT CONNECT_BY_ISLEAF FROM orders", "E201"),
+            (
+                "SELECT CONNECT_BY_ISLEAF FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
+            (
+                "SELECT CONNECT_BY_ISCYCLE FROM orders CONNECT BY parent_id = PRIOR id",
+                "E201",
+            ),
             (
                 "SELECT missing FROM orders CONNECT BY parent_id = PRIOR id",
                 "E201",
@@ -1584,8 +1592,8 @@ fn values_source_columns_471() {
         "SELECT inventory_rows.product_id FROM (VALUES (1)) AS inventory_rows(product_id)",
         "SELECT column1, column2 FROM VALUES (1, 'a'), (2, 'b')",
         "SELECT v.column1, v.column2 FROM (VALUES (1, 'a'), (2, 'b')) v",
-        "WITH v AS (VALUES (1, 2)) SELECT column1, column2 FROM v",
-        "WITH v(a, b) AS (VALUES (1, 2)) SELECT a, b FROM v",
+        "WITH v AS (SELECT * FROM (VALUES (1, 2))) SELECT column1, column2 FROM v",
+        "WITH v(a, b) AS (SELECT * FROM VALUES (1, 2)) SELECT a, b FROM v",
         "SELECT v.id, items.quantity FROM VALUES (1) v(id) JOIN items ON v.id = items.quantity",
         "SELECT v.\"Product\" FROM VALUES (1) v(\"Product\")",
         "SELECT v.\"Product\" FROM (VALUES (1)) v(\"Product\")",
@@ -1608,7 +1616,15 @@ fn values_source_columns_471() {
             "SELECT id FROM VALUES (1) a(id) JOIN (VALUES (2)) b(id) ON a.id = b.id",
             "E221",
         ),
-        ("WITH v AS (VALUES (1)) SELECT column2 FROM v", "E201"),
+        (
+            "WITH v AS (SELECT * FROM VALUES (1)) SELECT column2 FROM v",
+            "E201",
+        ),
+        (
+            "WITH v AS (VALUES (1, 2)) SELECT column1, column2 FROM v",
+            "E003",
+        ),
+        ("WITH v(a, b) AS (VALUES (1, 2)) SELECT a, b FROM v", "E003"),
     ] {
         let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
         assert!(

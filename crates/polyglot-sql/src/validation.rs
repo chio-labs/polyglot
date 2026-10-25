@@ -3876,14 +3876,20 @@ fn validate_scope_columns(
             let (source, aliases) = match node {
                 Expression::Subquery(query) => (&query.this, &query.column_aliases),
                 Expression::Alias(alias) => (&alias.this, &alias.column_aliases),
+                Expression::Table(table) => (node, &table.column_aliases),
                 _ => continue,
             };
             if !aliases.is_empty()
                 && known_relation_width(source, &resolver)
                     .is_some_and(|width| aliases.len() > width)
             {
+                let relation = if matches!(node, Expression::Table(_)) {
+                    "Table"
+                } else {
+                    "Derived-table"
+                };
                 errors.push(reference_diagnostic(
-                    "Derived-table column alias count exceeds its output column count".to_owned(),
+                    format!("{relation} column alias count exceeds its output column count"),
                     validation_codes::E_CTE_COLUMN_COUNT_MISMATCH,
                     strict,
                     aliases.last().and_then(|alias| alias.span),
@@ -4009,10 +4015,9 @@ fn validate_scope_columns(
             && select.connect.is_some()
             && column.table.is_none()
             && !column.name.quoted
-            && matches!(
-                column.name.name.to_ascii_uppercase().as_str(),
-                "LEVEL" | "CONNECT_BY_ISLEAF" | "CONNECT_BY_ISCYCLE"
-            )
+            // LEVEL is Snowflake's only CONNECT BY pseudo-column; it does not support
+            // Oracle's CONNECT_BY_ISLEAF or CONNECT_BY_ISCYCLE.
+            && column.name.name.eq_ignore_ascii_case("LEVEL")
         {
             continue;
         }

@@ -1567,6 +1567,13 @@ impl<'a> TypeAnnotator<'a> {
             }
         }
 
+        if self._dialect == Some(DialectType::ClickHouse)
+            && !func.quoted
+            && matches!(func_name.as_str(), "DATE_TRUNC" | "DATETRUNC")
+        {
+            return self.annotate_clickhouse_date_trunc(func);
+        }
+
         // Check known function return types
         if let Some(return_type) = self.function_return_types.get(&func_name) {
             if *return_type != DataType::Unknown {
@@ -1774,6 +1781,57 @@ impl<'a> TypeAnnotator<'a> {
             }),
             _ => None,
         }
+    }
+
+    /// Infer ClickHouse's `dateTrunc(unit, value[, timezone])` type, which depends on the unit:
+    /// year to week give a date, day to second a date with time, and sub-second units keep a
+    /// `DateTime64`. A `Date32` or `DateTime64` value widens a date result to `Date32`.
+    fn annotate_clickhouse_date_trunc(&mut self, func: &Function) -> Option<DataType> {
+        let (Some(unit), Some(value), true) =
+            (func.args.first(), func.args.get(1), func.args.len() <= 3)
+        else {
+            return None;
+        };
+        let Expression::Literal(literal) = unit else {
+            return None;
+        };
+        let crate::expressions::Literal::String(unit) = literal.as_ref() else {
+            return None;
+        };
+        let (input, nullable) = match self.annotate(value)? {
+            DataType::Nullable { inner } => (*inner, true),
+            other => (other, false),
+        };
+        let custom = |data_type: &DataType, prefix: &str| {
+            matches!(data_type, DataType::Custom { name }
+                if name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix))
+        };
+        let date32 = custom(&input, "Date32");
+        let datetime64 = custom(&input, "DateTime64");
+        let with_time =
+            datetime64 || custom(&input, "DateTime") || matches!(input, DataType::Timestamp { .. });
+        if !(with_time || date32 || matches!(input, DataType::Date)) {
+            return None;
+        }
+        let result = match unit.to_ascii_lowercase().as_str() {
+            "year" | "quarter" | "month" | "week" if date32 || datetime64 => DataType::Custom {
+                name: "Date32".to_owned(),
+            },
+            "year" | "quarter" | "month" | "week" => DataType::Date,
+            "day" | "hour" | "minute" | "second" if with_time => input,
+            "day" | "hour" | "minute" | "second" if !date32 => DataType::Custom {
+                name: "DATETIME".to_owned(),
+            },
+            "millisecond" | "microsecond" | "nanosecond" if datetime64 => input,
+            _ => return None,
+        };
+        Some(if nullable {
+            DataType::Nullable {
+                inner: Box::new(result),
+            }
+        } else {
+            result
+        })
     }
 
     /// Annotate IF/IIF/IFF conditional function

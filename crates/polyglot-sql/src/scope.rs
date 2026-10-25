@@ -1202,6 +1202,9 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope, build_children: bool
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
             scope.derived_table_scopes.extend(derived_scope);
         }
+        Expression::Alias(alias) if matches!(&alias.this, Expression::Function(_)) => {
+            scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
+        }
         Expression::Lateral(lateral) => {
             let name = lateral
                 .alias
