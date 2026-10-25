@@ -56024,6 +56024,9 @@ impl Parser {
                 }
                 self.skip();
             }
+            if !self.check(TokenType::RParen) {
+                return Err(self.parse_error("Expected ')' to close the IF condition"));
+            }
             // Extract condition text from source (inside outer parens)
             let cond_text = if self.source.is_some() {
                 let inner_start = self.tokens[cond_start + 1].span.start;
@@ -56041,7 +56044,9 @@ impl Parser {
             while !self.is_at_end() && !self.check(TokenType::Semicolon) {
                 self.skip();
             }
-            let body_text = if self.source.is_some() {
+            let body_text = if body_start >= self.current {
+                String::new()
+            } else if self.source.is_some() {
                 let start_span = self.tokens[body_start].span.start;
                 let end_span = if self.current > 0 {
                     self.tokens[self.current - 1].span.end
@@ -56054,7 +56059,9 @@ impl Parser {
             } else {
                 self.tokens_to_sql(body_start, self.current)
             };
-            let command_text = format!("IF {} {}", cond_text, body_text);
+            let command_text = format!("IF {} {}", cond_text, body_text)
+                .trim_end()
+                .to_string();
             return Ok(Some(Expression::Command(Box::new(
                 crate::expressions::Command { this: command_text },
             ))));
