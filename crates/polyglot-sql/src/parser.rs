@@ -33174,7 +33174,8 @@ impl Parser {
             Expression::JSONExtract(_) |  // Allow chained paths like a:b:c
             Expression::Function(_) |     // Allow function results like PARSE_JSON(...):x
             Expression::ParseJson(_) |    // Allow PARSE_JSON specifically
-            Expression::Parameter(_) // Allow positional params like $1:name
+            Expression::Parameter(_) |    // Allow positional params like $1:name
+            Expression::Subscript(_) // Allow bracket subscripts like f[0]:name
         );
 
         if !is_valid_json_path_base {
