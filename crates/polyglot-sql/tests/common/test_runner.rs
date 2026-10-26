@@ -192,7 +192,9 @@ pub fn dialect_identity_test(
     }
     let output = outputs.join("; ");
 
-    if output != expected_output {
+    if output != expected_output
+        && !(dialect == DialectType::DuckDB && arrow_lambda_spelling(&output) == expected_output)
+    {
         return Err(format!(
             "Mismatch:\n  input:    {}\n  expected: {}\n  output:   {}",
             sql, expected_output, output
@@ -229,7 +231,9 @@ pub fn transpile_test(
         return Err("No statements transpiled".to_string());
     }
 
-    if results[0] != expected {
+    if results[0] != expected
+        && !(target == DialectType::DuckDB && arrow_lambda_spelling(&results[0]) == expected)
+    {
         return Err(format!(
             "Mismatch:\n  input:    {} ({:?} -> {:?})\n  expected: {}\n  actual:   {}",
             sql, source, target, expected, results[0]
@@ -237,6 +241,45 @@ pub fn transpile_test(
     }
 
     Ok(())
+}
+
+/// Respell DuckDB `LAMBDA x : body` lambdas as SQLGlot's `x -> body`.
+///
+/// DuckDB 2.0 rejects arrow lambdas by default and 2.1 removes them, so Polyglot writes every
+/// DuckDB lambda with a colon while SQLGlot fixtures keep arrows. A DuckDB output that equals
+/// its fixture once its lambdas are respelled differs from the fixture only in lambda syntax.
+fn arrow_lambda_spelling(sql: &str) -> String {
+    const HEAD: &str = "LAMBDA ";
+    const SEPARATOR: &str = " : ";
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(start) = rest.find(HEAD) {
+        let after_head = &rest[start + HEAD.len()..];
+        let Some(end) = after_head.find(SEPARATOR) else {
+            break;
+        };
+        let parameters = &after_head[..end];
+        let plain = parameters
+            .split(", ")
+            .all(|parameter| !parameter.is_empty() && !parameter.contains([' ', '(', ')']));
+        if !plain {
+            out.push_str(&rest[..start + HEAD.len()]);
+            rest = after_head;
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        if parameters.contains(", ") {
+            out.push('(');
+            out.push_str(parameters);
+            out.push(')');
+        } else {
+            out.push_str(parameters);
+        }
+        out.push_str(" -> ");
+        rest = &after_head[end + SEPARATOR.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn polyglot_transpile_expected<'a>(

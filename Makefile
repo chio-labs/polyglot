@@ -297,6 +297,7 @@ test-rust-verify-core:
 	@cargo test -p polyglot-sql --test query_analysis_regression
 	@cargo test -p polyglot-sql --test is_predicate_precedence
 	@cargo test -p polyglot-sql --test duckdb_json_arrow_context
+	@cargo test -p polyglot-sql --test duckdb_lambda_syntax
 	@cargo test -p polyglot-sql --test quoted_relation_columns
 	@echo ""
 	@echo "=== Generic identity tests ==="

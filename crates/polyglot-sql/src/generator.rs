@@ -25360,7 +25360,9 @@ impl Generator {
     // Additional expression generators
 
     fn generate_lambda(&mut self, f: &LambdaExpr) -> Result<()> {
-        if f.colon {
+        // DuckDB 2.0 rejects the arrow form by default and 2.1 removes it, so DuckDB output
+        // always uses LAMBDA x : expr, which DuckDB has accepted since 1.3.
+        if f.colon || matches!(self.config.dialect, Some(DialectType::DuckDB)) {
             // DuckDB syntax: LAMBDA x : expr
             self.write_keyword("LAMBDA");
             self.write_space();
