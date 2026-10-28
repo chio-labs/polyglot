@@ -71,8 +71,11 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            smoke: true
+          # Cross-compiled on the Intel runner: this repository gets no arm64 macOS runner.
           - target: aarch64-apple-darwin
-            runner: macos-15
+            runner: macos-15-intel
+            smoke: false
     steps:
       - uses: actions/checkout@v7
 
@@ -88,10 +91,17 @@ jobs:
           sccache: true
 
       - name: Smoke test wheel
+        if: matrix.smoke
         run: |
           ls dist/*-abi3-*.whl
           python -m pip install --no-index --find-links dist polyglot-sql-chio
           python -c "import polyglot_sql; assert polyglot_sql.parse_one('SELECT 1', dialect='postgres')"
+
+      - name: Check cross-compiled wheel
+        if: ${{ !matrix.smoke }}
+        run: |
+          ls dist/*-abi3-macosx_*_arm64.whl
+          unzip -l dist/*-abi3-macosx_*_arm64.whl | grep -q 'polyglot_sql/.*\.so$'
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7
