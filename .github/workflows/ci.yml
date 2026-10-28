@@ -330,7 +330,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15
     steps:
       - uses: actions/checkout@v7
 
@@ -636,7 +636,7 @@ jobs:
             static_lib: libpolyglot_sql_ffi.a
             use_cross: false
             target_dir: target
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive_name: macos-aarch64
             archive_ext: tar.gz
