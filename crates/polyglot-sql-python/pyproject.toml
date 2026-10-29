@@ -24,10 +24,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/chio-labs/polyglot"
+Homepage = "https://github.com/sqlstack-io/polyglot"
 Documentation = "https://polyglot.gh.tobilg.com"
-Repository = "https://github.com/chio-labs/polyglot"
-Issues = "https://github.com/chio-labs/polyglot/issues"
+Repository = "https://github.com/sqlstack-io/polyglot"
+Issues = "https://github.com/sqlstack-io/polyglot/issues"
 
 [tool.maturin]
 python-source = "python"
